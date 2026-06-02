@@ -246,7 +246,44 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             sum(len(p) for p in agent._codex_streamed_text_parts),
                             agent._client_log_context(),
                         )
-                final_response = stream.get_final_response()
+                try:
+                    final_response = stream.get_final_response()
+                except TypeError as exc:
+                    # openai-python 2.24.0 assumes response.completed always
+                    # carries response.output. The ChatGPT Codex backend can
+                    # finish with output=None even after streaming valid text
+                    # deltas, so build the same minimal response shape Hermes
+                    # already uses for empty-output recovery.
+                    if "'NoneType' object is not iterable" not in str(exc):
+                        raise
+                    if collected_output_items:
+                        final_response = SimpleNamespace(
+                            status="completed",
+                            output=list(collected_output_items),
+                            output_text=None,
+                        )
+                        logger.debug(
+                            "Codex stream: synthesized completed response from %d output items after SDK output=None parse failure",
+                            len(collected_output_items),
+                        )
+                    elif agent._codex_streamed_text_parts and not has_tool_calls:
+                        assembled = "".join(agent._codex_streamed_text_parts)
+                        final_response = SimpleNamespace(
+                            status="completed",
+                            output=[SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )],
+                            output_text=assembled,
+                        )
+                        logger.debug(
+                            "Codex stream: synthesized completed response from %d text deltas (%d chars) after SDK output=None parse failure",
+                            len(agent._codex_streamed_text_parts), len(assembled),
+                        )
+                    else:
+                        raise
                 # PATCH: ChatGPT Codex backend streams valid output items
                 # but get_final_response() can return an empty output list.
                 # Backfill from collected items or synthesize from deltas.
@@ -287,6 +324,53 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 exc,
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" in str(exc):
+                # The SDK can raise this while iterating the terminal
+                # response.completed event, before get_final_response() runs.
+                # Preserve the Codex answer already streamed instead of
+                # handing a successful primary call to the provider fallback.
+                if collected_output_items:
+                    logger.debug(
+                        "Codex Responses SDK stream iteration failed with output=None; "
+                        "synthesizing completed response from %d output items. %s",
+                        len(collected_output_items),
+                        agent._client_log_context(),
+                        exc_info=True,
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        output=list(collected_output_items),
+                        output_text=None,
+                    )
+                if agent._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(agent._codex_streamed_text_parts)
+                    logger.debug(
+                        "Codex Responses SDK stream iteration failed with output=None; "
+                        "synthesizing completed response from %d text deltas (%d chars). %s",
+                        len(agent._codex_streamed_text_parts),
+                        len(assembled),
+                        agent._client_log_context(),
+                        exc_info=True,
+                    )
+                    return SimpleNamespace(
+                        status="completed",
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        output_text=assembled,
+                    )
+                logger.debug(
+                    "Codex Responses SDK stream helper failed with NoneType iteration; "
+                    "falling back to create(stream=True). %s",
+                    agent._client_log_context(),
+                    exc_info=True,
+                )
+                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text

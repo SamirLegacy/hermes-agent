@@ -79,6 +79,7 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
+        provider = params.get("provider")
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -100,6 +101,7 @@ class ResponsesApiTransport(ProviderTransport):
             "input": _chat_messages_to_responses_input(
                 payload_messages,
                 is_xai_responses=is_xai_responses,
+                current_provider=provider,
             ),
             "tools": response_tools,
             "store": False,

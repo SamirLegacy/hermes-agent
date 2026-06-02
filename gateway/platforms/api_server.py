@@ -964,6 +964,12 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
+        # _resolve_runtime_agent_kwargs() may already resolve provider fallback
+        # and include an effective model.  Remove it from kwargs so AIAgent
+        # never receives duplicate model= values, while preserving fallback.
+        runtime_model = runtime_kwargs.pop("model", None)
+        if runtime_model:
+            model = runtime_model
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))

@@ -807,6 +807,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_items = getattr(assistant_message, "codex_reasoning_items", None)
     if codex_items:
         msg["codex_reasoning_items"] = codex_items
+        msg["codex_reasoning_provider"] = agent.provider
 
     # Codex Responses API: preserve exact assistant message items (with
     # id/phase) so follow-up turns can replay structured items instead of
@@ -814,6 +815,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_message_items = getattr(assistant_message, "codex_message_items", None)
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
+        msg["codex_message_provider"] = agent.provider
 
     if assistant_tool_calls:
         tool_calls = []

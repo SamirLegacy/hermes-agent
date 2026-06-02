@@ -248,6 +248,7 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
     is_xai_responses: bool = False,
+    current_provider: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -285,14 +286,29 @@ def _chat_messages_to_responses_input(
                 content_text = str(content) if content is not None else ""
 
             if role == "assistant":
+                provider_marker = (
+                    str(current_provider).strip()
+                    if isinstance(current_provider, str) and current_provider.strip()
+                    else None
+                )
+
                 # Replay encrypted reasoning items from previous turns
                 # so the API can maintain coherent reasoning chains.
-                # This applies to every Responses transport including
-                # xAI — see _chat_messages_to_responses_input docstring
-                # for the May 2026 reversal of the earlier xAI gate.
+                # Only replay opaque encrypted reasoning into the same
+                # provider that minted it. OpenAI Codex and xAI both use a
+                # Responses-shaped surface, but their encrypted_content blobs
+                # are not interchangeable.
                 codex_reasoning = msg.get("codex_reasoning_items")
+                reasoning_provider = msg.get("codex_reasoning_provider")
+                provider_matches = (
+                    not provider_marker
+                    or (
+                        isinstance(reasoning_provider, str)
+                        and reasoning_provider.strip() == provider_marker
+                    )
+                )
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list):
+                if isinstance(codex_reasoning, list) and provider_matches:
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
@@ -313,8 +329,16 @@ def _chat_messages_to_responses_input(
                 # OpenAI docs: "preserve and resend phase on all assistant
                 # messages — dropping it can degrade performance."
                 codex_message_items = msg.get("codex_message_items")
+                message_provider = msg.get("codex_message_provider")
+                message_provider_matches = (
+                    not provider_marker
+                    or (
+                        isinstance(message_provider, str)
+                        and message_provider.strip() == provider_marker
+                    )
+                )
                 replayed_message_items = 0
-                if isinstance(codex_message_items, list):
+                if isinstance(codex_message_items, list) and message_provider_matches:
                     for raw_item in codex_message_items:
                         if not isinstance(raw_item, dict):
                             continue
