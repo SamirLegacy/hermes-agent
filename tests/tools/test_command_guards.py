@@ -143,6 +143,159 @@ class TestTirithAllowDangerous:
         # allow_permanent should be True (no tirith warning)
         assert cb.call_args[1]["allow_permanent"] is True
 
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_screen_capture_requires_cli_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        result = check_all_command_guards(
+            "peekaboo see --annotate --path /tmp/peekaboo-see.png",
+            "local",
+            approval_callback=cb,
+        )
+
+        assert result["approved"] is True
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+        assert cb.call_args[1]["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_owner_gate_skips_smart_auto_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        with patch("tools.approval._get_approval_mode", return_value="smart"), \
+             patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards(
+                "peekaboo image --path /tmp/screen.png",
+                "local",
+                approval_callback=cb,
+            )
+
+        assert result["approved"] is True
+        smart.assert_not_called()
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_ssh_relay_owner_gate_skips_smart_auto_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        with patch("tools.approval._get_approval_mode", return_value="smart"), \
+             patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards(
+                "ssh mac peekaboo see --mode screen --path /tmp/screen.png",
+                "local",
+                approval_callback=cb,
+            )
+
+        assert result["approved"] is True
+        smart.assert_not_called()
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+        assert cb.call_args[1]["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_shell_wrapper_owner_gate_skips_smart_auto_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        with patch("tools.approval._get_approval_mode", return_value="smart"), \
+             patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards(
+                "bash -lc 'peekaboo see --mode screen --path /tmp/screen.png'",
+                "local",
+                approval_callback=cb,
+            )
+
+        assert result["approved"] is True
+        smart.assert_not_called()
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+        assert cb.call_args[1]["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_later_shell_wrapper_owner_gate_skips_smart_auto_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        with patch("tools.approval._get_approval_mode", return_value="smart"), \
+             patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards(
+                "echo bash -lc safe && bash -lc 'peekaboo see --path /tmp/s.png'",
+                "local",
+                approval_callback=cb,
+            )
+
+        assert result["approved"] is True
+        smart.assert_not_called()
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+        assert cb.call_args[1]["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_shell_option_args_owner_gate_skips_smart_auto_approval(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        with patch("tools.approval._get_approval_mode", return_value="smart"), \
+             patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards(
+                "bash -O extglob -c 'peekaboo see --path /tmp/s.png'",
+                "local",
+                approval_callback=cb,
+            )
+
+        assert result["approved"] is True
+        smart.assert_not_called()
+        cb.assert_called_once()
+        assert "Peekaboo screen capture" in cb.call_args.args[1]
+        assert cb.call_args[1]["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_session_choice_is_once_only(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        command = "peekaboo see --mode screen --path /tmp/screen.png"
+        cb = MagicMock(side_effect=["session", "deny"])
+
+        first = check_all_command_guards(command, "local", approval_callback=cb)
+        second = check_all_command_guards(command, "local", approval_callback=cb)
+
+        session_key = os.getenv("HERMES_SESSION_KEY", "default")
+        assert first["approved"] is True
+        assert second["approved"] is False
+        assert not is_approved(session_key, "Peekaboo screen capture")
+        assert cb.call_count == 2
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_always_choice_is_once_only_and_not_permanent(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        command = "PEEKABOO_AI_PROVIDERS=openai peekaboo see --analyze 'Describe'"
+        cb = MagicMock(side_effect=["always", "deny"])
+
+        first = check_all_command_guards(command, "local", approval_callback=cb)
+        second = check_all_command_guards(command, "local", approval_callback=cb)
+
+        session_key = os.getenv("HERMES_SESSION_KEY", "default")
+        assert first["approved"] is True
+        assert second["approved"] is False
+        assert not is_approved(session_key, "Peekaboo AI/provider analysis")
+        assert "Peekaboo AI/provider analysis" not in approval_module._permanent_approved
+        assert cb.call_count == 2
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_peekaboo_blocks_without_interactive_approval_surface(self, mock_tirith):
+        result = check_all_command_guards(
+            "peekaboo see --mode screen --path /tmp/screen.png",
+            "local",
+        )
+
+        assert result["approved"] is False
+        assert result["pattern_key"] == "Peekaboo screen capture"
+        assert result["outcome"] == "approval_surface_missing"
+        assert result["user_consent"] is False
+
 
 # ---------------------------------------------------------------------------
 # tirith warn + safe command

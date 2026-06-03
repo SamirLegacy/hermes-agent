@@ -12,6 +12,7 @@ import contextvars
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -333,7 +334,60 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # Dangerous command patterns
 # =========================================================================
 
+_PEEKABOO_CMD_BARE = r'(?:[~/.\w-]+/)*peekaboo'
+_PEEKABOO_CMD = rf'(?:"{_PEEKABOO_CMD_BARE}\b"|\'{_PEEKABOO_CMD_BARE}\b\'|{_PEEKABOO_CMD_BARE}\b)'
+_PEEKABOO_ENV_VALUE = r'(?:"[^"]*"|\'[^\']*\'|\S+)'
+_PEEKABOO_ENV_ASSIGN = rf'(?:(?:[A-Za-z_][A-Za-z0-9_]*={_PEEKABOO_ENV_VALUE})\s+)*'
+_PEEKABOO_ENV_OPTION = r'-(?!S\b)[^\s]+\s+'
+_PEEKABOO_ENV_SPLIT_STRING = rf'(?:-S\s+{_PEEKABOO_ENV_VALUE}\s+)?'
+_PEEKABOO_ENV_WRAPPER = (
+    rf'(?:(?:/usr/bin/env|env)\s+'
+    rf'(?:{_PEEKABOO_ENV_OPTION})*'
+    rf'{_PEEKABOO_ENV_SPLIT_STRING}'
+    rf'{_PEEKABOO_ENV_ASSIGN})?'
+)
+_PEEKABOO_CMD_WRAPPER = (
+    r'(?:(?:command\s+)|'
+    r'(?:arch\s+(?:-[^\s]+\s+)*)|'
+    r'(?:nice\s+(?:(?:-n\s+\S+|-n\S+|-\d+)\s+)?))*'
+)
+_PEEKABOO_PREFIX = rf'{_PEEKABOO_ENV_ASSIGN}{_PEEKABOO_ENV_WRAPPER}{_PEEKABOO_CMD_WRAPPER}'
+_PEEKABOO_LOCAL_CMDPOS = rf'{_CMDPOS}{_PEEKABOO_PREFIX}{_PEEKABOO_CMD}'
+_PEEKABOO_SSH_CMD = r'(?:[~/.\w-]+/)*ssh\b'
+_PEEKABOO_SSH_RELAY_CMDPOS = (
+    rf'{_CMDPOS}{_PEEKABOO_SSH_CMD}\b[^\n;&|]*?(?:--\s+)?'
+    rf'{_PEEKABOO_PREFIX}{_PEEKABOO_CMD}'
+)
+_PEEKABOO_CMDPOS = rf'(?:{_PEEKABOO_LOCAL_CMDPOS}|{_PEEKABOO_SSH_RELAY_CMDPOS})'
+_PEEKABOO_UI_ACTIONS = (
+    r'app|click|clipboard|dialog|dock|drag|hotkey|menu|menubar|move|open|'
+    r'paste|perform-action|press|run|scroll|set-value|space|swipe|type|window'
+)
+
 DANGEROUS_PATTERNS = [
+    # Peekaboo can see the user's desktop, send screenshots to AI providers,
+    # expose a GUI-control MCP server, and type/click in macOS apps. Treat
+    # those as owner-gated actions while leaving local status/help/cleanup
+    # commands such as `peekaboo permissions`, `peekaboo tools`, and
+    # `peekaboo clean --dry-run` usable without friction.
+    (rf'{_PEEKABOO_CMDPOS}\s+(?:agent\b|(?:see|image)\b[^\n;&|]*--analyze\b)',
+     "Peekaboo AI/provider analysis"),
+    (rf'{_PEEKABOO_CMDPOS}\s+mcp\b', "Peekaboo MCP server exposure"),
+    (rf'{_PEEKABOO_CMDPOS}\s+config\s+'
+     r'(?:add|add-provider|edit|init|login|models-provider|remove-provider|'
+     r'set-credential|test-provider)\b',
+     "Peekaboo provider/config credential change"),
+    (rf'{_PEEKABOO_CMDPOS}\s+(?:see|image|capture)\b',
+     "Peekaboo screen capture"),
+    (rf'{_PEEKABOO_CMDPOS}\s+list(?:\s+(?:apps|menubar|screens|windows)\b|\s+-{{1,2}}\w|(?=\s*(?:$|[;&|])))',
+     "Peekaboo UI/app state inspection"),
+    (rf'{_PEEKABOO_CMDPOS}\s+clean\b[^\n;&|]*--dry-run(?:=|\s+)'
+     r'(?:false|0|no|off)\b',
+     "Peekaboo snapshot cleanup"),
+    (rf'{_PEEKABOO_CMDPOS}\s+clean\b(?![^\n;&|]*--dry-run(?:\s|$|[;&|]))',
+     "Peekaboo snapshot cleanup"),
+    (rf'{_PEEKABOO_CMDPOS}\s+(?:{_PEEKABOO_UI_ACTIONS})\b',
+     "Peekaboo UI automation action"),
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
@@ -500,18 +554,78 @@ def _normalize_command_for_detection(command: str) -> str:
     return command
 
 
-def detect_dangerous_command(command: str) -> tuple:
+def _extract_shell_c_payloads(command: str) -> list[str]:
+    """Return payloads from shell -c/-lc wrappers, if present."""
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return []
+    shells = {"bash", "sh", "zsh", "ksh"}
+    short_options_with_values = ("-o", "-O")
+    long_options_with_values = ("--init-file", "--rcfile")
+    payloads: list[str] = []
+    for idx, part in enumerate(parts):
+        shell = os.path.basename(part)
+        if shell not in shells:
+            continue
+        next_idx = idx + 1
+        while next_idx < len(parts):
+            flag = parts[next_idx]
+            if flag == "--":
+                break
+            if not flag.startswith("-"):
+                break
+            if flag in short_options_with_values:
+                next_idx += 2
+                continue
+            if any(flag.startswith(opt) for opt in short_options_with_values):
+                next_idx += 1
+                continue
+            if flag in long_options_with_values:
+                next_idx += 2
+                continue
+            if any(flag.startswith(f"{opt}=") for opt in long_options_with_values):
+                next_idx += 1
+                continue
+            if flag.startswith("--"):
+                next_idx += 1
+                continue
+            if "c" in flag[1:]:
+                payload_idx = next_idx + 1
+                if payload_idx < len(parts):
+                    payloads.append(parts[payload_idx])
+                break
+            next_idx += 1
+    return payloads
+
+
+def _detect_dangerous_command(command: str, *, _depth: int = 0) -> tuple:
     """Check if a command matches any dangerous patterns.
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    command_lower = _normalize_command_for_detection(command).lower()
+    normalized = _normalize_command_for_detection(command)
+    if _depth < 3:
+        for shell_payload in _extract_shell_c_payloads(normalized):
+            nested = _detect_dangerous_command(shell_payload, _depth=_depth + 1)
+            if nested[0]:
+                return nested
+    command_lower = normalized.lower()
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
         if pattern_re.search(command_lower):
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def detect_dangerous_command(command: str) -> tuple:
+    return _detect_dangerous_command(command)
+
+
+def _requires_explicit_owner_approval(pattern_key: str) -> bool:
+    """Return True for surfaces that must not be auto-approved by smart mode."""
+    return pattern_key.startswith("Peekaboo ")
 
 
 # =========================================================================
@@ -981,13 +1095,28 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    requires_owner_gate = _requires_explicit_owner_approval(pattern_key)
+    if not requires_owner_gate and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    if not is_cli and not is_gateway:
+    if not is_cli and not is_gateway and not is_ask:
+        if requires_owner_gate:
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: Command requires explicit owner approval ({description}), "
+                    "but this session has no interactive approval surface. Do NOT retry "
+                    "this command headlessly; ask the owner to approve the exact action."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "approval_surface_missing",
+                "user_consent": False,
+            }
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -1027,6 +1156,7 @@ def check_dangerous_command(command: str, env_type: str,
         }
 
     choice = prompt_dangerous_approval(command, description,
+                                       allow_permanent=not requires_owner_gate,
                                        approval_callback=approval_callback)
 
     if choice == "deny":
@@ -1037,9 +1167,9 @@ def check_dangerous_command(command: str, env_type: str,
             "description": description,
         }
 
-    if choice == "session":
+    if choice == "session" and not requires_owner_gate:
         approve_session(session_key, pattern_key)
-    elif choice == "always":
+    elif choice == "always" and not requires_owner_gate:
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
@@ -1225,6 +1355,20 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
+        is_dangerous, pattern_key, description = detect_dangerous_command(command)
+        if is_dangerous and _requires_explicit_owner_approval(pattern_key):
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: Command requires explicit owner approval ({description}), "
+                    "but this session has no interactive approval surface. Do NOT retry "
+                    "this command headlessly; ask the owner to approve the exact action."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "approval_surface_missing",
+                "user_consent": False,
+            }
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -1277,7 +1421,7 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, tirith_desc, True))
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if _requires_explicit_owner_approval(pattern_key) or not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
@@ -1288,7 +1432,10 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    requires_owner_gate = any(
+        _requires_explicit_owner_approval(key) for key, _, _ in warnings
+    )
+    if approval_mode == "smart" and not requires_owner_gate:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
@@ -1382,8 +1529,13 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
 
-            # User approved — persist based on scope (same logic as CLI)
+            # User approved — persist based on scope (same logic as CLI).
+            # Exact owner-gated surfaces are always one-shot: even if an
+            # external approval UI sends "session" or "always", do not carry
+            # that consent to a future screen read, provider call, or UI action.
             for key, _, is_tirith in warnings:
+                if _requires_explicit_owner_approval(key):
+                    continue
                 if choice == "session" or (choice == "always" and is_tirith):
                     approve_session(session_key, key)
                 elif choice == "always":
@@ -1417,7 +1569,7 @@ def check_all_command_guards(command: str, env_type: str,
         }
 
     # CLI interactive: single combined prompt
-    # Hide [a]lways when any tirith warning is present
+    # Hide [a]lways when any tirith warning or exact owner-gated warning is present.
     _fire_approval_hook(
         "pre_approval_request",
         command=command,
@@ -1428,7 +1580,7 @@ def check_all_command_guards(command: str, env_type: str,
         surface="cli",
     )
     choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
+                                       allow_permanent=not has_tirith and not requires_owner_gate,
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -1458,8 +1610,11 @@ def check_all_command_guards(command: str, env_type: str,
             "user_consent": False,
         }
 
-    # Persist approval for each warning individually
+    # Persist approval for each warning individually. Exact owner-gated
+    # surfaces remain one-shot even if a callback returns "session" or "always".
     for key, _, is_tirith in warnings:
+        if _requires_explicit_owner_approval(key):
+            continue
         if choice == "session" or (choice == "always" and is_tirith):
             # tirith: session only (no permanent broad allowlisting)
             approve_session(session_key, key)

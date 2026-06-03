@@ -185,3 +185,60 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
+
+
+@pytest.mark.live_system_guard_bypass
+def test_runner_sets_hermes_home_before_test_module_import(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "import_env.json"
+    probe = probe_dir / "test_probe_import_env.py"
+
+    probe.write_text(textwrap.dedent(f"""
+        import json
+        import os
+        from pathlib import Path
+
+        Path({str(handoff)!r}).write_text(json.dumps({{
+            "hermes_home": os.environ.get("HERMES_HOME", ""),
+        }}))
+
+        def test_placeholder():
+            assert True
+    """).strip() + "\n")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    data = json.loads(handoff.read_text())
+    hermes_home = data["hermes_home"]
+    assert hermes_home
+    assert hermes_home != str(Path.home() / ".hermes")
+    assert "hermes-pytest-file-" in Path(hermes_home).name
+
+
+def test_run_tests_shell_wrapper_seeds_suite_hermes_home() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    script = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
+
+    assert "SUITE_HERMES_HOME=" in script
+    assert "hermes-pytest-suite-" in script
+    assert 'HERMES_HOME="$SUITE_HERMES_HOME"' in script

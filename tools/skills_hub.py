@@ -851,7 +851,11 @@ class GitHubSource(SkillSource):
 
     def _write_cache(self, key: str, data: list) -> None:
         """Write index data to cache."""
-        INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.debug("Could not create cache directory: %s", e)
+            return
         cache_file = INDEX_CACHE_DIR / f"{key}.json"
         try:
             cache_file.write_text(json.dumps(data, ensure_ascii=False))
@@ -2982,7 +2986,11 @@ def _read_index_cache(key: str) -> Optional[Any]:
 
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
-    INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.debug("Could not create cache directory: %s", e)
+        return
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
     # this directory.  Cache files contain unvetted community content that
     # could include adversarial text (prompt injection via catalog entries).

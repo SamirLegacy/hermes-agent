@@ -77,6 +77,32 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def test_agent_logging_uses_active_hermes_home(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+
+    active_home = tmp_path / "active-home"
+    stale_home = tmp_path / "stale-import-home"
+    calls = []
+
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+    monkeypatch.setattr(run_agent, "_hermes_home", stale_home)
+
+    import hermes_logging
+
+    def _fake_setup_logging(**kwargs):
+        calls.append(kwargs["hermes_home"])
+        return kwargs["hermes_home"] / "logs"
+
+    monkeypatch.setattr(hermes_logging, "setup_logging", _fake_setup_logging)
+    monkeypatch.setattr(hermes_logging, "setup_verbose_logging", lambda: None)
+
+    _build_agent(monkeypatch)
+
+    assert calls
+    assert calls[-1] == active_home
+    assert stale_home not in calls
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[

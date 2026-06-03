@@ -1,4 +1,5 @@
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -103,7 +104,7 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
 # ---------------------------------------------------------------------------
 
 
-def test_do_list_initializes_hub_dir(monkeypatch, hub_env):
+def test_do_list_does_not_initialize_hub_dir(monkeypatch, hub_env):
     import tools.skills_sync as skills_sync
     import tools.skills_tool as skills_tool
 
@@ -115,10 +116,39 @@ def test_do_list_initializes_hub_dir(monkeypatch, hub_env):
 
     _capture()
 
-    assert hub_dir.exists()
-    assert (hub_dir / "lock.json").exists()
-    assert (hub_dir / "quarantine").is_dir()
-    assert (hub_dir / "index-cache").is_dir()
+    assert not hub_dir.exists()
+
+
+def test_hub_cache_writes_ignore_unwritable_cache_dir(monkeypatch, tmp_path):
+    import tools.skills_hub as hub
+
+    class _UnwritableCacheDir:
+        def mkdir(self, *args, **kwargs):
+            raise PermissionError("sandbox denied")
+
+        def __truediv__(self, name):
+            return tmp_path / name
+
+    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", _UnwritableCacheDir())
+
+    hub._write_index_cache("index", {"items": []})
+    hub.GitHubSource(auth=object())._write_cache("github", [])
+
+    assert not (tmp_path / "index.json").exists()
+    assert not (tmp_path / "github.json").exists()
+
+
+def test_peekaboo_skill_documents_safe_baseline_and_app_scoped_permissions():
+    skill_md = Path(__file__).resolve().parents[2] / "skills" / "apple" / "peekaboo" / "SKILL.md"
+    text = skill_md.read_text(encoding="utf-8")
+
+    assert "peekaboo see --mode screen --screen-index 0 --annotate --path /tmp/peekaboo-see.png --json" in text
+    assert "macOS permission ownership" in text
+    assert "Terminal / iTerm" in text
+    assert "Hermes Desktop app" in text
+    assert "Codex Desktop app" in text
+    assert "VPS hosts, this skill is relay-only" in text
+    assert "With `--analyze` or `peekaboo agent`" in text
 
 
 def test_do_list_distinguishes_hub_builtin_and_local(three_source_env):
@@ -742,4 +772,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-

@@ -24,13 +24,15 @@ import {
   renameProfile,
   updateProfileSoul
 } from '@/hermes'
-import { AlertTriangle, Pencil, Save, Terminal, Trash2, Users } from '@/lib/icons'
+import { AlertTriangle, CheckCircle2, Link, Pencil, Save, Terminal, Trash2, Users } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 
+import { NEW_CHAT_ROUTE } from '../routes'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 import { titlebarHeaderBaseClass } from '../shell/titlebar'
 import type { SetTitlebarToolGroup } from '../shell/titlebar-controls'
+import { desktopProfileForRemoteUrl, desktopProfileRemoteUrl, normalizeDesktopRemoteUrl } from './desktop-profile-routes'
 
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
@@ -56,6 +58,10 @@ export function ProfilesView({
   const [createOpen, setCreateOpen] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
   const [deleting, setDeleting] = useState(false)
+  const [connectionConfig, setConnectionConfig] = useState<null | Awaited<
+    ReturnType<NonNullable<typeof window.hermesDesktop>['getConnectionConfig']>
+  >>(null)
+  const [connectingProfile, setConnectingProfile] = useState<null | string>(null)
 
   const refresh = useCallback(async () => {
     setRefreshing(true)
@@ -80,6 +86,24 @@ export function ProfilesView({
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  const refreshConnectionConfig = useCallback(async () => {
+    const desktop = window.hermesDesktop
+
+    if (!desktop?.getConnectionConfig) {
+      return
+    }
+
+    try {
+      setConnectionConfig(await desktop.getConnectionConfig())
+    } catch {
+      setConnectionConfig(null)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshConnectionConfig()
+  }, [refreshConnectionConfig])
 
   useEffect(() => {
     if (!setTitlebarToolGroup) {
@@ -106,6 +130,11 @@ export function ProfilesView({
 
     return profiles.find(p => p.name === selectedName) ?? profiles[0] ?? null
   }, [profiles, selectedName])
+
+  const activeDesktopProfile = useMemo(
+    () => desktopProfileForRemoteUrl(connectionConfig?.remoteUrl),
+    [connectionConfig?.remoteUrl]
+  )
 
   const handleCreate = useCallback(
     async (name: string, cloneFromDefault: boolean) => {
@@ -163,6 +192,63 @@ export function ProfilesView({
     }
   }, [pendingDelete, refresh])
 
+  const handleConnectProfile = useCallback(
+    async (profileName: string) => {
+      const remoteUrl = desktopProfileRemoteUrl(profileName)
+      const desktop = window.hermesDesktop
+
+      if (!remoteUrl) {
+        notify({
+          kind: 'warning',
+          title: 'No desktop route',
+          message: `${profileName} does not have a configured local VPS tunnel.`
+        })
+
+        return
+      }
+
+      if (!desktop?.applyConnectionConfig) {
+        notify({ kind: 'error', title: 'Desktop bridge unavailable', message: 'Restart Hermes Desktop and try again.' })
+
+        return
+      }
+
+      if (connectionConfig?.envOverride) {
+        notify({
+          kind: 'warning',
+          title: 'Remote URL is locked',
+          message: 'HERMES_DESKTOP_REMOTE_URL is overriding desktop settings.'
+        })
+
+        return
+      }
+
+      if (connectionConfig && !connectionConfig.remoteTokenSet) {
+        notify({
+          kind: 'warning',
+          title: 'Remote token missing',
+          message: 'Save the VPS session token in Settings -> Gateway before switching profiles.'
+        })
+
+        return
+      }
+
+      setConnectingProfile(profileName)
+
+      try {
+        window.location.hash = NEW_CHAT_ROUTE
+        await desktop.applyConnectionConfig({ mode: 'remote', remoteUrl })
+        notify({ kind: 'success', title: 'Connecting profile', message: `${profileName} via ${remoteUrl}` })
+        await refreshConnectionConfig()
+      } catch (err) {
+        notifyError(err, 'Failed to connect profile')
+      } finally {
+        setConnectingProfile(null)
+      }
+    },
+    [connectionConfig, refreshConnectionConfig]
+  )
+
   return (
     <section {...props} className="flex h-full min-w-0 flex-col overflow-hidden rounded-b-[0.9375rem] bg-background">
       <header className={titlebarHeaderBaseClass}>
@@ -189,6 +275,7 @@ export function ProfilesView({
                   <li key={profile.name}>
                     <ProfileRow
                       active={selected?.name === profile.name}
+                      connected={activeDesktopProfile === profile.name}
                       onSelect={() => setSelectedName(profile.name)}
                       profile={profile}
                     />
@@ -203,7 +290,11 @@ export function ProfilesView({
             <main className="min-h-0 overflow-hidden">
               {selected ? (
                 <ProfileDetail
+                  activeDesktopProfile={activeDesktopProfile}
+                  connectionConfig={connectionConfig}
+                  connecting={connectingProfile === selected.name}
                   key={selected.name}
+                  onConnect={() => void handleConnectProfile(selected.name)}
                   onDelete={() => setPendingDelete(selected)}
                   onRename={newName => handleRename(selected.name, newName)}
                   profile={selected}
@@ -254,7 +345,17 @@ export function ProfilesView({
   )
 }
 
-function ProfileRow({ active, onSelect, profile }: { active: boolean; onSelect: () => void; profile: ProfileInfo }) {
+function ProfileRow({
+  active,
+  connected,
+  onSelect,
+  profile
+}: {
+  active: boolean
+  connected: boolean
+  onSelect: () => void
+  profile: ProfileInfo
+}) {
   return (
     <button
       className={cn(
@@ -266,7 +367,10 @@ function ProfileRow({ active, onSelect, profile }: { active: boolean; onSelect: 
     >
       <span className="flex w-full items-center justify-between gap-2">
         <span className="truncate text-sm font-medium">{profile.name}</span>
-        {profile.is_default && <span className="text-[0.6rem] text-primary">default</span>}
+        <span className="flex shrink-0 items-center gap-1">
+          {connected && <span className="text-[0.6rem] text-primary">connected</span>}
+          {profile.is_default && <span className="text-[0.6rem] text-primary">default</span>}
+        </span>
       </span>
       <span className="text-[0.66rem] text-muted-foreground">
         {profile.skill_count} {profile.skill_count === 1 ? 'skill' : 'skills'}
@@ -277,16 +381,28 @@ function ProfileRow({ active, onSelect, profile }: { active: boolean; onSelect: 
 }
 
 function ProfileDetail({
+  activeDesktopProfile,
+  connecting,
+  connectionConfig,
+  onConnect,
   onDelete,
   onRename,
   profile
 }: {
+  activeDesktopProfile: null | string
+  connecting: boolean
+  connectionConfig: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnectionConfig']>> | null
+  onConnect: () => void
   onDelete: () => void
   onRename: (newName: string) => Promise<void>
   profile: ProfileInfo
 }) {
   const [renameOpen, setRenameOpen] = useState(false)
   const [copying, setCopying] = useState(false)
+  const remoteUrl = desktopProfileRemoteUrl(profile.name)
+  const connected = activeDesktopProfile === profile.name
+  const currentUrl = normalizeDesktopRemoteUrl(connectionConfig?.remoteUrl)
+  const canConnect = Boolean(remoteUrl) && !connected && !connectionConfig?.envOverride
 
   const handleCopySetup = useCallback(async () => {
     setCopying(true)
@@ -327,6 +443,10 @@ function ProfileDetail({
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
+                <Button disabled={!canConnect || connecting} onClick={onConnect} size="sm" variant={connected ? 'secondary' : 'default'}>
+                  {connected ? <CheckCircle2 /> : <Link />}
+                  {connected ? 'Connected' : connecting ? 'Connecting...' : 'Connect'}
+                </Button>
                 {!profile.is_default && (
                   <Button onClick={() => setRenameOpen(true)} size="sm" variant="outline">
                     <Pencil />
@@ -363,6 +483,26 @@ function ProfileDetail({
                 )}
               </DetailRow>
               <DetailRow label="Skills">{profile.skill_count}</DetailRow>
+              <DetailRow label="Desktop">
+                {remoteUrl ? (
+                  <>
+                    <span className={connected ? 'text-primary' : 'text-foreground'}>{connected ? 'Connected' : 'Available'}</span>
+                    <span className="font-mono text-muted-foreground"> · {remoteUrl}</span>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">No local VPS tunnel configured</span>
+                )}
+              </DetailRow>
+              <DetailRow label="Current">
+                {currentUrl ? (
+                  <>
+                    <span>{activeDesktopProfile ?? 'custom remote'}</span>
+                    <span className="font-mono text-muted-foreground"> · {currentUrl}</span>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">Local gateway</span>
+                )}
+              </DetailRow>
             </dl>
           </header>
 

@@ -66,9 +66,12 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+SUITE_HERMES_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-pytest-suite-XXXXXX")"
+
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_HOME="$SUITE_HERMES_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

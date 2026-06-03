@@ -5597,6 +5597,13 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "auth_store": str(_auth_file_path()),
             "error": str(exc),
         }
+    except Exception as exc:
+        logger.debug("Codex auth status lookup failed", exc_info=True)
+        return {
+            "logged_in": False,
+            "auth_store": str(_auth_file_path()),
+            "error": f"Unable to read Codex auth status: {exc}",
+        }
 
 
 def get_xai_oauth_auth_status() -> Dict[str, Any]:
@@ -5638,6 +5645,13 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
             "logged_in": False,
             "auth_store": str(_auth_file_path()),
             "error": str(exc),
+        }
+    except Exception as exc:
+        logger.debug("xAI OAuth status lookup failed", exc_info=True)
+        return {
+            "logged_in": False,
+            "auth_store": str(_auth_file_path()),
+            "error": f"Unable to read xAI OAuth status: {exc}",
         }
 
 

@@ -240,6 +240,18 @@ def spawn_async_diagnostic(
         "echo '=== end ==='"
     )
 
+    helper = (
+        "import subprocess, sys\n"
+        "timeout = float(sys.argv[1])\n"
+        "script = sys.argv[2]\n"
+        "try:\n"
+        "    subprocess.run(['bash', '-c', script], timeout=timeout, check=False)\n"
+        "except subprocess.TimeoutExpired:\n"
+        "    print('shutdown diagnostic timed out', flush=True)\n"
+        "except Exception as exc:\n"
+        "    print(f'shutdown diagnostic failed: {type(exc).__name__}: {exc}', flush=True)\n"
+    )
+
     try:
         # Open the log file in append mode and let the subprocess inherit.
         # We use os.O_APPEND so concurrent diagnostics from rapid signals
@@ -255,7 +267,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [sys.executable, "-c", helper, f"{timeout_seconds:.3f}", script],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

@@ -42,6 +42,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -118,16 +119,20 @@ def _count_tests(
         *[str(f) for f in files],
         *pytest_passthrough,
     ]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return {}
+    env = os.environ.copy()
+    with tempfile.TemporaryDirectory(prefix="hermes-pytest-collect-") as hermes_home:
+        env["HERMES_HOME"] = hermes_home
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return {}
 
     counts: dict[Path, int] = {}
     for line in result.stdout.splitlines():
@@ -280,12 +285,16 @@ def _run_one_file(
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     subproc_start = time.monotonic()
+    env = os.environ.copy()
+    hermes_home_tmp = tempfile.TemporaryDirectory(prefix="hermes-pytest-file-")
+    env["HERMES_HOME"] = hermes_home_tmp.name
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -334,6 +343,8 @@ def _run_one_file(
         # well-behaved is not universal — kill the group anyway. Already-
         # dead processes are a no-op.
         _kill_tree(proc, pgid=pgid)
+    finally:
+        hermes_home_tmp.cleanup()
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.

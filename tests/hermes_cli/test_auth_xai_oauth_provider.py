@@ -828,6 +828,21 @@ def test_get_xai_oauth_auth_status_logged_out(tmp_path, monkeypatch):
     assert "error" in status
 
 
+def test_get_xai_oauth_auth_status_handles_store_lock_failure(monkeypatch):
+    import hermes_cli.auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "resolve_xai_oauth_runtime_credentials",
+        lambda: (_ for _ in ()).throw(PermissionError("auth.lock blocked")),
+    )
+
+    status = auth_mod.get_xai_oauth_auth_status()
+    assert status["logged_in"] is False
+    assert "Unable to read xAI OAuth status" in status["error"]
+    assert "auth.lock blocked" in status["error"]
+
+
 # ---------------------------------------------------------------------------
 # refresh_xai_oauth_pure error handling
 # ---------------------------------------------------------------------------

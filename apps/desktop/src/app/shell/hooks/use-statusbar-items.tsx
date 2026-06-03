@@ -2,8 +2,9 @@ import { useStore } from '@nanostores/react'
 import { useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
+import { desktopProfileForRemoteUrl } from '@/app/profiles/desktop-profile-routes'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
-import { Activity, AlertCircle, Clock, Command, Cpu, Hash, Loader2, Sparkles } from '@/lib/icons'
+import { Activity, AlertCircle, Clock, Command, Cpu, Hash, Loader2, Sparkles, Users } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
@@ -11,6 +12,7 @@ import { $desktopActionTasks } from '@/store/activity'
 import { $previewServerRestartStatus } from '@/store/preview'
 import {
   $busy,
+  $connection,
   $currentModel,
   $currentProvider,
   $currentUsage,
@@ -23,7 +25,7 @@ import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
 import { $desktopVersion, $updateApply, $updateStatus, setUpdateOverlayOpen } from '@/store/updates'
 import type { StatusResponse } from '@/types/hermes'
 
-import { CRON_ROUTE } from '../../routes'
+import { CRON_ROUTE, PROFILES_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
 interface StatusbarItemsOptions {
@@ -54,6 +56,7 @@ export function useStatusbarItems({
   toggleCommandCenter
 }: StatusbarItemsOptions) {
   const busy = useStore($busy)
+  const connection = useStore($connection)
   const currentModel = useStore($currentModel)
   const currentProvider = useStore($currentProvider)
   const currentUsage = useStore($currentUsage)
@@ -122,6 +125,8 @@ export function useStatusbarItems({
     : gatewayDegraded
       ? 'text-amber-600 hover:text-amber-600'
       : 'text-destructive hover:text-destructive'
+  const activeDesktopProfile =
+    connection?.mode === 'remote' ? desktopProfileForRemoteUrl(connection.baseUrl) ?? 'custom remote' : null
 
   const versionItem = useMemo<StatusbarItem>(() => {
     const appVersion = desktopVersion?.appVersion
@@ -190,6 +195,18 @@ export function useStatusbarItems({
         variant: 'menu'
       },
       {
+        detail: activeDesktopProfile ?? undefined,
+        hidden: !connection || connection.mode !== 'remote',
+        icon: <Users className="size-3" />,
+        id: 'desktop-profile-route',
+        label: 'Profile',
+        title: activeDesktopProfile
+          ? `Desktop is connected to ${activeDesktopProfile}`
+          : 'Desktop is connected to a custom remote backend',
+        to: PROFILES_ROUTE,
+        variant: 'action'
+      },
+      {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
           bgFailed > 0 && 'text-destructive hover:text-destructive'
@@ -227,9 +244,11 @@ export function useStatusbarItems({
     ],
     [
       agentsOpen,
+      activeDesktopProfile,
       bgFailed,
       bgRunning,
       commandCenterOpen,
+      connection,
       gatewayMenuContent,
       gatewayClassName,
       gatewayDetail,

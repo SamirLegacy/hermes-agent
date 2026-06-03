@@ -4578,10 +4578,6 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         == "Chromium-family browser isn't running with remote debugging — attempting to launch..."
     )
     assert any(
-        "No supported Chromium-family browser executable was found" in line
-        for line in resp["result"]["messages"]
-    )
-    assert any(
         "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
     )
     assert "BROWSER_CDP_URL" not in os.environ

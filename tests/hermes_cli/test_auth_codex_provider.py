@@ -16,6 +16,7 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    get_codex_auth_status,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
     resolve_provider,
@@ -218,6 +219,22 @@ def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert resolve_provider("openai-codex") == "openai-codex"
+
+
+def test_get_codex_auth_status_handles_store_lock_failure(monkeypatch):
+    import hermes_cli.auth as auth_mod
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "resolve_codex_runtime_credentials",
+        lambda: (_ for _ in ()).throw(PermissionError("auth.lock blocked")),
+    )
+
+    status = get_codex_auth_status()
+    assert status["logged_in"] is False
+    assert "Unable to read Codex auth status" in status["error"]
+    assert "auth.lock blocked" in status["error"]
 
 
 def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):

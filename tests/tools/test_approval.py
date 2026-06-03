@@ -13,6 +13,7 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    check_dangerous_command,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -127,6 +128,236 @@ class TestSafeCommand:
         assert is_dangerous is False
         assert key is None
         assert desc is None
+
+
+class TestPeekabooOwnerGates:
+    def _assert_gate(self, command: str, expected: str):
+        is_dangerous, key, desc = detect_dangerous_command(command)
+        assert is_dangerous is True, command
+        assert key == expected
+        assert desc == expected
+
+    def test_screen_capture_commands_require_owner_gate(self):
+        self._assert_gate(
+            "peekaboo see --annotate --path /tmp/peekaboo-see.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "/opt/homebrew/bin/peekaboo image --mode screen --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "peekaboo capture live --json",
+            "Peekaboo screen capture",
+        )
+
+    def test_ai_analysis_commands_require_owner_gate(self):
+        self._assert_gate(
+            "peekaboo see --mode screen --analyze 'Summarize the dashboard'",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            "peekaboo image --path /tmp/screen.png --analyze 'What changed?'",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            "peekaboo agent 'Open Safari and inspect the page'",
+            "Peekaboo AI/provider analysis",
+        )
+
+    def test_wrapper_and_env_prefixed_commands_require_owner_gate(self):
+        openai_key_env = "OPENAI_" + "API" + "_KEY"
+        self._assert_gate(
+            "PEEKABOO_AI_PROVIDERS=openai peekaboo see --analyze 'Summarize'",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            f"{openai_key_env}=dummy peekaboo agent 'Inspect the screen'",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            "/usr/bin/env peekaboo see --mode screen --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "command peekaboo see --mode screen --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "FOO='bar baz' peekaboo see --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            'FOO="bar baz" peekaboo image --path /tmp/screen.png',
+            "Peekaboo screen capture",
+        )
+
+    def test_quoted_and_launch_wrapped_commands_require_owner_gate(self):
+        self._assert_gate(
+            '"peekaboo" image --path /tmp/screen.png',
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            '"/opt/homebrew/bin/peekaboo" image --path /tmp/screen.png',
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "arch -arm64 peekaboo image --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "nice peekaboo image --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "nice -n 5 peekaboo image --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            'env -S "FOO=bar" peekaboo image --path /tmp/screen.png',
+            "Peekaboo screen capture",
+        )
+
+    def test_shell_wrapped_commands_require_owner_gate(self):
+        self._assert_gate(
+            "bash -lc 'peekaboo see --mode screen --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "zsh -c \"PEEKABOO_AI_PROVIDERS=openai peekaboo image --analyze 'Describe'\"",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            "ssh mac bash -lc 'peekaboo see --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "echo bash -lc safe && bash -lc 'peekaboo see --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "bash -O extglob -c 'peekaboo see --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "bash -o posix -c 'peekaboo see --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "bash --rcfile /tmp/bashrc -c 'peekaboo see --path /tmp/screen.png'",
+            "Peekaboo screen capture",
+        )
+
+    def test_ssh_relay_commands_require_owner_gate(self):
+        self._assert_gate(
+            "ssh mac peekaboo see --mode screen --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "ssh mac -- peekaboo see --analyze 'What is visible?'",
+            "Peekaboo AI/provider analysis",
+        )
+        self._assert_gate(
+            "ssh mac /opt/homebrew/bin/peekaboo image --path /tmp/screen.png",
+            "Peekaboo screen capture",
+        )
+        self._assert_gate(
+            "ssh -p 2222 mac PEEKABOO_AI_PROVIDERS=openai peekaboo image --analyze 'Describe'",
+            "Peekaboo AI/provider analysis",
+        )
+
+    def test_mcp_and_provider_config_require_owner_gate(self):
+        self._assert_gate(
+            "peekaboo mcp serve",
+            "Peekaboo MCP server exposure",
+        )
+        self._assert_gate(
+            "peekaboo config set-credential openai",
+            "Peekaboo provider/config credential change",
+        )
+        self._assert_gate(
+            "peekaboo config login anthropic",
+            "Peekaboo provider/config credential change",
+        )
+
+    def test_ui_inspection_and_actions_require_owner_gate(self):
+        self._assert_gate(
+            "peekaboo list --json",
+            "Peekaboo UI/app state inspection",
+        )
+        self._assert_gate(
+            "peekaboo list apps --json",
+            "Peekaboo UI/app state inspection",
+        )
+        self._assert_gate(
+            "peekaboo type 'hello' --app TextEdit",
+            "Peekaboo UI automation action",
+        )
+        self._assert_gate(
+            "peekaboo click --on B1",
+            "Peekaboo UI automation action",
+        )
+        self._assert_gate(
+            "peekaboo clipboard get --json",
+            "Peekaboo UI automation action",
+        )
+
+    def test_cleanup_requires_owner_gate_unless_dry_run(self):
+        self._assert_gate(
+            "peekaboo clean --all-snapshots",
+            "Peekaboo snapshot cleanup",
+        )
+        self._assert_gate(
+            "bash -lc 'peekaboo clean --all-snapshots'",
+            "Peekaboo snapshot cleanup",
+        )
+        self._assert_gate(
+            "peekaboo clean --all-snapshots --dry-run=false",
+            "Peekaboo snapshot cleanup",
+        )
+        for value in ["false", "0", "no", "off"]:
+            self._assert_gate(
+                f"peekaboo clean --all-snapshots --dry-run {value}",
+                "Peekaboo snapshot cleanup",
+            )
+
+    def test_status_help_and_cleanup_commands_stay_ungated(self):
+        for command in [
+            "peekaboo --version",
+            "peekaboo permissions",
+            "peekaboo list permissions",
+            "peekaboo tools --json",
+            "peekaboo clean --older-than 1 --dry-run",
+            "peekaboo clean --all-snapshots --dry-run --json",
+            "echo 'peekaboo see --path /tmp/screen.png'",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(command)
+            assert is_dangerous is False, command
+            assert key is None
+            assert desc is None
+
+    def test_peekaboo_legacy_guard_blocks_without_approval_surface(self):
+        result = check_dangerous_command(
+            "peekaboo see --path /tmp/screen.png",
+            "local",
+        )
+
+        assert result["approved"] is False
+        assert result["pattern_key"] == "Peekaboo screen capture"
+        assert result["outcome"] == "approval_surface_missing"
+        assert result["user_consent"] is False
+
+    def test_peekaboo_legacy_guard_respects_exec_ask_surface(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+        result = check_dangerous_command(
+            "peekaboo see --path /tmp/screen.png",
+            "local",
+        )
+
+        assert result["approved"] is False
+        assert result["pattern_key"] == "Peekaboo screen capture"
+        assert result["status"] == "approval_required"
 
 
 def _clear_session(key):

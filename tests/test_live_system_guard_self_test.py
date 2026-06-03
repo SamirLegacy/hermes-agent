@@ -17,9 +17,12 @@ the guard? Add a test here too.
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -204,6 +207,7 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason="systemctl not installed")
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
     # Run with check=False so we don't fail on the gateway's exit code.
@@ -216,6 +220,7 @@ def test_systemctl_status_passes_through():
     assert r is not None  # Did not raise — the guard let it through.
 
 
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason="systemctl not installed")
 def test_systemctl_show_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
@@ -226,6 +231,7 @@ def test_systemctl_show_passes_through():
     assert r is not None
 
 
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason="systemctl not installed")
 def test_systemctl_list_units_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
@@ -236,6 +242,7 @@ def test_systemctl_list_units_passes_through():
     assert r is not None
 
 
+@pytest.mark.skipif(shutil.which("systemctl") is None, reason="systemctl not installed")
 def test_systemctl_unrelated_unit_passes_through():
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
     # Use --dry-run so we don't actually try to restart anything; just
@@ -260,6 +267,19 @@ def test_kill_own_subtree_passes_through():
         p.wait(timeout=2)
     # SIGTERM = 15; subprocess returncode is -15 on POSIX.
     assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
+
+
+@pytest.mark.asyncio
+async def test_kill_asyncio_spawned_child_passes_through():
+    """Async subprocesses bypass subprocess.Popen but are still our children."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+    )
+    os.kill(proc.pid, signal.SIGTERM)
+    returncode = await asyncio.wait_for(proc.wait(), timeout=2)
+    assert returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
 
 
 def test_subprocess_pkill_with_unrelated_pattern_passes_through():
