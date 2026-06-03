@@ -525,6 +525,7 @@ export function DesktopController() {
     inferenceStatus,
     modelMenuContent,
     openAgents,
+    freshDraftReady,
     openCommandCenterSection,
     requestGateway,
     statusSnapshot,

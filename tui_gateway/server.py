@@ -1582,10 +1582,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
     ):
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
-    # Surface YOLO (approval-bypass) state so clients (desktop status bar, TUI)
-    # can hydrate their indicator on session start/resume. Mirror exactly what
-    # `config.set yolo` reports: the session-scoped flag when we have a session,
-    # else the process-level HERMES_YOLO_MODE env toggle.
+    # Per-session YOLO only — what `config.set yolo` toggles. Do not mirror
+    # HERMES_YOLO_MODE here; that is process-scoped and would lie to the desktop
+    # status bar while approvals.mode stays manual.
     yolo = False
     try:
         session_key = (session or {}).get("session_key")
@@ -1593,8 +1592,6 @@ def _session_info(agent, session: dict | None = None) -> dict:
             from tools.approval import is_session_yolo_enabled
 
             yolo = bool(is_session_yolo_enabled(session_key))
-        if not yolo:
-            yolo = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
     except Exception:
         yolo = False
     info: dict = {
@@ -5046,13 +5043,28 @@ def _(rid, params: dict) -> dict:
                     is_session_yolo_enabled,
                 )
 
-                current = is_session_yolo_enabled(session["session_key"])
-                if current:
+                raw = str(value or "").strip().lower()
+                if raw in {"1", "on", "true", "yes"}:
+                    enable_session_yolo(session["session_key"])
+                    nv = "1"
+                elif raw in {"0", "off", "false", "no"}:
                     disable_session_yolo(session["session_key"])
                     nv = "0"
                 else:
-                    enable_session_yolo(session["session_key"])
-                    nv = "1"
+                    current = is_session_yolo_enabled(session["session_key"])
+                    if current:
+                        disable_session_yolo(session["session_key"])
+                        nv = "0"
+                    else:
+                        enable_session_yolo(session["session_key"])
+                        nv = "1"
+                agent = session.get("agent")
+                if agent is not None:
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(agent, session),
+                    )
             else:
                 current = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
                 if current:

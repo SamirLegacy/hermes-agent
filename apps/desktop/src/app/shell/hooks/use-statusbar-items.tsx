@@ -8,6 +8,7 @@ import { Activity, AlertCircle, ChevronDown, Clock, Command, Hash, Loader2, Spar
 import { formatModelStatusLabel } from '@/lib/model-status-label'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
+import { setSessionYolo } from '@/lib/yolo-session'
 import { cn } from '@/lib/utils'
 import { $desktopActionTasks } from '@/store/activity'
 import { $previewServerRestartStatus } from '@/store/preview'
@@ -44,10 +45,14 @@ interface StatusbarItemsOptions {
   modelMenuContent?: ReactNode
   openAgents: () => void
   openCommandCenterSection: (section: CommandCenterSection) => void
+  freshDraftReady: boolean
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   statusSnapshot: StatusResponse | null
   toggleCommandCenter: () => void
 }
+
+const YOLO_ON_CLASS =
+  'bg-amber-500/15 text-foreground hover:bg-amber-500/25 dark:bg-amber-500/20 dark:hover:bg-amber-500/30'
 
 export function useStatusbarItems({
   agentsOpen,
@@ -60,6 +65,7 @@ export function useStatusbarItems({
   modelMenuContent,
   openAgents,
   openCommandCenterSection,
+  freshDraftReady,
   requestGateway,
   statusSnapshot,
   toggleCommandCenter
@@ -85,23 +91,26 @@ export function useStatusbarItems({
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
 
-  // Flip per-session approval bypass via the same `config.set yolo` RPC the TUI
-  // uses, then recolour from the gateway's reported value. The gateway has no
-  // `value` arg for yolo — sending the key alone toggles it.
+  // Per-session approval bypass. On a new-chat draft (no runtime session yet),
+  // arm locally; `createBackendSessionForSend` applies it after session.create.
   const toggleYolo = useCallback(async () => {
+    const next = !$yoloActive.get()
     const sid = $activeSessionId.get()
+
+    setYoloActive(next)
 
     if (!sid) {
       return
     }
 
     try {
-      const result = await requestGateway<{ value?: string }>('config.set', { key: 'yolo', session_id: sid })
-      setYoloActive(result?.value === '1')
+      await setSessionYolo(requestGateway, sid, next)
     } catch {
-      // Leave the indicator as-is if the toggle RPC fails.
+      setYoloActive(!next)
     }
   }, [requestGateway])
+
+  const showYoloToggle = gatewayState === 'open' && (!!activeSessionId || freshDraftReady)
 
   const gatewayMenuContent = useMemo(
     () => (
@@ -302,19 +311,19 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
-        // Gray (inherits tertiary text) when off, amber/yellow when on — amber
-        // is the app's existing "heads-up" colour and tracks dark/light theme.
-        className: yoloActive
-          ? 'text-amber-600 hover:text-amber-600 dark:text-amber-300 dark:hover:text-amber-300'
-          : undefined,
-        hidden: !activeSessionId,
+        className: yoloActive ? YOLO_ON_CLASS : undefined,
+        hidden: !showYoloToggle,
         icon: <Zap className="size-3" />,
         id: 'yolo',
         label: 'YOLO',
         onSelect: () => void toggleYolo(),
         title: yoloActive
-          ? 'YOLO on — auto-approving commands this session. Click to turn off.'
-          : 'YOLO off — click to auto-approve commands this session.',
+          ? activeSessionId
+            ? 'YOLO on — auto-approving dangerous commands this session. Click to turn off.'
+            : 'YOLO armed for the next session — will apply when you send the first message.'
+          : activeSessionId
+            ? 'YOLO off — click to auto-approve dangerous commands this session.'
+            : 'YOLO off — click to enable for the next session.',
         variant: 'action'
       },
       {
@@ -359,8 +368,11 @@ export function useStatusbarItems({
       currentModel,
       currentProvider,
       currentReasoningEffort,
+      freshDraftReady,
+      gatewayState,
       modelMenuContent,
       sessionStartedAt,
+      showYoloToggle,
       toggleYolo,
       turnStartedAt,
       versionItem,
