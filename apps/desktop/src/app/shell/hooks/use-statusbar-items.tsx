@@ -51,9 +51,6 @@ interface StatusbarItemsOptions {
   toggleCommandCenter: () => void
 }
 
-const YOLO_ON_CLASS =
-  'bg-amber-500/15 text-foreground hover:bg-amber-500/25 dark:bg-amber-500/20 dark:hover:bg-amber-500/30'
-
 export function useStatusbarItems({
   agentsOpen,
   commandCenterOpen,
@@ -311,9 +308,22 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
-        className: yoloActive ? YOLO_ON_CLASS : undefined,
+        className: cn(
+          yoloActive &&
+            '!text-(--ui-text-primary) bg-amber-500/10 hover:!text-(--ui-text-primary) hover:bg-amber-500/16 dark:bg-amber-400/12 dark:hover:bg-amber-400/18',
+          yoloActive &&
+            !activeSessionId &&
+            'ring-1 ring-inset ring-amber-500/30 dark:ring-amber-400/25'
+        ),
         hidden: !showYoloToggle,
-        icon: <Zap className="size-3" />,
+        icon: (
+          <Zap
+            className={cn(
+              'size-3 shrink-0',
+              yoloActive ? 'text-amber-900 dark:text-amber-100' : 'opacity-70'
+            )}
+          />
+        ),
         id: 'yolo',
         label: 'YOLO',
         onSelect: () => void toggleYolo(),
