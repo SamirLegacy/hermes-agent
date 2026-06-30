@@ -120,24 +120,17 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
-def test_background_review_summarizer_receives_captured_messages_after_close(monkeypatch):
-    """The action summarizer must see review messages even after close cleanup.
+def test_background_review_candidate_extractor_receives_captured_messages_after_close(monkeypatch):
+    """Candidate extraction must see review messages even after close cleanup.
 
-    Regression for the bug where ``review_messages`` was snapshot AFTER
-    ``review_agent.close()``. close() is allowed to clean per-session state
-    (including ``_session_messages``), so the summarizer would receive an
-    empty list and the user-visible self-improvement summary would silently
-    disappear. The fix snapshots ``_session_messages`` before teardown.
+    close() may clear _session_messages, so the review messages must be
+    snapshotted before teardown and then passed to the candidate extractor.
     """
-    import json
     import agent.background_review as bg_review
 
-    review_tool_message = {
-        "role": "tool",
-        "tool_call_id": "call_bg",
-        "content": json.dumps(
-            {"success": True, "message": "Entry added", "target": "memory"}
-        ),
+    review_assistant_message = {
+        "role": "assistant",
+        "content": '{"candidate_signals":[]}',
     }
     captured: dict = {}
     events: list[str] = []
@@ -148,30 +141,27 @@ def test_background_review_summarizer_receives_captured_messages_after_close(mon
 
         def run_conversation(self, **kwargs):
             events.append("run_conversation")
-            self._session_messages = [review_tool_message]
+            self._session_messages = [review_assistant_message]
 
         def shutdown_memory_provider(self):
             events.append("shutdown_memory_provider")
 
         def close(self):
             events.append("close")
-            # close() is allowed to clean _session_messages — the fix
-            # must have snapshot them before this runs.
             self._session_messages = []
 
-    def fake_summarize(review_messages, prior_snapshot, notification_mode="on"):
-        events.append("summarize")
+    def fake_extract(review_messages, *, agent, messages_snapshot):
+        events.append("extract")
         captured["review_messages"] = list(review_messages)
-        captured["prior_snapshot"] = list(prior_snapshot)
-        captured["notification_mode"] = notification_mode
+        captured["messages_snapshot"] = list(messages_snapshot)
         return []
 
     monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
     monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(
         bg_review,
-        "summarize_background_review_actions",
-        fake_summarize,
+        "extract_background_review_candidate_signals",
+        fake_extract,
     )
 
     messages_snapshot = [{"role": "user", "content": "hi"}]
@@ -187,11 +177,10 @@ def test_background_review_summarizer_receives_captured_messages_after_close(mon
         "run_conversation",
         "shutdown_memory_provider",
         "close",
-        "summarize",
+        "extract",
     ]
-    assert captured["review_messages"] == [review_tool_message]
-    assert captured["prior_snapshot"] == messages_snapshot
-    assert captured["notification_mode"] == "on"
+    assert captured["review_messages"] == [review_assistant_message]
+    assert captured["messages_snapshot"] == messages_snapshot
 
 
 def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
@@ -251,29 +240,18 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
 
 
 def test_background_review_summary_is_attributed_to_self_improvement_loop(monkeypatch):
-    """The CLI/gateway emission must identify the self-improvement loop.
-
-    Users who miss the line in their terminal have no way to tell that the
-    background review was what modified their skill/memory stores. The
-    summary prefix ``💾 Self-improvement review: …`` makes the origin
-    explicit so both the CLI and gateway deliveries are unambiguous.
-    """
-    import json
+    """Candidate-ledger emission must identify the self-improvement loop."""
+    import agent.background_review as bg_review
 
     captured_prints: list = []
     captured_bg_callback: list = []
 
     class FakeReviewAgent:
         def __init__(self, **kwargs):
-            # Simulate a review that successfully updated memory so
-            # _summarize_background_review_actions returns a real action.
             self._session_messages = [
                 {
-                    "role": "tool",
-                    "tool_call_id": "call_bg",
-                    "content": json.dumps(
-                        {"success": True, "message": "Entry added", "target": "memory"}
-                    ),
+                    "role": "assistant",
+                    "content": '{"candidate_signals":[]}',
                 }
             ]
 
@@ -286,8 +264,16 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
         def close(self):
             pass
 
+    def fake_extract(review_messages, *, agent, messages_snapshot):
+        return [{"claim": "good", "evidence": [{"path": "p", "excerpt": "e"}]}]
+
+    def fake_record(signal):
+        return {"disposition": "accepted", "dedupe_key": "abc123", "written": True}
+
     monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
     monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(bg_review, "extract_background_review_candidate_signals", fake_extract)
+    monkeypatch.setattr(bg_review, "record_background_review_signal", fake_record)
 
     agent = _bare_agent()
     agent._safe_print = lambda *a, **kw: captured_prints.append(" ".join(str(x) for x in a))
@@ -299,14 +285,11 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
         review_memory=True,
     )
 
-    # Exactly one summary should have been emitted, and it must identify
-    # the self-improvement review explicitly.
     assert len(captured_prints) == 1, captured_prints
     printed = captured_prints[0]
     assert "Self-improvement review" in printed, printed
-    assert "Memory updated" in printed, printed
+    assert "candidate accepted:abc123" in printed, printed
 
-    # Gateway path gets the same prefix.
     assert len(captured_bg_callback) == 1
     assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
         captured_bg_callback[0]

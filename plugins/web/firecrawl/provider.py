@@ -56,6 +56,19 @@ from tools.website_policy import check_website_access
 logger = logging.getLogger(__name__)
 
 
+def _env_value(name: str) -> str:
+    """Resolve env vars through Hermes' profile-aware config layer."""
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(name)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.getenv(name, "")
+    return (value or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Lazy Firecrawl SDK proxy
 # ---------------------------------------------------------------------------
@@ -121,8 +134,8 @@ Firecrawl = _FirecrawlProxy()
 
 def _get_direct_firecrawl_config() -> Optional[tuple]:
     """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
-    api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
-    api_url = os.getenv("FIRECRAWL_API_URL", "").strip().rstrip("/")
+    api_key = _env_value("FIRECRAWL_API_KEY")
+    api_url = _env_value("FIRECRAWL_API_URL").rstrip("/")
 
     if not api_key and not api_url:
         return None

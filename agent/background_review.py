@@ -19,9 +19,13 @@ for invariants and PR review criteria.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -108,6 +112,366 @@ def _msg_text(m: Dict) -> str:
     return ""
 
 
+def _background_review_default_ledger_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return home / "evidence" / "self-improvement" / "candidates" / "background-review.jsonl"
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _background_review_dedupe_key(signal: Dict[str, Any]) -> str:
+    source_event = signal.get("source_event") if isinstance(signal.get("source_event"), dict) else {}
+    basis = {
+        "session_id": source_event.get("session_id"),
+        "event_id": source_event.get("event_id"),
+        "signal_type": signal.get("signal_type"),
+        "candidate_class": signal.get("candidate_class"),
+        "target": signal.get("target"),
+        "claim": " ".join(str(signal.get("claim", "")).lower().split()),
+    }
+    return hashlib.sha256(_stable_json(basis).encode("utf-8")).hexdigest()[:24]
+
+
+def _target_requires_owner_gate(signal: Dict[str, Any]) -> bool:
+    target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
+    store = str(target.get("store", "")).lower()
+    path = str(target.get("path_or_name", "")).lower()
+    cls = str(signal.get("candidate_class", "")).lower()
+    tier = str(signal.get("authority_tier", "")).upper()
+    if tier == "T3" or cls in {"external_action", "skill_delete", "config_change", "governance_change", "runtime_patch"}:
+        return True
+    if store in {"external", "git", "cron", "daemon", "launchd", "hermes-runtime", "hermes-config", "governance", "hook", "customer-data"}:
+        return True
+    protected_markers = (
+        "soul.md", "hermes.md", "agents.md", "claude.md", "rules/", "governance/",
+        "hooks/", "agent/background_review.py", "gateway/", "config.yaml",
+        "model-catalog", "forbidden-actions",
+    )
+    return any(marker in path for marker in protected_markers) or any(
+        word in path for word in ("push", "publish", "send", "deploy", "secret", "credential", "oauth", "token")
+    )
+
+
+def _direct_write_blocked(signal: Dict[str, Any]) -> bool:
+    requested = signal.get("requested_action") if isinstance(signal.get("requested_action"), dict) else {}
+    tool = str(requested.get("tool", "")).lower()
+    if tool not in {"memory", "skill_manage"}:
+        return False
+    return not bool(signal.get("promotion_authorized"))
+
+
+def _normalize_background_review_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    source_event = signal.get("source_event") if isinstance(signal.get("source_event"), dict) else {}
+    evidence = signal.get("evidence") if isinstance(signal.get("evidence"), list) else []
+    clean_evidence: List[Dict[str, str]] = []
+    for item in evidence:
+        if isinstance(item, dict):
+            clean_evidence.append({
+                "path": str(item.get("path", "")),
+                "excerpt": str(item.get("excerpt", ""))[:500],
+            })
+        elif isinstance(item, str):
+            clean_evidence.append({"path": "", "excerpt": item[:500]})
+    requested = signal.get("requested_action") if isinstance(signal.get("requested_action"), dict) else {}
+    requested_action = dict(requested)
+    requested_action["blocked"] = _direct_write_blocked(signal)
+    return {
+        "source": "background_review",
+        "source_event": {
+            "session_id": str(source_event.get("session_id", "")),
+            "event_id": str(source_event.get("event_id", "")),
+            "timestamp": str(source_event.get("timestamp", "")),
+        },
+        "signal_type": str(signal.get("signal_type", "")),
+        "candidate_class": str(signal.get("candidate_class", "skill_patch")),
+        "target": signal.get("target") if isinstance(signal.get("target"), dict) else {},
+        "claim": str(signal.get("claim", "")).strip(),
+        "evidence": clean_evidence,
+        "confidence": float(signal.get("confidence", 0.0) or 0.0),
+        "recurrence_count": int(signal.get("recurrence_count", 0) or 0),
+        "future_trigger": str(signal.get("future_trigger", "")).strip(),
+        "authority_tier": str(signal.get("authority_tier", "T1") or "T1"),
+        "requested_action": requested_action,
+        "promotion_authorized": bool(signal.get("promotion_authorized")),
+    }
+
+
+def _background_review_disposition(signal: Dict[str, Any]) -> Dict[str, Any]:
+    reasons: List[str] = []
+    if not signal.get("claim"):
+        reasons.append("missing_claim")
+    if not signal.get("evidence"):
+        reasons.append("missing_evidence")
+    if signal.get("confidence", 0.0) < 0.65:
+        reasons.append("low_confidence")
+    claim = str(signal.get("claim", ""))
+    if len(claim) < 50 and not signal.get("future_trigger"):
+        reasons.append("weak_single_signal")
+    if signal.get("recurrence_count", 0) <= 0 and not signal.get("future_trigger"):
+        reasons.append("not_reusable")
+    if _target_requires_owner_gate(signal):
+        reasons.append("owner_gate_required")
+    blocking = {"missing_claim", "missing_evidence", "low_confidence", "weak_single_signal", "not_reusable"}
+    if blocking & set(reasons):
+        return {"disposition": "rejected_weak", "reasons": sorted(set(reasons))}
+    if "owner_gate_required" in reasons:
+        return {"disposition": "owner_gate_required", "reasons": sorted(set(reasons))}
+    return {"disposition": "accepted", "reasons": sorted(set(reasons))}
+
+
+def record_background_review_signal(signal: Dict[str, Any], ledger_path: Optional[str | Path] = None) -> Dict[str, Any]:
+    """Validate and record one background-review learning signal.
+
+    Background review is no longer allowed to write permanent memory/skills
+    directly. It may only emit evidence-backed candidate signals into this
+    append-only, deduped ledger. Promotion is handled by the later promotion
+    lane, not by the review fork itself.
+    """
+    normalized = _normalize_background_review_signal(signal)
+    disposition = _background_review_disposition(normalized)
+    normalized["disposition"] = disposition["disposition"]
+    normalized["reasons"] = disposition["reasons"]
+    normalized["dedupe_key"] = _background_review_dedupe_key(normalized)
+    normalized["recorded_at"] = int(time.time())
+    direct_blocked = bool((normalized.get("requested_action") or {}).get("blocked"))
+    path = Path(ledger_path) if ledger_path is not None else _background_review_default_ledger_path()
+    if disposition["disposition"] == "rejected_weak":
+        return {
+            "ok": True,
+            "written": False,
+            "disposition": "rejected_weak",
+            "reasons": disposition["reasons"],
+            "direct_write_blocked": direct_blocked,
+            "dedupe_key": normalized["dedupe_key"],
+            "path": str(path),
+        }
+    existing: set[str] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                existing.add(str(json.loads(line).get("dedupe_key", "")))
+            except Exception:
+                continue
+    if normalized["dedupe_key"] in existing:
+        return {
+            "ok": True,
+            "written": False,
+            "disposition": "duplicate",
+            "reasons": ["duplicate"],
+            "direct_write_blocked": direct_blocked,
+            "dedupe_key": normalized["dedupe_key"],
+            "path": str(path),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(_stable_json(normalized) + "\n")
+    return {
+        "ok": True,
+        "written": True,
+        "disposition": disposition["disposition"],
+        "reasons": disposition["reasons"],
+        "direct_write_blocked": direct_blocked,
+        "dedupe_key": normalized["dedupe_key"],
+        "path": str(path),
+    }
+
+
+def background_review_learning_complete(result: Dict[str, Any]) -> Dict[str, Any]:
+    path = Path(str(result.get("path", ""))) if result.get("path") else None
+    key = str(result.get("dedupe_key", ""))
+    blockers: List[str] = []
+    if result.get("disposition") not in {"accepted", "owner_gate_required", "duplicate"}:
+        blockers.append("not_accepted")
+    if result.get("disposition") != "duplicate" and not result.get("written"):
+        blockers.append("ledger_entry_missing")
+    if path and key and path.exists():
+        try:
+            found = any(json.loads(line).get("dedupe_key") == key for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except Exception:
+            found = False
+        if not found:
+            blockers.append("ledger_entry_missing")
+    elif result.get("disposition") != "duplicate":
+        blockers.append("ledger_entry_missing")
+    return {"complete": not blockers, "blockers": sorted(set(blockers))}
+
+
+def extract_background_review_candidate_signals(review_messages: List[Dict], *, agent: Any, messages_snapshot: List[Dict]) -> List[Dict[str, Any]]:
+    """Extract JSON candidate signals from the review agent's final text."""
+    signals: List[Dict[str, Any]] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        text = _msg_text(msg)
+        if not text:
+            continue
+        candidates = [text]
+        candidates.extend(match.group(1) for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S))
+        for candidate_text in candidates:
+            try:
+                parsed = json.loads(candidate_text)
+            except Exception:
+                continue
+            raw = parsed.get("candidate_signals") if isinstance(parsed, dict) else None
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        source_event = item.setdefault("source_event", {})
+                        if isinstance(source_event, dict):
+                            source_event.setdefault("session_id", getattr(agent, "session_id", ""))
+                            source_event.setdefault("event_id", f"background_review:{len(messages_snapshot or [])}")
+                        signals.append(item)
+    return signals
+
+
+def _message_text_for_learning(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return " ".join(parts).strip()
+    return ""
+
+
+def _eligible_session_learning_signal(text: str) -> bool:
+    lower = text.lower()
+    markers = (
+        "you framed", "wrong task", "generic", "do not", "don't", "never ",
+        "next time", "future", "scope boundary", "owner gate", "quality standard",
+        "fake done", "evidence", "verification", "blocked", "rework", "i hate",
+        "stop ", "must ", "should ", "angry", "correction",
+    )
+    return len(text) >= 40 and any(marker in lower for marker in markers)
+
+
+def _session_message_to_signal(session_id: str, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    text = _message_text_for_learning(message)
+    if not _eligible_session_learning_signal(text):
+        return None
+    message_id = str(message.get("id") or message.get("message_id") or message.get("turn_id") or hashlib.sha256(text.encode("utf-8")).hexdigest()[:12])
+    timestamp = str(message.get("timestamp", ""))
+    lower = text.lower()
+    authority_tier = "T3" if any(marker in lower for marker in ("push", "publish", "deploy", "runtime", "owner gate", "config", "credential", "secret")) else "T1"
+    candidate_class = "external_action" if any(marker in lower for marker in ("push", "publish", "deploy")) else "skill_patch"
+    target = {"store": "skill", "path_or_name": "software-delivery-workflows"}
+    if authority_tier == "T3" and "runtime" in lower:
+        target = {"store": "hermes-runtime", "path_or_name": "agent/background_review.py"}
+        candidate_class = "runtime_patch"
+    return {
+        "source_event": {"session_id": session_id, "event_id": message_id, "timestamp": timestamp},
+        "signal_type": "session_end_user_correction",
+        "claim": text[:500],
+        "target": target,
+        "candidate_class": candidate_class,
+        "evidence": [{"path": f"sessiondb:{session_id}:{message_id}", "excerpt": text[:500]}],
+        "confidence": 0.9,
+        "recurrence_count": 1,
+        "future_trigger": "When this class of user correction or workflow failure recurs.",
+        "authority_tier": authority_tier,
+    }
+
+
+def run_session_end_learning_hook(
+    session_db: Any,
+    session_id: str,
+    *,
+    ledger_path: Optional[str | Path] = None,
+    receipt_path: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    """Read a real SessionDB transcript and append eligible learning candidates.
+
+    The hook is fail-closed: missing/unreadable SessionDB never reports success.
+    It only writes candidate ledger entries through record_background_review_signal;
+    it never promotes memory/skill changes directly.
+    """
+    path = Path(ledger_path) if ledger_path is not None else _background_review_default_ledger_path()
+    receipt = Path(receipt_path) if receipt_path is not None else path.with_suffix(".receipt.json")
+    result: Dict[str, Any] = {
+        "status": "processed",
+        "session_id": session_id,
+        "ledger_path": str(path),
+        "receipt_path": str(receipt),
+        "created": 0,
+        "duplicates": 0,
+        "skipped": 0,
+        "malformed": 0,
+        "blocked": 0,
+        "promoted": 0,
+        "promotion_performed": False,
+        "blockers": [],
+        "decisions": [],
+    }
+    if session_db is None or not session_id:
+        result["status"] = "blocked"
+        result["blockers"].append("session_db_unavailable")
+        return result
+    try:
+        messages = session_db.get_messages(session_id)
+    except Exception as exc:
+        result["status"] = "blocked"
+        result["blockers"].append("session_db_unavailable")
+        result["error"] = str(exc)
+        return result
+    if not isinstance(messages, list):
+        result["status"] = "blocked"
+        result["blockers"].append("session_db_malformed")
+        return result
+    for message in messages:
+        if not isinstance(message, dict):
+            result["malformed"] += 1
+            continue
+        if message.get("role") != "user" or not isinstance(message.get("content"), (str, list)):
+            result["malformed"] += 1 if message.get("role") == "user" else 0
+            result["skipped"] += 0 if message.get("role") == "user" else 1
+            continue
+        signal = _session_message_to_signal(session_id, message)
+        if signal is None:
+            result["skipped"] += 1
+            continue
+        decision = record_background_review_signal(signal, path)
+        result["decisions"].append(decision)
+        if decision.get("written"):
+            result["created"] += 1
+        elif decision.get("disposition") == "duplicate":
+            result["duplicates"] += 1
+        elif decision.get("disposition") == "rejected_weak":
+            result["skipped"] += 1
+        else:
+            result["blocked"] += 1
+    if result["malformed"] or result["created"] or result["duplicates"] or result["skipped"]:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def record_session_end_learning_hook_failure(session_id: str, error: Exception | str, *, path: Optional[str | Path] = None) -> Dict[str, Any]:
+    receipt_path = Path(path) if path is not None else _background_review_default_ledger_path().with_name("session-end-hook-failures.jsonl")
+    payload = {
+        "source": "session_end_learning_hook",
+        "session_id": session_id,
+        "status": "blocked",
+        "blocker": "session_end_learning_hook_failed",
+        "error": str(error),
+        "recorded_at": int(time.time()),
+    }
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    with receipt_path.open("a", encoding="utf-8") as fh:
+        fh.write(_stable_json(payload) + "\n")
+    return {"written": True, "path": str(receipt_path), "blocker": payload["blocker"]}
+
+
 def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
     """Compact replay for the routed (different-model) path only.
 
@@ -153,210 +517,51 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
-# the user-message that the forked review agent receives.  AIAgent exposes
-# them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
-# the actual text lives here so future edits are one-place.
+# the user-message that the forked review agent receives. Background review is
+# candidate-only: it must not directly call memory or skill tools.
+_CANDIDATE_SIGNAL_SCHEMA = (
+    "Return ONLY compact JSON with this shape: "
+    "{\"candidate_signals\":[{\"source_event\":{\"session_id\":str,\"event_id\":str,\"timestamp\":str},"
+    "\"signal_type\":str,\"claim\":str,\"target\":{\"store\":str,\"path_or_name\":str},"
+    "\"candidate_class\":\"skill_patch|memory|skill_merge|skill_create|external_action|runtime_patch\","
+    "\"evidence\":[{\"path\":str,\"excerpt\":str}],\"confidence\":number,"
+    "\"recurrence_count\":number,\"future_trigger\":str,\"authority_tier\":\"T0|T1|T2|T3\"}]}"
+)
+
+_BACKGROUND_REVIEW_GATE_INSTRUCTIONS = (
+    "You are the background self-improvement reviewer. You may identify durable "
+    "learning CANDIDATES only; you must not write memory, create skills, patch "
+    "skills, delete skills, change config, send messages, commit, push, publish, "
+    "deploy, or claim learning is complete. Permanent writes are handled later by "
+    "the score-gated promotion lane.\n\n"
+    "Emit a candidate only when the signal is evidence-backed, reusable, specific, "
+    "and tied to a source event. Weak one-off comments, vague preferences, transient "
+    "environment failures, duplicate observations, and generic quality language must "
+    "produce an empty candidate_signals list.\n\n"
+    "Every candidate must include evidence path/excerpt, source_event, confidence, "
+    "target, candidate_class, authority_tier, and future_trigger. If the candidate "
+    "touches Hermes runtime, governance, hooks, config, deletion, customer data, "
+    "external send/publish/push/deploy, credentials, or cron/daemon authority, mark "
+    "authority_tier as T3 or candidate_class as runtime_patch/external_action so the "
+    "owner gate catches it.\n\n"
+    + _CANDIDATE_SIGNAL_SCHEMA + "\n\n"
+    "If no candidate survives these gates, return exactly {\"candidate_signals\":[]}."
+)
+
 _MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
-    "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "Review the conversation above for durable user-memory candidate signals only.\n\n"
+    + _BACKGROUND_REVIEW_GATE_INSTRUCTIONS
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
-    "Target shape of the library: CLASS-LEVEL skills, each with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries. This "
-    "shapes HOW you update, not WHETHER you update.\n\n"
-    "Signals to look for (any one of these warrants action):\n"
-    "  • User corrected your style, tone, format, legibility, or "
-    "verbosity. Frustration signals like 'stop doing X', 'this is too "
-    "verbose', 'don't format like this', 'why are you explaining', "
-    "'just give me the answer', 'you always do Y and I hate it', or an "
-    "explicit 'remember this' are FIRST-CLASS skill signals, not just "
-    "memory signals. Update the relevant skill(s) to embed the "
-    "preference so the next session starts already knowing.\n"
-    "  • User corrected your workflow, approach, or sequence of steps. "
-    "Encode the correction as a pitfall or explicit step in the skill "
-    "that governs that class of task.\n"
-    "  • Non-trivial technique, fix, workaround, debugging path, or "
-    "tool-usage pattern emerged that a future session would benefit "
-    "from. Capture it.\n"
-    "  • A skill that got loaded or consulted this session turned out "
-    "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do "
-    "pick one when a signal above fired:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-    "conversation for skills the user loaded via /skill-name or you "
-    "read via skill_view. If any of them covers the territory of the "
-    "new learning, PATCH that one first. It is the skill that was in "
-    "play, so it's the right one to extend.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
-    "If no loaded skill fits but an existing class-level skill does, "
-    "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella. Skills can be "
-    "packaged with three kinds of support files — use the right "
-    "directory per kind:\n"
-    "     • `references/<topic>.md` — session-specific detail (error "
-    "transcripts, reproduction recipes, provider quirks) AND "
-    "condensed knowledge banks: quoted research, API docs, external "
-    "authoritative excerpts, or domain notes you found while working "
-    "on the problem. Write it concise and for the value of the task, "
-    "not as a full mirror of upstream docs.\n"
-    "     • `templates/<name>.<ext>` — starter files meant to be "
-    "copied and modified (boilerplate configs, scaffolding, a "
-    "known-good example the agent can `reproduce with modifications`).\n"
-    "     • `scripts/<name>.<ext>` — statically re-runnable actions "
-    "the skill can invoke directly (verification scripts, fixture "
-    "generators, deterministic probes, anything the agent should run "
-    "rather than hand-type each time).\n"
-    "     Add support files via skill_manage action=write_file with "
-    "file_path starting 'references/', 'templates/', or 'scripts/'. "
-    "The umbrella's SKILL.md should gain a one-line pointer to any "
-    "new support file so future agents know it exists.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
-    "skill covers the class. The name MUST be at the class level. "
-    "The name MUST NOT be a specific PR number, error string, feature "
-    "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
-    "session artifact. If the proposed name only makes sense for "
-    "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-    "User-preference embedding (important): when the user expressed a "
-    "style/format/workflow preference, the update belongs in the "
-    "SKILL.md body, not just in memory. Memory captures 'who the user "
-    "is and what the current situation and state of your operations "
-    "are'; skills capture 'how to do this class of task for this "
-    "user'. When they complain about how you handled a task, the "
-    "skill that governs that task needs to carry the lesson.\n\n"
-    "If you notice two existing skills that overlap, note it in your "
-    "reply — the background curator handles consolidation at scale.\n\n"
-    "Protected skills (DO NOT edit these):\n"
-    "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
-    "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
-    "Do NOT capture (these become persistent self-imposed constraints "
-    "that bite you later when the environment changes):\n"
-    "  • Environment-dependent failures: missing binaries, fresh-install "
-    "errors, post-migration path mismatches, 'command not found', "
-    "unconfigured credentials, uninstalled packages. The user can fix "
-    "these — they are not durable rules.\n"
-    "  • Negative claims about tools or features ('browser tools do not "
-    "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-    "harden into refusals the agent cites against itself for months "
-    "after the actual problem was fixed.\n"
-    "  • Session-specific transient errors that resolved before the "
-    "conversation ended. If retrying worked, the lesson is the retry "
-    "pattern, not the original failure.\n"
-    "  • One-off task narratives. A user asking 'summarize today's "
-    "market' or 'analyze this PR' is not a class of work that warrants "
-    "a skill.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
-    "'Nothing to save.' is a real option but should NOT be the "
-    "default. If the session ran smoothly with no corrections and "
-    "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "Review the conversation above for durable skill/procedure candidate signals only.\n\n"
+    + _BACKGROUND_REVIEW_GATE_INSTRUCTIONS
 )
 
 _COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update two things:\n\n"
-    "**Memory**: who the user is. Did the user reveal persona, "
-    "desires, preferences, personal details, or expectations about "
-    "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-    "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-    "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-    "Signals that warrant a skill update (any one is enough):\n"
-    "  • User corrected your style, tone, format, legibility, "
-    "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-    "signal, not just a memory signal. 'stop doing X', 'don't format "
-    "like this', 'I hate when you Y' — embed the lesson in the skill "
-    "that governs that task so the next session starts fixed.\n"
-    "  • Non-trivial technique, fix, workaround, or debugging path "
-    "emerged.\n"
-    "  • A skill that was loaded or consulted turned out wrong, "
-    "missing, or outdated — patch it now.\n\n"
-    "Preference order for skills — pick the earliest that fits:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-    "loaded via /skill-name or skill_view in the conversation. If one "
-    "of them covers the learning, PATCH it first. It was in play; "
-    "it's the right place.\n"
-    "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-    "find the right one). Patch it.\n"
-    "  3. ADD A SUPPORT FILE under an existing umbrella via "
-    "skill_manage action=write_file. Three kinds: "
-    "`references/<topic>.md` for session-specific detail OR condensed "
-    "knowledge banks (quoted research, API docs excerpts, domain "
-    "notes) written concise and task-focused; `templates/<name>.<ext>` "
-    "for starter files meant to be copied and modified; "
-    "`scripts/<name>.<ext>` for statically re-runnable actions "
-    "(verification, fixture generators, probes). Add a one-line "
-    "pointer in SKILL.md so future agents find them.\n"
-    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-    "Name at the class level — NOT a PR number, error string, "
-    "codename, library-alone name, or 'fix-X / debug-Y' session "
-    "artifact. If the name only fits today's task, fall back to (1), "
-    "(2), or (3).\n\n"
-    "User-preference embedding: when the user complains about how "
-    "you handled a task, update the skill that governs that task — "
-    "memory alone isn't enough. Memory says 'who the user is and "
-    "what the current situation and state of your operations are'; "
-    "skills say 'how to do this class of task for this user'. Both "
-    "should carry user-preference lessons when relevant.\n\n"
-    "If you notice overlapping existing skills, mention it — the "
-    "background curator handles consolidation.\n\n"
-    "Protected skills (DO NOT edit these):\n"
-    "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
-    "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
-    "If the only skills that need updating are protected, say\n"
-    "'Nothing to save.' and stop.\n\n"
-    "Do NOT capture as skills (these become persistent self-imposed "
-    "constraints that bite you later when the environment changes):\n"
-    "  • Environment-dependent failures: missing binaries, fresh-install "
-    "errors, post-migration path mismatches, 'command not found', "
-    "unconfigured credentials, uninstalled packages. The user can fix "
-    "these — they are not durable rules.\n"
-    "  • Negative claims about tools or features ('browser tools do not "
-    "work', 'X tool is broken', 'cannot use Y from execute_code'). These "
-    "harden into refusals the agent cites against itself for months "
-    "after the actual problem was fixed.\n"
-    "  • Session-specific transient errors that resolved before the "
-    "conversation ended. If retrying worked, the lesson is the retry "
-    "pattern, not the original failure.\n"
-    "  • One-off task narratives. A user asking 'summarize today's "
-    "market' or 'analyze this PR' is not a class of work that warrants "
-    "a skill.\n\n"
-    "If a tool failed because of setup state, capture the FIX (install "
-    "command, config step, env var to set) under an existing setup or "
-    "troubleshooting skill — never 'this tool does not work' as a "
-    "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real signal. If "
-    "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "Review the conversation above for durable memory and skill candidate signals only.\n\n"
+    + _BACKGROUND_REVIEW_GATE_INSTRUCTIONS
 )
-
 
 
 def summarize_background_review_actions(
@@ -719,24 +924,18 @@ def _run_review_in_thread(
             # agent.compression_enabled, so this short-circuits both paths.
             review_agent.compression_enabled = False
 
-            from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
                 set_thread_tool_whitelist,
                 clear_thread_tool_whitelist,
             )
 
-            review_whitelist = {
-                t["function"]["name"]
-                for t in get_tool_definitions(
-                    enabled_toolsets=["memory", "skills"],
-                    quiet_mode=True,
-                )
-            }
+            review_whitelist: set[str] = set()
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
-                    "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    "Background review denied tool call: {tool_name}. "
+                    "Background review is candidate-ledger only and cannot "
+                    "write memory, skills, config, or external side effects."
                 ),
             )
             try:
@@ -750,9 +949,8 @@ def _run_review_in_thread(
                 review_agent.run_conversation(
                     user_message=(
                         prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
+                        + "\n\nDo not call tools. Tool calls are denied. "
+                        "Return only the candidate_signals JSON object described above."
                     ),
                     conversation_history=_review_history,
                 )
@@ -778,20 +976,24 @@ def _run_review_in_thread(
                 pass
             review_agent = None
 
-        # Scan the review agent's messages for successful tool actions
-        # and surface a compact summary to the user. Tool messages
-        # already present in messages_snapshot must be skipped, since
-        # the review agent inherits that history and would otherwise
-        # re-surface stale "created"/"updated" messages from the prior
-        # conversation as if they just happened (issue #14944).
-        actions = summarize_background_review_actions(
+        # Candidate-only background review: parse JSON candidate_signals and
+        # append accepted/owner-gated records into the controlled ledger. Direct
+        # memory/skill writes are no longer summarized because the review fork
+        # cannot call those tools.
+        candidate_actions: List[str] = []
+        for signal in extract_background_review_candidate_signals(
             review_messages,
-            messages_snapshot,
-            notification_mode=getattr(agent, "memory_notifications", "on"),
-        )
+            agent=agent,
+            messages_snapshot=messages_snapshot,
+        ):
+            result = record_background_review_signal(signal)
+            if result.get("disposition") in {"accepted", "owner_gate_required", "duplicate"}:
+                candidate_actions.append(
+                    f"candidate {result.get('disposition')}:{result.get('dedupe_key')}"
+                )
 
-        if actions:
-            summary = " · ".join(dict.fromkeys(actions))
+        if candidate_actions:
+            summary = " · ".join(dict.fromkeys(candidate_actions))
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )
@@ -868,6 +1070,10 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "record_background_review_signal",
+    "background_review_learning_complete",
+    "extract_background_review_candidate_signals",
+    "run_session_end_learning_hook",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",

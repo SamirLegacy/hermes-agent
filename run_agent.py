@@ -3367,6 +3367,15 @@ class AIAgent:
                 session_db = getattr(self, "_session_db", None)
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
+                    try:
+                        from agent import background_review as _bg_review
+                        _bg_review.run_session_end_learning_hook(session_db, session_id)
+                    except Exception as exc:
+                        try:
+                            from agent import background_review as _bg_review
+                            _bg_review.record_session_end_learning_hook_failure(session_id, exc)
+                        except Exception:
+                            pass
                     session_db.end_session(session_id, "agent_close")
         except Exception:
             pass

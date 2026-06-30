@@ -36,6 +36,19 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
+
+def _env_value(name: str) -> str:
+    """Resolve env vars through Hermes' profile-aware config layer."""
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(name)
+    except Exception:
+        value = None
+    if value is None:
+        value = os.getenv(name, "")
+    return (value or "").strip()
+
 # Module-level note: the canonical cache slots ``_parallel_client`` and
 # ``_async_parallel_client`` live on :mod:`tools.web_tools` so tests that do
 # ``tools.web_tools._parallel_client = None`` between cases see fresh state.
@@ -73,7 +86,7 @@ def _get_sync_client() -> Any:
     if cached is not None:
         return cached
 
-    api_key = os.getenv("PARALLEL_API_KEY")
+    api_key = _env_value("PARALLEL_API_KEY")
     if not api_key:
         raise ValueError(
             "PARALLEL_API_KEY environment variable not set. "
@@ -99,7 +112,7 @@ def _get_async_client() -> Any:
     if cached is not None:
         return cached
 
-    api_key = os.getenv("PARALLEL_API_KEY")
+    api_key = _env_value("PARALLEL_API_KEY")
     if not api_key:
         raise ValueError(
             "PARALLEL_API_KEY environment variable not set. "
@@ -153,7 +166,7 @@ class ParallelWebSearchProvider(WebSearchProvider):
 
     def is_available(self) -> bool:
         """Return True when ``PARALLEL_API_KEY`` is set to a non-empty value."""
-        return bool(os.getenv("PARALLEL_API_KEY", "").strip())
+        return bool(_env_value("PARALLEL_API_KEY"))
 
     def supports_search(self) -> bool:
         return True
