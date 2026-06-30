@@ -112,10 +112,11 @@ docs/superpowers/*
 # logs, and per-session caches are never artifacts of the codebase.
 .hermes/
 
-# Desktop/bootstrap install marker written into the managed checkout root by the
-# bootstrap installer. It is Hermes-managed runtime state, never a code change —
-# ignore it so `hermes update`'s `git stash push --include-untracked` does not
-# treat it as a local edit and autostash it on every run (#38529).
+# Install/bootstrap markers written into the managed checkout root by the
+# installer. They are Hermes-managed runtime state, never code changes — ignore
+# them so `hermes update`'s `git stash push --include-untracked` does not treat
+# them as local edits and autostash them on every run.
+.install_method
 .hermes-bootstrap-complete
 
 # Interrupted-update breadcrumb + recovery lock written next to the shared venv
