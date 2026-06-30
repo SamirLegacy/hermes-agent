@@ -1,7 +1,7 @@
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback } from 'react'
 
-import { getGlobalModelInfo } from '@/hermes'
+import { getGlobalModelInfo, setGlobalModel } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
 import { $activeSessionId, $currentModel, $currentProvider, setCurrentModel, setCurrentProvider } from '@/store/session'
@@ -35,24 +35,20 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
     [activeSessionId, queryClient]
   )
 
-  // Seed the composer's model state from the profile default. `force` reseeds
-  // for a profile swap (the new profile has its own default); otherwise this
-  // only fills an EMPTY selection so a user's pick (plain UI state in
-  // $currentModel) survives the lifecycle refreshes that fire on boot / fresh
-  // draft / session events. A live session owns the footer, so skip entirely.
-  const refreshCurrentModel = useCallback(async (force = false) => {
+  // Seed the draft composer's model state from the profile default. With no
+  // active runtime session the footer must always show the real configured
+  // default, not a stale local pick from a previous chat. A live session owns
+  // the footer, so skip entirely while one is focused. `_force` is retained for
+  // existing profile-swap call sites; draft refreshes are now always a reseed.
+  const refreshCurrentModel = useCallback(async (_force = false) => {
     try {
       if ($activeSessionId.get()) {
         return
       }
 
-      if (!force && $currentModel.get()) {
-        return
-      }
-
       const result = await getGlobalModelInfo()
 
-      if ($activeSessionId.get() || (!force && $currentModel.get())) {
+      if ($activeSessionId.get()) {
         return
       }
 
@@ -69,11 +65,10 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
   }, [])
 
   // Returns whether the switch succeeded so callers can await it before applying
-  // follow-up changes. The composer model is plain UI state: with no live
-  // session it's just stored (and shipped on the next session.create); with one
-  // it's scoped to that session via config.set. It NEVER writes the profile
-  // default — that lives in Settings → Model — so picking a model here can't
-  // silently mutate global config.
+  // follow-up changes. A live session switch remains scoped to that runtime via
+  // config.set. With no live session, a pick updates the profile default instead
+  // of becoming sticky local composer state; fresh chats then inherit the same
+  // source of truth the statusbar displays.
   const selectModel = useCallback(
     async (selection: ModelSelection): Promise<boolean> => {
       // Snapshot for rollback: the switch is applied optimistically, so a
@@ -86,10 +81,25 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       setCurrentProvider(selection.provider)
       updateModelOptionsCache(selection.provider, selection.model, !activeSessionId)
 
-      // No live session yet: the pick is pure UI state. session.create reads
-      // $currentModel/$currentProvider and applies it as that session's override.
       if (!activeSessionId) {
-        return true
+        try {
+          const result = await setGlobalModel(selection.provider, selection.model)
+
+          if (!result.ok) {
+            throw new Error(result.confirm_message || 'Model switch requires confirmation')
+          }
+
+          void queryClient.invalidateQueries({ queryKey: ['model-options'] })
+
+          return true
+        } catch (err) {
+          setCurrentModel(prevModel)
+          setCurrentProvider(prevProvider)
+          updateModelOptionsCache(prevProvider, prevModel, true)
+          notifyError(err, copy.modelSwitchFailed)
+
+          return false
+        }
       }
 
       try {

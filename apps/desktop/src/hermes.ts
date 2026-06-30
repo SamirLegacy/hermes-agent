@@ -742,8 +742,14 @@ export function getRecommendedDefaultModel(provider: string): Promise<Recommende
 export function setGlobalModel(
   provider: string,
   model: string
-): Promise<{ ok: boolean; provider: string; model: string }> {
-  return window.hermesDesktop.api<{ ok: boolean; provider: string; model: string }>({
+): Promise<{ confirm_message?: string; confirm_required?: boolean; model: string; ok: boolean; provider: string }> {
+  return window.hermesDesktop.api<{
+    confirm_message?: string
+    confirm_required?: boolean
+    model: string
+    ok: boolean
+    provider: string
+  }>({
     ...profileScoped(),
     path: '/api/model/set',
     method: 'POST',

@@ -19,8 +19,6 @@ import { resolveNewSessionCwd, tombstoneSessions, untombstoneSessions } from '@/
 import {
   $currentCwd,
   $currentFastMode,
-  $currentModel,
-  $currentProvider,
   $currentReasoningEffort,
   $messages,
   $sessions,
@@ -173,13 +171,11 @@ export function useSessionActions({
         const newChatProfile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
         await ensureGatewayProfile(newChatProfile)
         const cwd = $currentCwd.get().trim() || workspaceCwdForNewSession()
-        // The composer's model/effort/fast is sticky UI state ($currentModel,
-        // $currentProvider, $currentReasoningEffort, $currentFastMode). Ship it
-        // with every session.create so the new chat opens on whatever the picker
-        // shows — applied as per-session overrides, never written to the profile
-        // default (that lives in Settings → Model).
-        const uiModel = $currentModel.get().trim()
-        const uiProvider = $currentProvider.get().trim()
+        // A fresh chat must resolve its model from the backend profile default.
+        // Do NOT ship draft composer model/provider as a per-session override:
+        // stale local metadata can otherwise beat the configured default on every
+        // new chat. No-session model picks update the profile default directly;
+        // active-session picks are handled by config.set on that runtime.
         const uiEffort = $currentReasoningEffort.get().trim()
         const uiFast = $currentFastMode.get()
 
@@ -187,7 +183,6 @@ export function useSessionActions({
           cols: 96,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {}),
-          ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
           ...(uiEffort ? { reasoning_effort: uiEffort } : {}),
           ...(uiFast ? { fast: true } : {})
         })

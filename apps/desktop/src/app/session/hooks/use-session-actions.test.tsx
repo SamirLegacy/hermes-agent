@@ -12,6 +12,8 @@ import {
   $messages,
   $resumeFailedSessionId,
   setActiveSessionId,
+  setCurrentModel,
+  setCurrentProvider,
   setMessages,
   setResumeFailedSessionId,
   setSessions
@@ -114,6 +116,8 @@ describe('createBackendSessionForSend profile routing', () => {
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
     $currentCwd.set('')
+    setCurrentModel('')
+    setCurrentProvider('')
     vi.restoreAllMocks()
   })
 
@@ -154,6 +158,16 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ cwd: '/remote/worktree' })
+  })
+
+  it('does not ship stale composer model state as a new-chat override', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('gpt-5.5')
+      setCurrentProvider('openai-codex')
+    })
+
+    expect(params).not.toHaveProperty('model')
+    expect(params).not.toHaveProperty('provider')
   })
 })
 

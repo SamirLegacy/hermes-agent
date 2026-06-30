@@ -132,8 +132,9 @@ describe('useModelControls', () => {
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
 
-  it('stores a no-session pick as UI state with no gateway or global write', async () => {
+  it('persists a no-session pick as the profile default instead of sticky composer state', async () => {
     const requestGateway = vi.fn()
+    setGlobalModel.mockResolvedValue({ ok: true, provider: 'anthropic', model: 'claude-sonnet-4.6' })
     let controls!: Controls
 
     render(<Harness activeSessionId={null} onReady={value => (controls = value)} requestGateway={requestGateway} />)
@@ -145,15 +146,44 @@ describe('useModelControls', () => {
       })
     ).resolves.toBe(true)
 
-    // The pick is plain UI state; session.create ships it later. Nothing touches
-    // the gateway or the profile default here.
+    // A draft-session pick is not sticky localStorage state. It becomes the
+    // visible profile default, so fresh chats and relaunches do not resurrect
+    // an old composer override.
     expect($currentModel.get()).toBe('claude-sonnet-4.6')
     expect($currentProvider.get()).toBe('anthropic')
     expect(requestGateway).not.toHaveBeenCalled()
-    expect(setGlobalModel).not.toHaveBeenCalled()
+    expect(setGlobalModel).toHaveBeenCalledWith('anthropic', 'claude-sonnet-4.6')
   })
 
-  it('seeds an empty composer model from global but never clobbers a pick', async () => {
+  it('rolls back a no-session pick when the profile-default write is rejected', async () => {
+    const requestGateway = vi.fn()
+    setCurrentModel('claude-sonnet-5')
+    setCurrentProvider('anthropic')
+    setGlobalModel.mockResolvedValue({
+      confirm_message: 'Confirm expensive model first',
+      confirm_required: true,
+      ok: false,
+      provider: 'openrouter',
+      model: 'anthropic/claude-opus-4.7'
+    })
+    let controls!: Controls
+
+    render(<Harness activeSessionId={null} onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(
+      controls.selectModel({
+        model: 'anthropic/claude-opus-4.7',
+        provider: 'openrouter'
+      })
+    ).resolves.toBe(false)
+
+    expect($currentModel.get()).toBe('claude-sonnet-5')
+    expect($currentProvider.get()).toBe('anthropic')
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Model switch failed')
+  })
+
+  it('always reseeds a draft composer from the profile default', async () => {
     vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
 
     const { result } = renderHook(() =>
@@ -168,14 +198,16 @@ describe('useModelControls', () => {
     await result.current.refreshCurrentModel()
     expect($currentModel.get()).toBe('openai/gpt-5.5')
 
-    // A user pick must survive the lifecycle refreshes that fire on boot / fresh
-    // draft / session events.
+    // Stale local/session metadata must not survive draft refreshes. With no
+    // active runtime session, the statusbar should always show the real profile
+    // default, not a sticky composer override.
     setCurrentModel('anthropic/claude-sonnet-4.6')
     setCurrentProvider('anthropic')
     await result.current.refreshCurrentModel()
-    expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    expect($currentModel.get()).toBe('openai/gpt-5.5')
+    expect($currentProvider.get()).toBe('openai-codex')
 
-    // A profile swap forces a reseed to the new profile's default.
+    // A profile swap remains a reseed to the new profile's default.
     await result.current.refreshCurrentModel(true)
     expect($currentModel.get()).toBe('openai/gpt-5.5')
   })
