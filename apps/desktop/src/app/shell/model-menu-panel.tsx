@@ -42,7 +42,7 @@ import {
   $currentProvider,
   $currentReasoningEffort
 } from '@/store/session'
-import type { MoaConfigResponse, ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
+import type { MoaConfigResponse, ModelOptionProvider, ModelOptionsResponse, PinnedModelRef } from '@/types/hermes'
 
 import { ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
@@ -57,7 +57,7 @@ interface ModelMenuPanelProps {
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }
 
-interface ProviderGroup {
+export interface ProviderGroup {
   families: ModelFamily[]
   provider: ModelOptionProvider
 }
@@ -191,8 +191,14 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
 
   const groups = useMemo(
     () =>
-      groupModels(providers ?? [], search, { model: optionsModel, provider: optionsProvider }, effectiveVisibleModels),
-    [providers, search, optionsModel, optionsProvider, effectiveVisibleModels]
+      groupModels(
+        providers ?? [],
+        search,
+        { model: optionsModel, provider: optionsProvider },
+        effectiveVisibleModels,
+        modelOptions.data?.pinned_models ?? []
+      ),
+    [providers, search, optionsModel, optionsProvider, effectiveVisibleModels, modelOptions.data?.pinned_models]
   )
 
   return (
@@ -370,11 +376,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
 // provider serving 19 models (e.g. opencode-go) must show all 19 when the user
 // searches for it, not a truncated subset. (#47077 follow-up)
 
-function groupModels(
+export function groupModels(
   providers: ModelOptionProvider[],
   search: string,
   current: { model: string; provider: string },
-  visible: Set<string> | null
+  visible: Set<string> | null,
+  pinnedModels: readonly PinnedModelRef[] = []
 ): ProviderGroup[] {
   const q = search.trim().toLowerCase()
   const groups: ProviderGroup[] = []
@@ -398,13 +405,27 @@ function groupModels(
       // Search spans every family, regardless of visibility.
       shown = new Set(allFamilies.filter(matches).map(family => family.id))
     } else if (visible) {
-      // User has customized which models show — honor their selection exactly.
+      // User has customized which models show — honor their selection exactly,
+      // then layer configured runtime routes (current/fallback) back in so stale
+      // local visibility state cannot hide the profile's escape hatches.
       shown = new Set(
         allFamilies.filter(family => visible.has(modelVisibilityKey(provider.slug, family.id))).map(family => family.id)
       )
     } else {
       // Default: curated top-N families per provider.
       shown = new Set(allFamilies.slice(0, DEFAULT_VISIBLE_PER_PROVIDER).map(family => family.id))
+    }
+
+    if (!q && pinnedModels.length > 0) {
+      const pinnedForProvider = pinnedModels.filter(ref => ref.provider === provider.slug)
+
+      for (const ref of pinnedForProvider) {
+        const family = allFamilies.find(candidate => candidate.id === ref.model || candidate.fastId === ref.model)
+
+        if (family) {
+          shown.add(family.id)
+        }
+      }
     }
 
     // Always include the active model — but keep every row in the provider's

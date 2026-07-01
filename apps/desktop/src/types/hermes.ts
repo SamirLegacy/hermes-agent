@@ -286,8 +286,15 @@ export interface ModelCapabilities {
   reasoning: boolean
 }
 
+export interface PinnedModelRef {
+  model: string
+  provider: string
+  reason: 'current' | 'fallback' | string
+}
+
 export interface ModelOptionsResponse {
   model?: string
+  pinned_models?: PinnedModelRef[]
   provider?: string
   providers?: ModelOptionProvider[]
 }

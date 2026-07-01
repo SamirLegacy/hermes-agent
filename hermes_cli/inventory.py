@@ -227,7 +227,45 @@ def build_models_payload(
         "providers": rows,
         "model": ctx.current_model,
         "provider": ctx.current_provider,
+        "pinned_models": _pinned_model_refs(ctx),
     }
+
+
+def _pinned_model_refs(ctx: ConfigContext) -> list[dict[str, str]]:
+    """Models the picker should keep reachable despite local visibility filters.
+
+    The dropdown's visibility preferences are client-local, while the profile
+    default and fallback chain are runtime policy. If stale visibility state hides
+    a configured fallback provider, the user loses the obvious manual escape hatch
+    (for example GPT-5.5 via openai-codex). Surface those configured routes as
+    pinned refs; the frontend still renders them in provider order.
+    """
+    refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(provider: object, model: object, reason: str) -> None:
+        p = str(provider or "").strip()
+        m = str(model or "").strip()
+        if not p or not m:
+            return
+        key = (p.lower(), m.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append({"provider": p, "model": m, "reason": reason})
+
+    add(ctx.current_provider, ctx.current_model, "current")
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        for entry in get_fallback_chain(load_config()):
+            add(entry.get("provider"), entry.get("model"), "fallback")
+    except Exception:
+        pass
+
+    return refs
 
 
 def _apply_capabilities(rows: list[dict]) -> None:

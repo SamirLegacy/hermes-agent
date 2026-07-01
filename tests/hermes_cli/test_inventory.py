@@ -160,14 +160,44 @@ def test_build_models_payload_returns_expected_shape():
          "source": "built-in"},
     ]
     ctx = _empty_ctx(provider="openrouter", model="m1", base_url="")
-    with _list_auth_returning(rows):
+    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value={}):
         payload = build_models_payload(ctx)
-    assert set(payload.keys()) == {"providers", "model", "provider"}
+    assert set(payload.keys()) == {"providers", "model", "provider", "pinned_models"}
     assert payload["model"] == "m1"
     assert payload["provider"] == "openrouter"
+    assert payload["pinned_models"] == [{"provider": "openrouter", "model": "m1", "reason": "current"}]
     assert payload["providers"][0]["slug"] == "moa"
     assert payload["providers"][0]["models"] == ["default"]
     assert payload["providers"][1:] == rows
+
+
+def test_build_models_payload_pins_configured_fallback_models():
+    """Model pickers must keep configured fallback models selectable.
+
+    Regression: a stale desktop visible-models preference could hide the
+    openai-codex provider, making the configured GPT-5.5 fallback disappear
+    from the status-bar model picker even though the backend advertised it.
+    """
+    rows = [
+        {"slug": "anthropic", "name": "Anthropic", "models": ["claude-sonnet-5"],
+         "total_models": 1, "is_current": True, "is_user_defined": False,
+         "source": "built-in"},
+        {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5.5"],
+         "total_models": 1, "is_current": False, "is_user_defined": False,
+         "source": "built-in"},
+    ]
+    ctx = _empty_ctx(provider="anthropic", model="claude-sonnet-5", base_url="")
+    cfg = {
+        "fallback_providers": [{"provider": "openai-codex", "model": "gpt-5.5"}],
+    }
+
+    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value=cfg):
+        payload = build_models_payload(ctx)
+
+    assert payload["pinned_models"] == [
+        {"provider": "anthropic", "model": "claude-sonnet-5", "reason": "current"},
+        {"provider": "openai-codex", "model": "gpt-5.5", "reason": "fallback"},
+    ]
 
 
 def test_build_models_payload_does_not_call_provider_model_ids():
