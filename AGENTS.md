@@ -49,6 +49,31 @@ schema**, the one place where every addition is paid for on every API call.
 whether the product is allowed to grow. We are expansive at the edges and
 conservative at the waist.
 
+### CI is the done-gate — never claim done on red
+
+A change is done only when its CI is green — not when the code looks right, not
+when local tests pass, not when a fix was pushed. Observe the green run before
+you say done.
+
+- **Land through a PR; never push to `main`.** `main` is branch-protected:
+  direct pushes are rejected and a red PR cannot merge. Open a pull request, let
+  CI run, and merge only once it is green. There is no direct-push path to
+  `main`.
+- **Read *which* check is red, not just the red X.** The required gate is the
+  aggregate job **`All required checks pass`**, which turns red when *any*
+  sub-check fails. Open the failing run and identify the actual failing job
+  before changing anything. A red aggregate is frequently not a test failure —
+  re-fixing already-green tests against an unrelated failure is the classic
+  wasted loop.
+- **`check-attribution` is a map fix, not a code fix.** `Check contributors /
+  check-attribution` fails when a commit's author/committer email is not in
+  `AUTHOR_MAP` (`scripts/release.py`). The fix is to add the email there — never
+  touch the tests for it. `Samir <samir@local>` is already mapped; a new commit
+  identity must be added in the same PR.
+- **Cite the green run.** When you report a task complete, point to the passing
+  run (`gh run view <id>`) or the green PR state. Never call a task done while
+  its CI is in-progress or failing.
+
 ### What we want
 
 - **Fix real bugs, well.** The bulk of what lands is `fix(...)` against an
