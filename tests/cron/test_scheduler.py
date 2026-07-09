@@ -1002,6 +1002,62 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_uses_cron_reasoning_and_fast_overrides(self, tmp_path):
+        """Cron-specific inference settings must override the daily chat defaults."""
+        (tmp_path / "config.yaml").write_text(
+            """
+model:
+  provider: openai-codex
+  default: gpt-5.6-sol
+agent:
+  reasoning_effort: medium
+  service_tier: fast
+cron:
+  reasoning_effort: xhigh
+  service_tier: fast
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "terra-cron",
+            "name": "Terra cron",
+            "prompt": "hello",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-terra",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://chatgpt.com/backend-api/codex",
+                     "provider": "openai-codex",
+                     "api_mode": "responses",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.6-terra"
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert kwargs["service_tier"] == "priority"
+        assert kwargs["request_overrides"] == {"service_tier": "priority"}
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it

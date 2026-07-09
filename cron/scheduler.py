@@ -31,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -2620,10 +2620,41 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml
+        # Cron-specific inference settings override the daily chat defaults.
+        # This keeps a cost-efficient interactive model/effort while allowing
+        # scheduled work to run on a deeper reasoning tier. Fall back to the
+        # agent settings for backward compatibility when cron.* is absent.
         from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+        raw_cron_cfg = _cfg.get("cron", {})
+        cron_cfg: dict[str, Any] = raw_cron_cfg if isinstance(raw_cron_cfg, dict) else {}
+        raw_agent_cfg = _cfg.get("agent", {})
+        agent_cfg: dict[str, Any] = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        effort = str(
+            cron_cfg.get("reasoning_effort")
+            or agent_cfg.get("reasoning_effort", "")
+        ).strip()
         reasoning_config = parse_reasoning_effort(effort)
+
+        raw_service_tier = str(
+            cron_cfg.get("service_tier")
+            or agent_cfg.get("service_tier", "")
+        ).strip().lower()
+        service_tier: Optional[str] = None
+        request_overrides: dict[str, Any] = {}
+        if raw_service_tier in {"fast", "priority", "on"}:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            request_overrides = resolve_fast_mode_overrides(model) or {}
+            if request_overrides and request_overrides.get("service_tier") == "priority":
+                service_tier = "priority"
+        elif raw_service_tier not in {
+            "", "normal", "default", "standard", "off", "none"
+        }:
+            logger.warning(
+                "Job '%s': unknown cron service_tier %r, ignoring",
+                job_id,
+                raw_service_tier,
+            )
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
@@ -2807,6 +2838,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
