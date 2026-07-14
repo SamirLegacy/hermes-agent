@@ -10,6 +10,7 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -695,7 +696,19 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
 
     # Probe triggers the OAuth flow (browser redirect + callback capture).
     try:
-        tools = _probe_single_server(name, server_config)
+        try:
+            connect_timeout = float(server_config.get("connect_timeout", 30))
+        except (TypeError, ValueError, OverflowError):
+            connect_timeout = 30.0
+        if not math.isfinite(connect_timeout) or connect_timeout <= 0:
+            connect_timeout = 30.0
+        probe_config = dict(server_config)
+        probe_config["connect_timeout"] = connect_timeout
+        tools = _probe_single_server(
+            name,
+            probe_config,
+            connect_timeout=connect_timeout,
+        )
         # A clean probe is NOT proof of authentication. Some MCP servers
         # (notably Google's official Drive server) serve initialize +
         # tools/list WITHOUT auth, so the probe lists tools even when the

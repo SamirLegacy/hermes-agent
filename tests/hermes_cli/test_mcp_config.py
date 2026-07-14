@@ -716,7 +716,10 @@ class TestMcpLogin:
         # Probe returns tools even though auth never completed.
         monkeypatch.setattr(
             "hermes_cli.mcp_config._probe_single_server",
-            lambda name, cfg: [("search_files", "d"), ("read_file_content", "d")],
+            lambda name, cfg, **kwargs: [
+                ("search_files", "d"),
+                ("read_file_content", "d"),
+            ],
         )
         # No token file is created → _oauth_tokens_present() returns False.
         from hermes_cli.mcp_config import cmd_mcp_login
@@ -738,7 +741,7 @@ class TestMcpLogin:
         # cmd_mcp_login wipes tokens before probing, then the real OAuth flow
         # writes a fresh token during the probe. Simulate that: the mocked
         # probe drops a token file, mirroring a successful authorization.
-        def mock_probe(name, cfg):
+        def mock_probe(name, cfg, **kwargs):
             token_dir.mkdir(exist_ok=True)
             (token_dir / "realserver.json").write_text('{"access_token": "x"}')
             return [("a", "d"), ("b", "d"), ("c", "d")]
@@ -754,6 +757,54 @@ class TestMcpLogin:
 
         assert "Authenticated — 3 tool(s) available" in out
         assert "no OAuth token" not in out
+
+    @pytest.mark.parametrize(
+        ("configured_timeout", "expected_timeout"),
+        [
+            (12, 12.0),
+            ("not-a-number", 30.0),
+            ("nan", 30.0),
+            ("inf", 30.0),
+            (0, 30.0),
+            (-1, 30.0),
+            (10**400, 30.0),
+        ],
+    )
+    def test_login_applies_configured_probe_timeout(
+        self,
+        tmp_path,
+        monkeypatch,
+        configured_timeout,
+        expected_timeout,
+    ):
+        """OAuth login propagates a valid timeout and safely defaults invalid input."""
+        _seed_config(tmp_path, {
+            "realserver": {
+                "url": "https://mcp.example.com/mcp",
+                "auth": "oauth",
+                "connect_timeout": configured_timeout,
+            },
+        })
+        observed = {}
+
+        def mock_probe(name, cfg, **kwargs):
+            observed["config_timeout"] = cfg["connect_timeout"]
+            observed.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._oauth_tokens_present", lambda name: True
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="realserver"))
+
+        assert observed["connect_timeout"] == expected_timeout
+        assert observed["config_timeout"] == expected_timeout
 
 
 # ---------------------------------------------------------------------------
