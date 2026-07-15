@@ -629,7 +629,16 @@ def cmd_mcp_test(args):
     auth_type = cfg.get("auth", "")
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
-        _info("Auth: OAuth 2.1 PKCE")
+        oauth_config = cfg.get("oauth", {})
+        grant_type = (
+            oauth_config.get("grant_type", "authorization_code")
+            if isinstance(oauth_config, dict)
+            else "authorization_code"
+        )
+        if grant_type == "client_credentials":
+            _info("Auth: OAuth 2.1 client_credentials")
+        else:
+            _info("Auth: OAuth 2.1 PKCE")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):

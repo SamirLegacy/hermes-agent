@@ -445,6 +445,45 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    @pytest.mark.parametrize(
+        ("oauth_config", "expected_auth"),
+        [
+            ({}, "Auth: OAuth 2.1 PKCE"),
+            ({"grant_type": "authorization_code"}, "Auth: OAuth 2.1 PKCE"),
+            (
+                {"grant_type": "client_credentials"},
+                "Auth: OAuth 2.1 client_credentials",
+            ),
+        ],
+    )
+    def test_test_reports_configured_oauth_grant(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+        oauth_config,
+        expected_auth,
+    ):
+        _seed_config(tmp_path, {
+            "gbrain": {
+                "url": "http://127.0.0.1:7331/mcp",
+                "auth": "oauth",
+                "oauth": oauth_config,
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="gbrain"))
+
+        out = capsys.readouterr().out
+        assert expected_auth in out
+        if oauth_config.get("grant_type") == "client_credentials":
+            assert "Auth: OAuth 2.1 PKCE" not in out
+
 
 # ---------------------------------------------------------------------------
 # Tests: env var interpolation
