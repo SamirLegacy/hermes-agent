@@ -2174,6 +2174,8 @@ def _try_resolve_fallback_provider() -> dict | None:
                     requested=entry.get("provider"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry),
+                    explicit_api_mode=entry.get("api_mode"),
+                    target_model=entry.get("model"),
                 )
                 # Log the literal `provider` key from config, not the resolved
                 # runtime category — an Ollama fallback resolves through the
@@ -7648,6 +7650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
+
+            adapter._hermes_profile = self._active_profile_name()
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
@@ -8623,6 +8627,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
+                    adapter._hermes_profile = self._active_profile_name()
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
@@ -9493,6 +9498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._hermes_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -18767,6 +18773,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
+            # MCP connections and their registered tool handlers are global to
+            # this process, while multiplex routing changes profile per turn.
+            # Reject a turn before agent dispatch when a live source-bound
+            # client-credentials connection does not belong to this profile.
+            from tools.mcp_tool import assert_mcp_profile_compatible
+            assert_mcp_profile_compatible()
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,

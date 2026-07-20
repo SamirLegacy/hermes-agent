@@ -8,6 +8,8 @@ multiplex mode fails closed instead of leaking.
 import pytest
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from agent import secret_scope as ss
 
@@ -61,6 +63,44 @@ class TestRuntimeProviderUsesScope:
         ss.set_multiplex_active(True)
         # global var: no scope needed, no raise
         assert _getenv("HERMES_MAX_ITERATIONS") == "42"
+
+
+class TestFallbackConfigUsesScope:
+    """Fallback `key_env` resolution must stay inside the routed profile."""
+
+    def test_key_env_reads_profile_scope_not_process_environment(self, monkeypatch):
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        monkeypatch.setenv("XAI_API_KEY", "process-global-key")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"XAI_API_KEY": "wolf-profile-key"})
+        try:
+            assert (
+                resolve_entry_api_key(
+                    {
+                        "provider": "xai",
+                        "model": "grok-code-fast-1",
+                        "key_env": "XAI_API_KEY",
+                    }
+                )
+                == "wolf-profile-key"
+            )
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_key_env_fails_closed_without_scope_in_multiplex(self, monkeypatch):
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        monkeypatch.setenv("XAI_API_KEY", "must-not-leak")
+        ss.set_multiplex_active(True)
+        with pytest.raises(ss.UnscopedSecretError):
+            resolve_entry_api_key(
+                {
+                    "provider": "xai",
+                    "model": "grok-code-fast-1",
+                    "key_env": "XAI_API_KEY",
+                }
+            )
 
 
 class TestMcpInterpolationUsesScope:
@@ -156,3 +196,45 @@ class TestProfilePathResolutionUnderMultiplexScope:
             t.join()
 
         assert seen["home"] == str(prof_b)
+
+
+class TestMultiplexMcpRoutingGuard:
+    @pytest.mark.asyncio
+    async def test_profile_mcp_identity_checked_before_agent_dispatch(
+        self, tmp_path, monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        from hermes_constants import get_hermes_home
+
+        profile_b = tmp_path / "profile-b"
+        profile_b.mkdir()
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: profile_b
+        runner._run_agent_inner = AsyncMock()
+        seen = []
+
+        def reject_inherited_connection():
+            seen.append(Path(get_hermes_home()))
+            raise RuntimeError("profile-bound MCP mismatch")
+
+        monkeypatch.setattr(
+            "tools.mcp_tool.assert_mcp_profile_compatible",
+            reject_inherited_connection,
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="profile-b-chat",
+            chat_type="dm",
+            profile="profile-b",
+        )
+
+        with pytest.raises(RuntimeError, match="profile-bound MCP mismatch"):
+            await runner._run_agent(
+                "message", "context", [], source, "session-b",
+            )
+
+        assert seen == [profile_b]
+        runner._run_agent_inner.assert_not_awaited()
