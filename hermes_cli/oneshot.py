@@ -382,11 +382,66 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
+    # Resolve the primary before constructing AIAgent.  If the configured
+    # default cannot authenticate (including a valid-but-rate-limited Codex
+    # subscription), advance through the configured provider chain here.
+    # AIAgent cannot perform this particular transition because it does not
+    # exist yet.  Explicit --model/--provider requests remain provider-isolated
+    # so operator diagnostics do not silently exercise a different backend.
+    _fb = get_fallback_chain(cfg)
+    env_provider = os.getenv("HERMES_INFERENCE_PROVIDER", "").strip()
+    configured_provider = (
+        str(model_cfg.get("provider") or "").strip()
+        if isinstance(model_cfg, dict)
+        else ""
     )
+    env_provider_is_effective = bool(env_provider and not configured_provider)
+    allow_preflight_fallback = not (
+        (model or "").strip()
+        or (provider or "").strip()
+        or env_model
+        or env_provider_is_effective
+    )
+    from hermes_cli.auth import AuthError
+
+    try:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url_from_alias,
+        )
+    except (AuthError, ValueError) as primary_exc:
+        if not allow_preflight_fallback:
+            raise
+
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        for index, entry in enumerate(_fb):
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=entry["provider"],
+                    target_model=entry["model"],
+                    explicit_base_url=entry.get("base_url"),
+                    explicit_api_key=resolve_entry_api_key(entry),
+                )
+            except Exception as fallback_exc:
+                logging.debug(
+                    "oneshot preflight fallback %s failed: %s",
+                    entry.get("provider"),
+                    fallback_exc,
+                )
+                continue
+
+            effective_model = entry["model"]
+            _fb = _fb[index + 1 :]
+            logging.warning(
+                "oneshot primary provider unavailable; using fallback provider=%s model=%s",
+                entry["provider"],
+                entry["model"],
+            )
+            break
+        else:
+            raise primary_exc
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
@@ -402,11 +457,6 @@ def _run_agent(
     # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
     try:
-        # Read the effective fallback chain from profile config so oneshot
-        # workers honour the same merge semantics as interactive CLI and
-        # gateway sessions.
-        _fb = get_fallback_chain(cfg)
-
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),

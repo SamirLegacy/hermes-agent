@@ -1219,6 +1219,187 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
     assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
 
 
+@pytest.mark.parametrize(
+    ("primary_failure", "stale_env_provider"),
+    [("auth", False), ("disabled", False), ("auth", True)],
+)
+def test_oneshot_run_agent_uses_ordered_fallback_when_default_is_unavailable(
+    monkeypatch, primary_failure, stale_env_provider,
+):
+    import hermes_cli.oneshot as oneshot_mod
+    from hermes_cli.auth import AuthError
+
+    captured = {}
+    resolve_calls = []
+    fallback_chain = [
+        {"provider": "kimi-coding", "model": "k3", "key_env": "TEST_KIMI_KEY"},
+        {"provider": "zai", "model": "glm-5.2"},
+        {"provider": "xai-oauth", "model": "grok-4.5"},
+    ]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, _prompt, **_kwargs):
+            return {"final_response": "fallback ok"}
+
+        def shutdown_memory_provider(self, messages=None):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_resolve_runtime_provider(**kwargs):
+        resolve_calls.append(kwargs)
+        if kwargs.get("requested") is None:
+            if primary_failure == "disabled":
+                raise ValueError("provider 'openai-codex' is disabled in config")
+            raise AuthError(
+                "primary quota exhausted",
+                provider="openai-codex",
+                code="codex_rate_limited",
+            )
+        if kwargs.get("requested") == "kimi-coding":
+            return {
+                "api_key": "fallback-key",
+                "base_url": "https://api.kimi.example/v1",
+                "provider": "kimi-coding",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            }
+        raise AssertionError(f"unexpected provider: {kwargs.get('requested')}")
+
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+    if stale_env_provider:
+        monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "stale-provider")
+    monkeypatch.setenv("TEST_KIMI_KEY", "fallback-key")
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"default": "gpt-5.6-sol", "provider": "openai-codex"},
+            "fallback_providers": fallback_chain,
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_resolve_runtime_provider,
+    )
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
+
+    assert oneshot_mod._run_agent("hello", use_config_toolsets=False) == (
+        "fallback ok",
+        {"final_response": "fallback ok"},
+    )
+    assert [call.get("requested") for call in resolve_calls] == [None, "kimi-coding"]
+    assert resolve_calls[1]["target_model"] == "k3"
+    assert resolve_calls[1]["explicit_api_key"] == "fallback-key"
+    assert captured["provider"] == "kimi-coding"
+    assert captured["model"] == "k3"
+    assert captured["fallback_model"] == fallback_chain[1:]
+
+
+@pytest.mark.parametrize("selection_source", ["cli", "environment"])
+def test_oneshot_run_agent_does_not_fallback_for_explicit_provider(
+    monkeypatch, selection_source,
+):
+    import hermes_cli.oneshot as oneshot_mod
+    from hermes_cli.auth import AuthError
+
+    error = AuthError(
+        "explicit provider unavailable",
+        provider="openai-codex",
+        code="codex_rate_limited",
+    )
+    model_config = {"default": "gpt-5.6-sol"}
+    if selection_source == "cli":
+        model_config["provider"] = "openai-codex"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        types.SimpleNamespace(AIAgent=lambda **_kwargs: pytest.fail("agent built")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": model_config,
+            "fallback_providers": [{"provider": "kimi-coding", "model": "k3"}],
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+
+    kwargs = {}
+    if selection_source == "cli":
+        kwargs = {"model": "gpt-5.6-sol", "provider": "openai-codex"}
+    else:
+        monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openai-codex")
+
+    with pytest.raises(AuthError) as exc_info:
+        oneshot_mod._run_agent(
+            "hello",
+            use_config_toolsets=False,
+            **kwargs,
+        )
+
+    assert exc_info.value is error
+
+
+def test_oneshot_run_agent_preserves_primary_auth_error_when_fallbacks_fail(
+    monkeypatch,
+):
+    import hermes_cli.oneshot as oneshot_mod
+    from hermes_cli.auth import AuthError
+
+    primary_error = AuthError(
+        "primary quota exhausted",
+        provider="openai-codex",
+        code="codex_rate_limited",
+    )
+
+    def fake_resolve_runtime_provider(**kwargs):
+        if kwargs.get("requested") is None:
+            raise primary_error
+        raise AuthError("fallback unavailable", provider=str(kwargs.get("requested")))
+
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        types.SimpleNamespace(AIAgent=lambda **_kwargs: pytest.fail("agent built")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"default": "gpt-5.6-sol", "provider": "openai-codex"},
+            "fallback_providers": [
+                {"provider": "kimi-coding", "model": "k3"},
+                {"provider": "zai", "model": "glm-5.2"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_resolve_runtime_provider,
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        oneshot_mod._run_agent("hello", use_config_toolsets=False)
+
+    assert exc_info.value is primary_error
+
+
 def test_oneshot_run_agent_closes_agent_when_chat_raises(monkeypatch):
     import hermes_cli.oneshot as oneshot_mod
 
