@@ -45,6 +45,73 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_resolve_runtime_provider_kimi_manual_pool_detects_coding_endpoint(monkeypatch):
+    entry = SimpleNamespace(
+        **{
+            "access_" + "token": "sk-" + "kimi-fixture",
+            "source": "manual",
+            "base_" + "url": "https://api.moonshot.ai/v1",
+        }
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "kimi-coding")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="kimi-coding", target_model="k3")
+
+    assert resolved["provider"] == "kimi-coding"
+    assert resolved["base_url"] == "https://api.kimi.com/coding"
+    assert resolved["api_mode"] == "anthropic_messages"
+
+
+def test_resolve_runtime_provider_zai_manual_pool_detects_coding_endpoint(monkeypatch):
+    entry = SimpleNamespace(
+        **{
+            "access_" + "token": "zai-" + "fixture",
+            "source": "manual",
+            "base_" + "url": "https://api.z.ai/api/paas/v4",
+        }
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "zai")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+    )
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_resolve_zai_base_url",
+        lambda *_args: "https://api.z.ai/api/coding/paas/v4",
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="zai", target_model="glm-5.2")
+
+    assert resolved["provider"] == "zai"
+    assert resolved["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
     entry = SimpleNamespace(
         provider="nous",

@@ -404,6 +404,22 @@ def _resolve_runtime_from_pool_entry(
     effective_model = (target_model or model_cfg.get("default") or "")
     base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+    if provider == "kimi-coding":
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        default_url = base_url or (pconfig.inference_base_url if pconfig else "")
+        base_url = auth_mod._resolve_kimi_base_url(
+            api_key,
+            default_url,
+            _getenv("KIMI_BASE_URL", "").strip(),
+        ).rstrip("/")
+    elif provider == "zai":
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        default_url = base_url or (pconfig.inference_base_url if pconfig else "")
+        base_url = auth_mod._resolve_zai_base_url(
+            api_key,
+            default_url,
+            _getenv("GLM_BASE_URL", "").strip(),
+        ).rstrip("/")
     api_mode = "chat_completions"
     if provider == "openai-codex":
         api_mode = "codex_responses"
