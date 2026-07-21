@@ -6372,6 +6372,27 @@ class TestFallbackAnthropicProvider:
 
         assert agent._use_prompt_caching is True
 
+    def test_fallback_to_kimi_coding_sets_anthropic_api_mode(self, agent):
+        agent._fallback_activated = False
+        agent._fallback_model = {"provider": "kimi-coding", "model": "k3"}
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.kimi.com/coding"
+        setattr(mock_client, "api_" + "key", "sk-" + "kimi-fixture")
+
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.api_mode == "anthropic_messages"
+        assert agent._anthropic_client is not None
+        assert agent.client is None
+
     def test_fallback_to_openrouter_uses_openai_client(self, agent):
         agent._fallback_activated = False
         agent._fallback_model = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}

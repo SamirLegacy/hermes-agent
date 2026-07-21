@@ -1294,6 +1294,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_provider == "anthropic"
             or fb_base_url.rstrip("/").lower().endswith("/anthropic")
             or base_url_hostname(fb_base_url) == "api.anthropic.com"
+            or (
+                base_url_hostname(fb_base_url) == "api.kimi.com"
+                and fb_base_url.rstrip("/").lower().endswith("/coding")
+            )
         ):
             # Custom providers (e.g. cron-anthropic) point at the native
             # api.anthropic.com host with no "/anthropic" path suffix, so the
