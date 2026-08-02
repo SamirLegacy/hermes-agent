@@ -67,15 +67,25 @@ INSTALL_POLICY = {
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 # Patterns whose real blast radius lives in an EXECUTABLE file. In markdown they
-# often match a DOCUMENTED command (skill docs quote sanctioned call idioms like
-# `echo "<prompt>" | bash scripts/run.sh`), and a critical verdict there blocks
-# legitimate agent-authored documentation writes. Markdown downgrades them to
-# "high": agent-created/trusted skills pass as `caution` (friction fix), while
-# community skills still BLOCK on `caution` — markdown docs are executable-by-
-# proxy (the agent runs what the doc says), so third-party content keeps its
-# gate (judge finding, 2026-08-02). Encoded payloads stay covered everywhere by
-# base64_decode_pipe/hex_encoded_string, which are NOT downgraded.
-_DOC_CONTEXT_DOWNGRADE = {"echo_pipe_exec": "high"}
+# typically match a DOCUMENTED command or a plain file/path MENTION (skill docs
+# quote sanctioned call idioms like `echo "<prompt>" | bash scripts/run.sh`, or
+# reference AGENTS.md / .hermes/config.yaml as governance notes), and a critical
+# verdict there blocks legitimate agent-authored documentation writes while
+# adding no real protection: the actual attack vector (encoded payloads,
+# hardcoded secrets, getenv exfil) is covered by patterns NOT in this table.
+# Markdown downgrades these to "high": agent-created/trusted skills pass as
+# `caution` (friction fix), while community skills still BLOCK on `caution` —
+# markdown docs are executable-by-proxy (the agent runs what the doc says), so
+# third-party content keeps its gate (judge finding + FP inventory, 2026-08-02:
+# 62/107 profile skills flagged, 43 dangerous, almost all doc-mention noise).
+_DOC_CONTEXT_DOWNGRADE = {
+    "echo_pipe_exec": "high",      # documented `echo ... | bash script` idiom
+    "curl_pipe_shell": "high",     # documented `curl ... | sh` install idiom
+    "curl_pipe_python": "high",    # documented `curl ... | python` install idiom
+    "env_exfil_curl": "high",      # doc curl example with $TOKEN to first-party API
+    "agent_config_mod": "high",    # mention of AGENTS.md/CLAUDE.md/.cursorrules
+    "hermes_config_mod": "high",   # mention of .hermes/config.yaml / SOUL.md
+}
 
 
 # ---------------------------------------------------------------------------
