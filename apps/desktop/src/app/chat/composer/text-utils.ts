@@ -63,7 +63,7 @@ const AT_SCOPE_RE = new RegExp(`^(${DIRECTIVE_SCOPES.join('|')}):(.*)$`)
 // Lexical DirectivePlugin gets the same semantics from node boundaries), so
 // `@` or `/` typed immediately after a pill still opens the popover.
 const AT_TRIGGER_RE = /(?:^|[\s\uFFFC])(@)([^\s@\uFFFC]*)$/
-const SLASH_COMMAND_TRIGGER_RE = /^(\/)((?:[a-zA-Z][\w-]*(?:\s+\S*)*)?)$/
+const SLASH_COMMAND_TRIGGER_RE = /^(\/)\s?((?:[a-zA-Z][\w-]*(?:\s+\S*)*)?)$/
 const SLASH_INLINE_TRIGGER_RE = /[\s\uFFFC](\/)([a-zA-Z][\w-]*)?$/
 // `:joy` → emoji completions, Slack-style. Boundary-anchored so a mid-word
 // colon (`localhost:8080`, `note:`) never fires; two chars minimum so a bare
@@ -189,7 +189,10 @@ export function detectTrigger(textBefore: string): TriggerState | null {
   const command = SLASH_COMMAND_TRIGGER_RE.exec(textBefore)
 
   if (command) {
-    return { kind: '/', query: command[2], tokenLength: 1 + command[2].length, value: command[2] }
+    // tokenLength spans the full match — including the one optional space the
+    // regex tolerates after the slash (`/ goal`) — so the chip replaces the
+    // whole token, never leaving the stray space behind.
+    return { kind: '/', query: command[2], tokenLength: command[0].length, value: command[2] }
   }
 
   const at = AT_TRIGGER_RE.exec(textBefore)

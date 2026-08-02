@@ -1138,6 +1138,7 @@ export function ChatBar({
             {trigger && !argStageEmpty && (
               <ComposerTriggerPopover
                 activeIndex={triggerActive}
+                inline={trigger.inline}
                 items={triggerItems}
                 kind={trigger.kind}
                 loading={triggerLoading}

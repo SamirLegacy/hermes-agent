@@ -2191,6 +2191,7 @@ export const zh: Translations = {
     lookupNoMatches: '没有匹配项。',
     lookupTry: '试试',
     lookupOr: '或',
+    lookupInlineSkillsOnly: 'Only skills complete mid-message — commands run at the start of a message.', // TODO(i18n): translate
     commonCommands: '常用命令',
     hotkeys: '快捷键',
     helpFooter: '打开完整面板 · 退格键关闭',

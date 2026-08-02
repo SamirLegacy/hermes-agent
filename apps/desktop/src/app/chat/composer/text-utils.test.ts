@@ -11,6 +11,15 @@ describe('detectTrigger', () => {
     expect(detectTrigger('/skill')).toEqual({ kind: '/', query: 'skill', tokenLength: 6, value: 'skill' })
   })
 
+  it('tolerates one space after the leading slash', () => {
+    // `/ goal` behaves like `/goal` — a stray space must not silence the menu.
+    expect(detectTrigger('/ goal')).toEqual({ kind: '/', query: 'goal', tokenLength: 6, value: 'goal' })
+    // `/ ` alone still opens the bare menu.
+    expect(detectTrigger('/ ')).toEqual({ kind: '/', query: '', tokenLength: 2, value: '' })
+    // Two spaces is prose, not an invocation.
+    expect(detectTrigger('/  goal')).toBeNull()
+  })
+
   it('detects a bare at-mention trigger with an empty query', () => {
     expect(detectTrigger('@')).toEqual({ kind: '@', query: '', tokenLength: 1, value: '' })
   })

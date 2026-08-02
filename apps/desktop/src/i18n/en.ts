@@ -1998,6 +1998,7 @@ export const en: Translations = {
     lookupNoMatches: 'No matches.',
     lookupTry: 'Try',
     lookupOr: 'or',
+    lookupInlineSkillsOnly: 'Only skills complete mid-message — commands run at the start of a message.',
     commonCommands: 'Common commands',
     hotkeys: 'Hotkeys',
     helpFooter: 'opens the full panel · backspace dismisses',

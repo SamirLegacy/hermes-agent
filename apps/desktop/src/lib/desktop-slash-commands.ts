@@ -443,16 +443,23 @@ export function isDesktopSlashCommand(command: string): boolean {
   return isDesktopSlashExtensionCommand(command)
 }
 
+/** The canonical target when `command` is an alias, else null. */
+export function desktopSlashAliasTarget(command: string): string | null {
+  return ALIAS_TO_CANONICAL.get(normalizeCommand(command)) ?? null
+}
+
 /** Gates discovery in the popover/completions. */
-export function isDesktopSlashSuggestion(command: string): boolean {
+export function isDesktopSlashSuggestion(command: string, opts?: { includeAliases?: boolean }): boolean {
   const normalized = normalizeCommand(command)
 
-  // Aliases stay hidden so the popover isn't cluttered with duplicates.
-  if (ALIAS_TO_CANONICAL.has(normalized)) {
+  // Aliases stay hidden in the bare menu so it isn't cluttered with duplicates;
+  // typed queries opt in (muscle memory like `/compact` must resolve) and the
+  // row is decorated with its canonical target instead.
+  if (!opts?.includeAliases && ALIAS_TO_CANONICAL.has(normalized)) {
     return false
   }
 
-  const spec = SPEC_BY_NAME.get(normalized)
+  const spec = resolveDesktopCommand(normalized)
 
   if (spec) {
     return spec.surface.kind !== 'unavailable' && !spec.hidden

@@ -1681,6 +1681,7 @@ export const ar = defineLocale({
     lookupNoMatches: 'لا توجد نتائج',
     lookupTry: 'جرب',
     lookupOr: 'أو',
+    lookupInlineSkillsOnly: 'Only skills complete mid-message — commands run at the start of a message.', // TODO(i18n): translate
     commonCommands: 'الأوامر الشائعة',
     hotkeys: 'الاختصارات',
     helpFooter: 'استخدم الأسهم للتنقل و Enter للاختيار.',

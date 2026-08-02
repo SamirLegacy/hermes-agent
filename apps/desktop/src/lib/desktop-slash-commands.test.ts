@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   desktopSkinSlashCompletions,
+  desktopSlashAliasTarget,
   desktopSlashCommandArgumentMode,
   desktopSlashDescription,
   desktopSlashUnavailableMessage,
@@ -48,9 +49,15 @@ describe('desktop slash command curation', () => {
   it('routes /compact to /compress (context compression), not the TUI display toggle', () => {
     expect(resolveDesktopCommand('/compact')?.name).toBe('/compress')
     expect(isDesktopSlashCommand('/compact')).toBe(true)
-    // Alias stays out of the popover so /compress is the single visible entry.
+    // Bare menu: alias stays hidden so /compress is the single visible entry.
     expect(isDesktopSlashSuggestion('/compact')).toBe(false)
     expect(isDesktopSlashSuggestion('/compress')).toBe(true)
+    // Typed queries opt in: muscle memory resolves, the caller decorates the
+    // row with its canonical target.
+    expect(isDesktopSlashSuggestion('/compact', { includeAliases: true })).toBe(true)
+    expect(desktopSlashAliasTarget('/compact')).toBe('/compress')
+    expect(desktopSlashAliasTarget('/compress')).toBeNull()
+    expect(desktopSlashAliasTarget('/my-skill')).toBeNull()
   })
 
   it('surfaces /tools, /save, and /personality on the desktop', () => {

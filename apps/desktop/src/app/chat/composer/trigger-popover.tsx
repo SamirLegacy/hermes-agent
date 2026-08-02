@@ -58,6 +58,9 @@ interface ComposerTriggerPopoverProps {
   loading: boolean
   onHover: (index: number) => void
   onPick: (item: Unstable_TriggerItem) => void
+  /** True when the trigger fired mid-message (inline `/skill` refs in prose —
+   *  commands only complete at message start). Shapes the empty-state hint. */
+  inline?: boolean
   placement?: 'bottom' | 'top'
   /** The `@kind:` browse the list is filtered to, when there is one. Rendered
    *  as a header so the scope reads as the mode it is — the raw `@folder:` in
@@ -79,6 +82,7 @@ interface ComposerTriggerPopoverProps {
  */
 export function ComposerTriggerPopover({
   activeIndex,
+  inline,
   items,
   kind,
   loading,
@@ -120,6 +124,8 @@ export function ComposerTriggerPopover({
               <>
                 {copy.lookupTry} <span className="font-mono text-foreground/80">:joy:</span>.
               </>
+            ) : inline ? (
+              <>{copy.lookupInlineSkillsOnly}</>
             ) : (
               <>
                 {copy.lookupTry} <span className="font-mono text-foreground/80">/help</span>.

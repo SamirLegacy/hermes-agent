@@ -1834,6 +1834,7 @@ export const ja = defineLocale({
     lookupNoMatches: '一致なし。',
     lookupTry: '試す',
     lookupOr: 'または',
+    lookupInlineSkillsOnly: 'Only skills complete mid-message — commands run at the start of a message.', // TODO(i18n): translate
     commonCommands: '一般的なコマンド',
     hotkeys: 'ホットキー',
     helpFooter: 'フルパネルを開く · Backspace で閉じる',

@@ -7,6 +7,7 @@ import { sessionTitle } from '@/lib/chat-runtime'
 import {
   type CommandsCatalogLike,
   desktopSkinSlashCompletions,
+  desktopSlashAliasTarget,
   desktopSlashDescription,
   type DesktopThemeCommandOption,
   filterDesktopCommandsCatalog,
@@ -205,18 +206,29 @@ export function useSlashCompletions(options: {
 
             return { ...item, text: `${prefix}${argText}` }
           })
-          .filter(item => isArgCompletion || isDesktopSlashSuggestion(item.text))
-          .map(item => ({
-            ...item,
-            // Arg suggestions (e.g. `/handoff <platform>`) live under one
-            // header; otherwise split skills out from built-in commands.
-            group: isArgCompletion ? 'Options' : isDesktopSlashExtensionCommand(item.text) ? 'Skills' : 'Commands',
-            // Arg items carry their own meta (the personality/toolset/platform
-            // blurb). Only command rows get the registry description — looking
-            // one up for `/personality none` would clobber it with the parent
-            // command's text.
-            meta: isArgCompletion ? textValue(item.meta) : desktopSlashDescription(item.text, textValue(item.meta))
-          }))
+          .filter(item => isArgCompletion || isDesktopSlashSuggestion(item.text, { includeAliases: true }))
+          .map(item => {
+            // Alias rows (`/compact`) carry their canonical target up front so
+            // the user learns the primary spelling instead of discovering the
+            // alias relationship by accident.
+            const aliasTarget = isArgCompletion ? null : desktopSlashAliasTarget(item.text)
+
+            return {
+              ...item,
+              // Arg suggestions (e.g. `/handoff <platform>`) live under one
+              // header; otherwise split skills out from built-in commands.
+              group: isArgCompletion ? 'Options' : isDesktopSlashExtensionCommand(item.text) ? 'Skills' : 'Commands',
+              // Arg items carry their own meta (the personality/toolset/platform
+              // blurb). Only command rows get the registry description — looking
+              // one up for `/personality none` would clobber it with the parent
+              // command's text.
+              meta: isArgCompletion
+                ? textValue(item.meta)
+                : aliasTarget
+                  ? `(= ${aliasTarget}) ${desktopSlashDescription(item.text, textValue(item.meta))}`
+                  : desktopSlashDescription(item.text, textValue(item.meta))
+            }
+          })
 
         // Keep each group contiguous so headers render once: Commands before
         // Skills (stable within a group, preserving backend relevance order).

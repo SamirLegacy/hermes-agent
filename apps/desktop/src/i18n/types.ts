@@ -1681,6 +1681,7 @@ export interface Translations {
     lookupNoMatches: string
     lookupTry: string
     lookupOr: string
+    lookupInlineSkillsOnly: string
     commonCommands: string
     hotkeys: string
     helpFooter: string
