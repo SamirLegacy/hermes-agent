@@ -21,7 +21,9 @@ def _can_symlink():
 
 from tools.skills_guard import (
     Finding,
+    INSTALL_POLICY,
     ScanResult,
+    VERDICT_INDEX,
     scan_file,
     scan_skill,
     should_allow_install,
@@ -183,13 +185,20 @@ class TestScanFile:
         assert any(fi.category == "injection" for fi in findings)
 
     def test_echo_pipe_documented_in_markdown_is_downgraded(self, tmp_path):
-        # Skill docs quote sanctioned call idioms; the executable blast radius
-        # lives in script files, so markdown gets an informational finding.
+        # Skill docs quote sanctioned call idioms; markdown downgrades to
+        # "high" so agent-authored docs pass (caution) while community skills
+        # still block at caution — docs are executable-by-proxy.
         f = tmp_path / "SKILL.md"
         f.write_text('| route | `echo "<p>" | bash "$ROOT/dispatch.sh"` |\n')
         findings = scan_file(f, "SKILL.md")
         hits = [fi for fi in findings if fi.pattern_id == "echo_pipe_exec"]
-        assert hits and all(fi.severity == "low" for fi in hits)
+        assert hits and all(fi.severity == "high" for fi in hits)
+        # End-to-end policy: caution verdict blocks community installs but
+        # allows agent-created/trusted ones (judge finding, 2026-08-02).
+        verdict = _determine_verdict(findings)
+        assert verdict == "caution"
+        assert INSTALL_POLICY["community"][VERDICT_INDEX[verdict]] == "block"
+        assert INSTALL_POLICY["agent-created"][VERDICT_INDEX[verdict]] == "allow"
 
     def test_echo_pipe_in_script_stays_critical(self, tmp_path):
         f = tmp_path / "run.sh"

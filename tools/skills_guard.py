@@ -67,13 +67,15 @@ INSTALL_POLICY = {
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 # Patterns whose real blast radius lives in an EXECUTABLE file. In markdown they
-# almost always match a DOCUMENTED command (skill docs quote sanctioned call
-# idioms like `echo "<prompt>" | bash scripts/run.sh`), and a critical verdict
-# there blocks legitimate documentation writes. Markdown downgrades them to
-# informational "low"; script/code files keep full severity. Encoded payloads
-# stay covered everywhere by base64_decode_pipe/hex_encoded_string, which are
-# NOT downgraded.
-_DOC_CONTEXT_DOWNGRADE = {"echo_pipe_exec": "low"}
+# often match a DOCUMENTED command (skill docs quote sanctioned call idioms like
+# `echo "<prompt>" | bash scripts/run.sh`), and a critical verdict there blocks
+# legitimate agent-authored documentation writes. Markdown downgrades them to
+# "high": agent-created/trusted skills pass as `caution` (friction fix), while
+# community skills still BLOCK on `caution` — markdown docs are executable-by-
+# proxy (the agent runs what the doc says), so third-party content keeps its
+# gate (judge finding, 2026-08-02). Encoded payloads stay covered everywhere by
+# base64_decode_pipe/hex_encoded_string, which are NOT downgraded.
+_DOC_CONTEXT_DOWNGRADE = {"echo_pipe_exec": "high"}
 
 
 # ---------------------------------------------------------------------------
