@@ -66,6 +66,15 @@ INSTALL_POLICY = {
 
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
+# Patterns whose real blast radius lives in an EXECUTABLE file. In markdown they
+# almost always match a DOCUMENTED command (skill docs quote sanctioned call
+# idioms like `echo "<prompt>" | bash scripts/run.sh`), and a critical verdict
+# there blocks legitimate documentation writes. Markdown downgrades them to
+# informational "low"; script/code files keep full severity. Encoded payloads
+# stay covered everywhere by base64_decode_pipe/hex_encoded_string, which are
+# NOT downgraded.
+_DOC_CONTEXT_DOWNGRADE = {"echo_pipe_exec": "low"}
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -589,6 +598,7 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     findings = []
     lines = content.split('\n')
     seen = set()  # (pattern_id, line_number) for deduplication
+    is_markdown = file_path.suffix.lower() == '.md'
 
     # Regex pattern matching
     for pattern, pid, severity, category, description in THREAT_PATTERNS:
@@ -602,7 +612,7 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
                     matched_text = matched_text[:117] + "..."
                 findings.append(Finding(
                     pattern_id=pid,
-                    severity=severity,
+                    severity=_DOC_CONTEXT_DOWNGRADE.get(pid, severity) if is_markdown else severity,
                     category=category,
                     file=rel_path,
                     line=i,

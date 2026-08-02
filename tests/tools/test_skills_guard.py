@@ -182,6 +182,22 @@ class TestScanFile:
         assert {"sys_prompt_override", "fake_policy", "invisible_unicode"} <= ids
         assert any(fi.category == "injection" for fi in findings)
 
+    def test_echo_pipe_documented_in_markdown_is_downgraded(self, tmp_path):
+        # Skill docs quote sanctioned call idioms; the executable blast radius
+        # lives in script files, so markdown gets an informational finding.
+        f = tmp_path / "SKILL.md"
+        f.write_text('| route | `echo "<p>" | bash "$ROOT/dispatch.sh"` |\n')
+        findings = scan_file(f, "SKILL.md")
+        hits = [fi for fi in findings if fi.pattern_id == "echo_pipe_exec"]
+        assert hits and all(fi.severity == "low" for fi in hits)
+
+    def test_echo_pipe_in_script_stays_critical(self, tmp_path):
+        f = tmp_path / "run.sh"
+        f.write_text('echo "hello world" | bash scripts/run.sh\n')
+        findings = scan_file(f, "run.sh")
+        hits = [fi for fi in findings if fi.pattern_id == "echo_pipe_exec"]
+        assert hits and all(fi.severity == "critical" for fi in hits)
+
 
     def test_deduplication_per_pattern_per_line(self, tmp_path):
         f = tmp_path / "dup.sh"
