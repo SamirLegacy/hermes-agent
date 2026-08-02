@@ -279,11 +279,13 @@ def test_e_call_does_not_unwind_module_callables():
     """
     src_path = os.path.join(REPO_ROOT, "agent", "background_review.py")
     src = open(src_path, encoding="utf-8").read()
-    # The fix added: ``try: actions = summarize_background_review_actions(...)``
-    # followed by ``except Exception as e: ... actions = []``.
-    assert "actions = summarize_background_review_actions(" in src
+    # The fork routes review output through the candidate ledger instead of
+    # the direct summarize call; the #59437 invariant now guards that call:
+    # ``try: candidate_signals = extract_background_review_candidate_signals(...)``
+    # followed by ``except Exception as e: ... candidate_signals = []``.
+    assert "candidate_signals = extract_background_review_candidate_signals(" in src
     assert (
-        "summarize_background_review_actions returned partial results"
+        "extract_background_review_candidate_signals returned partial "
         in src
     ), "expected partial-results guard message present"
     # And the prior-tonon-dict guard for the call_details lookup.

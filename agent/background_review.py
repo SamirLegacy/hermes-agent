@@ -1076,11 +1076,24 @@ def _run_review_in_thread(
         # memory/skill writes are no longer summarized because the review fork
         # cannot call those tools.
         candidate_actions: List[str] = []
-        for signal in extract_background_review_candidate_signals(
-            review_messages,
-            agent=agent,
-            messages_snapshot=messages_snapshot,
-        ):
+        # #59437 invariant, carried onto the fork's candidate path: a failure
+        # while extracting review signals must not unwind the whole review —
+        # coerce to an empty list so completed review work survives.
+        try:
+            candidate_signals = extract_background_review_candidate_signals(
+                review_messages,
+                agent=agent,
+                messages_snapshot=messages_snapshot,
+            )
+        except Exception as e:
+            logger.warning(
+                "extract_background_review_candidate_signals returned partial "
+                "results after exception (treating as empty); suppressing the "
+                "error that previously aborted the entire review (#59437): %s",
+                e,
+            )
+            candidate_signals = []
+        for signal in candidate_signals:
             result = record_background_review_signal(signal)
             if result.get("disposition") in {"accepted", "owner_gate_required", "duplicate"}:
                 candidate_actions.append(
