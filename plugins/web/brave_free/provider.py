@@ -30,19 +30,6 @@ logger = logging.getLogger(__name__)
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 
-def _env_value(name: str) -> str:
-    """Resolve env vars through Hermes' profile-aware config layer."""
-    try:
-        from hermes_cli.config import get_env_value
-
-        value = get_env_value(name)
-    except Exception:
-        value = None
-    if value is None:
-        value = os.getenv(name, "")
-    return (value or "").strip()
-
-
 class BraveFreeWebSearchProvider(WebSearchProvider):
     """Search-only Brave provider using the free-tier Data-for-Search API.
 
@@ -62,7 +49,9 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
 
     def is_available(self) -> bool:
         """Return True when ``BRAVE_SEARCH_API_KEY`` is set to a non-empty value."""
-        return bool(_env_value("BRAVE_SEARCH_API_KEY"))
+        from agent.web_search_provider import get_provider_env
+
+        return bool(get_provider_env("BRAVE_SEARCH_API_KEY"))
 
     def supports_search(self) -> bool:
         return True
@@ -78,7 +67,9 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         """
         import httpx
 
-        api_key = _env_value("BRAVE_SEARCH_API_KEY")
+        from agent.web_search_provider import get_provider_env
+
+        api_key = get_provider_env("BRAVE_SEARCH_API_KEY")
         if not api_key:
             return {"success": False, "error": "BRAVE_SEARCH_API_KEY is not set"}
 
