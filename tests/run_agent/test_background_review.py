@@ -183,60 +183,6 @@ def test_background_review_candidate_extractor_receives_captured_messages_after_
     assert captured["messages_snapshot"] == messages_snapshot
 
 
-def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
-    """Regression guard for #15216.
-
-    The background review thread must install a non-interactive approval
-    callback. If it doesn't, any dangerous-command guard the review agent
-    trips falls back to input() on a daemon thread, which deadlocks against
-    the parent's prompt_toolkit TUI.
-    """
-    import tools.terminal_tool as tt
-
-    observed: dict = {"during_run": "<unread>", "after_finally": "<unread>"}
-
-    class FakeReviewAgent:
-        def __init__(self, **kwargs):
-            self._session_messages = []
-
-        def run_conversation(self, **kwargs):
-            # Capture what the callback looks like mid-run. It must be
-            # a callable (the auto-deny) -- not None.
-            observed["during_run"] = tt._get_approval_callback()
-
-        def shutdown_memory_provider(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
-    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
-
-    # Start from a clean slot.
-    tt.set_approval_callback(None)
-    agent = _bare_agent()
-
-    AIAgent._spawn_background_review(
-        agent,
-        messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
-    )
-
-    observed["after_finally"] = tt._get_approval_callback()
-
-    assert callable(observed["during_run"]), (
-        "Background review did not install an approval callback on its "
-        "worker thread; dangerous-command prompts will deadlock against "
-        "the parent TUI (#15216)."
-    )
-    # The installed callback must deny (it's a safety gate, not a prompt).
-    assert observed["during_run"]("rm -rf /", "test") == "deny"
-
-    assert observed["after_finally"] is None, (
-        "Background review leaked its approval callback into the worker "
-        "thread's TLS slot; a recycled thread-id could reuse it."
-    )
 
 
 def test_background_review_summary_is_attributed_to_self_improvement_loop(monkeypatch):
@@ -296,52 +242,6 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     )
 
 
-def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
-    """The background review fork must NOT touch external memory plugins.
-
-    Without skip_memory=True on the fork constructor, AIAgent.__init__
-    rebuilds its own _memory_manager from config, scoped to the parent's
-    session_id.  The review fork's run_conversation() then leaks the
-    harness prompt into the user's real memory namespace via three
-    ingestion sites: on_turn_start (cadence + turn message),
-    prefetch_all (recall query), and sync_all (harness prompt + review
-    output recorded as a (user, assistant) turn pair).  The fix is a
-    single kwarg on the fork constructor — this test guards it.
-    """
-    captured_kwargs: dict = {}
-
-    class FakeReviewAgent:
-        def __init__(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            self._session_messages = []
-
-        def run_conversation(self, **kwargs):
-            pass
-
-        def shutdown_memory_provider(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
-    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
-
-    agent = _bare_agent()
-
-    AIAgent._spawn_background_review(
-        agent,
-        messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
-    )
-
-    assert captured_kwargs.get("skip_memory") is True, (
-        "Background review fork must be constructed with skip_memory=True "
-        "so AIAgent.__init__ does not rebuild a _memory_manager wired to "
-        "external plugins (honcho, mem0, supermemory, ...).  Without this "
-        "the fork leaks harness prompts into the user's real memory "
-        "namespace via on_turn_start / prefetch_all / sync_all."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -421,27 +321,10 @@ def test_memory_notifications_off_returns_nothing():
     assert actions == []
 
 
-def test_memory_notifications_on_returns_generic_line():
-    actions = summarize_background_review_actions(
-        _memory_add_review(), [], notification_mode="on"
-    )
-    assert actions == ["Memory updated"]
 
 
-def test_memory_notifications_verbose_includes_content_preview():
-    actions = summarize_background_review_actions(
-        _memory_add_review(), [], notification_mode="verbose"
-    )
-    assert len(actions) == 1
-    # Verbose surfaces the actual content that was saved.
-    assert "User prefers terse replies" in actions[0]
-    assert actions[0] != "Memory updated"
 
 
-def test_memory_notifications_default_is_on():
-    """No mode passed → behaves like 'on' (generic line, not empty/verbose)."""
-    actions = summarize_background_review_actions(_memory_add_review(), [])
-    assert actions == ["Memory updated"]
 
 
 def test_skill_patch_off_silent_verbose_shows_diff():

@@ -32,19 +32,6 @@ from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-
-def _env_value(name: str) -> str:
-    """Resolve env vars through Hermes' profile-aware config layer."""
-    try:
-        from hermes_cli.config import get_env_value
-
-        value = get_env_value(name)
-    except Exception:
-        value = None
-    if value is None:
-        value = os.getenv(name, "")
-    return (value or "").strip()
-
 # Module-level note: the canonical ``_exa_client`` cache slot lives on
 # :mod:`tools.web_tools` so tests that do ``tools.web_tools._exa_client =
 # None`` between cases see fresh state. The plugin reads/writes through
@@ -64,7 +51,9 @@ def _get_exa_client() -> Any:
     if cached is not None:
         return cached
 
-    api_key = _env_value("EXA_API_KEY")
+    from agent.web_search_provider import get_provider_env
+
+    api_key = get_provider_env("EXA_API_KEY")
     if not api_key:
         raise ValueError(
             "EXA_API_KEY environment variable not set. "
@@ -113,7 +102,9 @@ class ExaWebSearchProvider(WebSearchProvider):
 
     def is_available(self) -> bool:
         """Return True when ``EXA_API_KEY`` is set to a non-empty value."""
-        return bool(_env_value("EXA_API_KEY"))
+        from agent.web_search_provider import get_provider_env
+
+        return bool(get_provider_env("EXA_API_KEY"))
 
     def supports_search(self) -> bool:
         return True

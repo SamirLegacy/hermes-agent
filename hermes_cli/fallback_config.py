@@ -13,7 +13,13 @@ def _normalized_base_url(value: Any) -> str:
 
 
 def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
-    """API key for one fallback entry: inline ``api_key``, else ``key_env``."""
+    """API key for one fallback entry: inline ``api_key``, else ``key_env``.
+
+    Mirrors the custom-provider convention (``key_env`` names the env var
+    holding the key; ``api_key_env`` accepted as an alias). Returns None when
+    neither yields a non-empty value, letting ``resolve_runtime_provider``
+    fall through to the provider's standard credential resolution.
+    """
     if not isinstance(entry, dict):
         return None
     inline = str(entry.get("api_key") or "").strip()

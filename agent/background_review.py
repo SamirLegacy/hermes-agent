@@ -67,11 +67,16 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
+        "credential_pool": getattr(agent, "_credential_pool", None),
+        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "max_tokens": getattr(agent, "max_tokens", None),
+        "command": getattr(agent, "acp_command", None),
+        "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
@@ -94,10 +99,15 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         )
         return {
             "provider": rp.get("provider") or task_provider,
-            "model": task_model,
+            "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
             "api_mode": rp.get("api_mode"),
+            "credential_pool": rp.get("credential_pool"),
+            "request_overrides": dict(rp.get("request_overrides") or {}),
+            "max_tokens": rp.get("max_output_tokens"),
+            "command": rp.get("command"),
+            "args": list(rp.get("args") or []),
             "routed": True,
         }
     except Exception as e:
@@ -655,10 +665,21 @@ def summarize_background_review_actions(
             data = json.loads(msg.get("content", "{}"))
         except (json.JSONDecodeError, TypeError):
             continue
+        # ``data`` may not be a dict — some memory/skill tool responses in
+        # older codepaths or wrapper MCP servers return a top-level JSON
+        # list (e.g. ``[{"success": true, ...}]``) or a scalar.  The original
+        # isinstance check below silently skips non-dict payloads, which
+        # is correct, but ``data.get("_change")`` further down can still
+        # hand back a list and break ``change.get("description", "")``.
+        # Defensively normalize everything through a dict-typed alias so
+        # the rest of the function can stay terse without per-call
+        # ``isinstance`` guards (#59437).
         if not isinstance(data, dict) or not data.get("success"):
             continue
         message = data.get("message", "")
-        detail = call_details.get(tcid, {})
+        detail = call_details.get(tcid) or {}
+        if not isinstance(detail, dict):
+            detail = {}
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
 
@@ -686,12 +707,30 @@ def summarize_background_review_actions(
             content = detail.get("content", "")
             old_text = detail.get("old_text", "")
             skill_name = detail.get("name", "")
-            operations = detail.get("operations") or []
+            # ``operations`` may be anything callable put into the JSON
+            # arguments.  Anything non-iterable that isn't a list[str]
+            # of dicts becomes unusable here, so coerce defensively.
+            ops_raw = detail.get("operations")
+            operations: list = (
+                ops_raw if isinstance(ops_raw, list) else []
+            )
             max_preview = 120
             if is_skill:
-                change = data.get("_change", {})
-                old_string = change.get("old", "") or detail.get("old_string", "")
-                new_string = change.get("new", "") or detail.get("new_string", "")
+                # ``_change`` is a free-form dict the skill tool leaves in
+                # the response.  Older / wrapper MCP backends return it
+                # as a list, an int, or a JSON-shaped scalar — normalize
+                # to a dict so the .get() calls downstream don't
+                # AttributeError (#59437).
+                change_raw = data.get("_change")
+                change: dict = (
+                    change_raw if isinstance(change_raw, dict) else {}
+                )
+                old_string = (
+                    change.get("old", "") or detail.get("old_string", "")
+                )
+                new_string = (
+                    change.get("new", "") or detail.get("new_string", "")
+                )
                 description = change.get("description", "")
                 if action == "patch" and (old_string or new_string):
                     old_preview = old_string[:80].replace("\n", " ") + (
@@ -712,7 +751,13 @@ def summarize_background_review_actions(
                     actions.append(f"📝 {message}" if message else f"Skill {action}")
             elif operations:
                 for op in operations:
-                    op = op or {}
+                    # Each element must be a dict-of-fields; some
+                    # legacy codepaths serialize the entry as a bare
+                    # string and the message dict doesn't exist.  Skip
+                    # non-dict items defensively — they have no
+                    # actionable fields anyway (#59437).
+                    if not isinstance(op, dict):
+                        continue
                     op_act = op.get("action", "")
                     op_content = (op.get("content") or "")
                     op_old = (op.get("old_text") or "")
@@ -851,6 +896,25 @@ def _run_review_in_thread(
             # Match parent's toolset config so ``tools[]`` is byte-identical
             # in the request body — Anthropic's cache key includes it.
             # (The runtime whitelist below still restricts dispatch.)
+            _fork_kwargs: Dict[str, Any] = {}
+            if isinstance(_rt.get("max_tokens"), int):
+                _fork_kwargs["max_tokens"] = _rt["max_tokens"]
+            if isinstance(_rt.get("command"), str) and _rt["command"]:
+                _fork_kwargs["acp_command"] = _rt["command"]
+                _fork_kwargs["acp_args"] = _rt.get("args") or []
+            # Match parent's reasoning config so the fork's ``thinking`` /
+            # ``output_config`` are byte-identical in the request body —
+            # Anthropic's cache key is namespaced by ``thinking`` presence.
+            # Same-model path only: when routed to a different aux model the
+            # cache is cold regardless (parity buys nothing) and the parent's
+            # effort vocabulary may not be valid for the routed model/provider
+            # (e.g. OpenRouter ``extra_body.reasoning.effort`` is forwarded
+            # unclamped; codex_responses passes ``max``/``ultra`` through
+            # unmapped except on gpt-5.6/xAI). Let the routed fork use
+            # provider defaults — matching the ``not _routed`` gate on
+            # _cached_system_prompt below.
+            if not _routed:
+                _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=16,
@@ -860,11 +924,13 @@ def _run_review_in_thread(
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
-                credential_pool=getattr(agent, "_credential_pool", None),
+                credential_pool=_rt.get("credential_pool"),
+                request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
