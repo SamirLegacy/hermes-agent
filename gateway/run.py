@@ -474,20 +474,12 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redacted
 
 
-def _redact_approval_command(cmd: "str | None") -> str:
-    """Redact credentials from a command before it goes into an approval prompt.
-
-    Tirith's *findings* are already redacted, but the gateway approval prompt
-    is built from the raw command string, so a credential-shaped value Tirith
-    flagged would otherwise be echoed verbatim to the chat platform (#48456).
-    Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor
-    — so the prompt honors redaction even when ``security.redact_secrets`` is
-    off. Module-level so the wiring is unit-testable (the call site is a deeply
-    nested gateway closure that cannot be driven directly).
-    """
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(str(cmd or ""), force=True)
+# Re-exported for existing call sites (this module and gateway/platforms/api_server.py)
+# that reference ``_redact_approval_command`` — moved to gateway/redact_approval.py so
+# tui_gateway/server.py can import it at module top-level instead of lazily inside
+# _emit_approval_request() (see gateway/redact_approval.py docstring for the incident
+# this fixes).
+from gateway.redact_approval import _redact_approval_command  # noqa: E402
 
 
 def _format_exec_approval_fallback(

@@ -3112,7 +3112,7 @@ def _run_approval_gate(
             if decision.get("notify_failed"):
                 return {
                     "approved": False,
-                    "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+                    "message": _format_notify_failed_message(decision.get("notify_error")),
                     "pattern_key": pattern_key,
                     "description": description,
                 }
@@ -3414,6 +3414,33 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+def _format_notify_failed_message(notify_error: str | None) -> str:
+    """Build the tool-facing message for a notify_cb failure.
+
+    A notify_cb raising (e.g. an ``ImportError`` from a lazy import racing an
+    in-place source update — the 2026-08-04 incident) is an approval
+    *delivery* defect, not a user decision: the request never reached the
+    user, so it was neither approved nor denied. The prior text ("BLOCKED:
+    Failed to send approval request to user. Do NOT retry.") was
+    denial-shaped and told the agent consent was withheld when consent was
+    never sought, and forbade retrying a transient delivery failure that a
+    backend restart clears. This message states what actually happened: the
+    failure detail, that no decision was made, that retrying is allowed once
+    delivery is restored, and that the user can approve out-of-band if
+    urgent. Shared by every ``_await_gateway_decision`` caller so the wording
+    stays one honest text instead of drifting per call site.
+    """
+    detail = f" ({notify_error})" if notify_error else ""
+    return (
+        "APPROVAL DELIVERY FAILED: could not send the approval request to "
+        f"the user{detail}. This is NOT a denial — the user was never asked "
+        "and has neither approved nor declined. Retry is allowed once the "
+        "approval delivery path is restored (for example, after a backend "
+        "restart). If this is urgent, have the user approve out-of-band "
+        "through another channel."
+    )
+
+
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
@@ -3425,9 +3452,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     heartbeat-polling wait loop lives in one place.
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
-    ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
-    notify callback raised.  Persistence of an approved choice and building
-    the final tool-facing result dict remain the caller's responsibility.
+    ``{"resolved": False, "choice": None, "notify_failed": True,
+    "notify_error": str}`` if the notify callback raised — ``notify_error``
+    carries the exception class/message so callers can build an honest
+    delivery-failure message via ``_format_notify_failed_message()`` instead
+    of misreporting it as a denial.  Persistence of an approved choice and
+    building the final tool-facing result dict remain the caller's
+    responsibility.
     """
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
@@ -3464,7 +3495,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
-        return {"resolved": False, "choice": None, "notify_failed": True}
+        return {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+            "notify_error": f"{type(exc).__name__}: {exc}",
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
@@ -3839,7 +3875,7 @@ def check_all_command_guards(command: str, env_type: str,
             if decision.get("notify_failed"):
                 return {
                     "approved": False,
-                    "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+                    "message": _format_notify_failed_message(decision.get("notify_error")),
                     "pattern_key": primary_key,
                     "description": combined_desc,
                 }

@@ -37,6 +37,7 @@ from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from gateway.redact_approval import _redact_approval_command
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -1802,8 +1803,6 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
         elif "allow_permanent" in payload:
             payload["choices"] = ["once", "session", "always", "deny"]
     if "command" in payload:
-        from gateway.run import _redact_approval_command
-
         payload["command"] = _redact_approval_command(payload.get("command"))
     _emit("approval.request", sid, payload)
 
