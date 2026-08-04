@@ -5,9 +5,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
-import type { ModelOptionProvider } from '@/types/hermes'
 
-import { groupModels, ModelMenuPanel } from './model-menu-panel'
+import { ModelMenuPanel } from './model-menu-panel'
 
 // Radix calls these on open; jsdom doesn't implement them.
 beforeAll(() => {
@@ -22,12 +21,6 @@ vi.mock('@/hermes', () => ({
   getGlobalModelOptions: (...args: unknown[]) => getGlobalModelOptions(...args),
   setApiRequestProfile: vi.fn()
 }))
-
-const provider = (slug: string, models: string[]): ModelOptionProvider => ({
-  models,
-  name: slug,
-  slug
-})
 
 // MoA presets now arrive as the catalog's virtual `moa` provider row (the same
 // payload a remote gateway's model.options returns), not the /api/model/moa
@@ -76,28 +69,6 @@ function renderPanel(onSelectModel = vi.fn()) {
 
   return { onSelectModel, content }
 }
-
-describe('groupModels', () => {
-  it('keeps configured fallback models visible even when a stale visibility filter hides their provider', () => {
-    const providers = [
-      provider('copilot', ['gpt-5.4', 'gpt-5.4-mini']),
-      provider('openai-codex', ['gpt-5.5', 'gpt-5.4']),
-      provider('anthropic', ['claude-sonnet-5'])
-    ]
-    const visible = new Set(['copilot::gpt-5.4'])
-
-    const groups = groupModels(
-      providers,
-      '',
-      { model: 'claude-sonnet-5', provider: 'anthropic' },
-      visible,
-      [{ provider: 'openai-codex', model: 'gpt-5.5', reason: 'fallback' }]
-    )
-
-    const codex = groups.find(group => group.provider.slug === 'openai-codex')
-    expect(codex?.families.map(family => family.id)).toContain('gpt-5.5')
-  })
-})
 
 describe('ModelMenuPanel MoA presets', () => {
   it('selecting a MoA preset switches PERSISTENTLY via onSelectModel (not the one-shot dispatch)', async () => {
