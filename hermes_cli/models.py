@@ -441,9 +441,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-5.4",
     ],
     "opencode-zen": [
-        "gpt-5.6-luna",
         "kimi-k2.5",
         "kimi-k2.6",
+        "gpt-5.6-luna",
         "gemini-3.5-flash",
         "gemini-3.1-pro",
         "gemini-3-flash",
@@ -467,6 +467,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3-ultra-free",
     ],
     "opencode-go": [
+        "gpt-5.6-luna",
         "kimi-k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
