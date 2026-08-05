@@ -1246,6 +1246,109 @@ class TestApprovalTimeoutIsNotConsent:
         assert "rephrase" in r["message"].lower()
 
 
+# =========================================================================
+# notify_cb failure is a delivery defect, not a denial (2026-08-04)
+#
+# tui_gateway/server.py:_emit_approval_request used to do
+# ``from gateway.run import _redact_approval_command`` INSIDE the function,
+# on every call. When gateway/run.py was mid-write during an in-place
+# source update, that lazy import raised ImportError; the exception
+# propagated out of notify_cb into _await_gateway_decision's
+# ``except Exception`` guard, which set ``notify_failed=True``.
+# check_all_command_guards / _run_approval_gate then reported
+# "BLOCKED: Failed to send approval request to user. Do NOT retry." — a
+# denial-shaped message for a failure that never reached the user.
+#
+# Fix A moved the redaction helper to gateway/redact_approval.py and made
+# both call sites import it at module top-level, so this specific
+# ImportError can no longer happen. Fix B (tested here) makes the
+# notify-failure message honest for the general case: any notify_cb
+# exception must produce a message that says delivery failed, names the
+# exception, states this is NOT a denial, and says retry is allowed.
+# =========================================================================
+
+
+class TestApprovalNotifyFailureIsHonestNotADenial:
+    """notify_cb raising must not be misreported as the user denying (Fix B)."""
+
+    SESSION_KEY = "test-notify-failure-session"
+
+    def setup_method(self):
+        from tools import approval as mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
+
+        self._saved_env = {
+            k: os.environ.get(k)
+            for k in ("HERMES_GATEWAY_SESSION", "HERMES_CRON_SESSION",
+                      "HERMES_YOLO_MODE",
+                      "HERMES_SESSION_KEY", "HERMES_INTERACTIVE")
+        }
+        os.environ.pop("HERMES_YOLO_MODE", None)
+        os.environ.pop("HERMES_INTERACTIVE", None)
+        os.environ.pop("HERMES_CRON_SESSION", None)
+        os.environ["HERMES_GATEWAY_SESSION"] = "1"
+        os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+
+    def teardown_method(self):
+        from tools import approval as mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_format_notify_failed_message_is_honest(self):
+        """Unit contract for the shared message builder: names the failure,
+        states it is not a denial, and says retry is allowed."""
+        from tools.approval import _format_notify_failed_message
+
+        msg = _format_notify_failed_message("ImportError: cannot import name '_redact_approval_command'")
+
+        assert "ImportError" in msg
+        assert "not a denial" in msg.lower()
+        assert "retry is allowed" in msg.lower()
+        assert "out-of-band" in msg.lower()
+        # Must NOT reuse the old denial-shaped wording that told the agent
+        # a real decision had been made.
+        assert "do not retry" not in msg.lower()
+
+    def test_notify_cb_import_error_yields_honest_message_not_denial(self, monkeypatch):
+        """RED-CAPABLE: reverting Fix B (restoring the old static BLOCKED
+        string at the check_all_command_guards call site) makes this test
+        fail, because the old text neither names the exception nor says
+        'not a denial' / 'retry is allowed'."""
+        from tools import approval as mod
+
+        monkeypatch.setattr(
+            mod, "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 5},
+        )
+
+        def _raising_notify(data):
+            raise ImportError("cannot import name '_redact_approval_command' from 'gateway.run'")
+
+        mod.register_gateway_notify(self.SESSION_KEY, _raising_notify)
+
+        result = mod.check_all_command_guards("rm -rf .git", "local")
+
+        assert result["approved"] is False
+        msg = result["message"]
+        # Honesty: names what actually happened.
+        assert "ImportError" in msg
+        assert "not a denial" in msg.lower()
+        assert "retry is allowed" in msg.lower()
+        # Must not carry the old denial-shaped phrasing that forbade retry
+        # and implied the user had responded.
+        assert "do not retry" not in msg.lower()
+        assert "the user has not consented" not in msg.lower()
+
+
 class TestTirithImportErrorFailOpenPolicy:
     """Regression guard for #20733.
 
