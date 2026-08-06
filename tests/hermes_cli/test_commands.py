@@ -1027,3 +1027,124 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+
+
+class TestTelegramMenuSkillPriority:
+    """``command_menu.priority`` must cover skill entries, not only core commands.
+
+    Previously the configured priority list reordered only the core-command
+    tier; skills always filled remaining slots alphabetically and were the
+    first tier trimmed at the cap — so a configured skill priority was inert
+    exactly where it mattered (overfull menus).  These tests pin the
+    contract: priority-listed skills float above alphabetical fill and
+    survive the trim; without a configured priority, ordering stays strictly
+    alphabetical.
+    """
+
+    @staticmethod
+    def _fake_skill_cmds(skills_dir, names):
+        return {
+            f"/{name}": {
+                "name": name,
+                "description": f"{name} skill",
+                "skill_md_path": f"{skills_dir}/{name}/SKILL.md",
+                "skill_dir": f"{skills_dir}/{name}",
+            }
+            for name in names
+        }
+
+    def test_priority_skill_survives_cap_trim(self, tmp_path, monkeypatch):
+        """A priority-listed skill must win the last slot over alphabetically
+        earlier non-priority skills."""
+        from unittest.mock import patch
+        from hermes_cli.commands import (
+            _collect_gateway_skill_entries,
+            _sanitize_telegram_name,
+        )
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        fake_cmds = self._fake_skill_cmds(local_dir, ["alpha-skill", "zeta-skill"])
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            entries, hidden_skills = _collect_gateway_skill_entries(
+                platform="telegram",
+                max_slots=1,
+                reserved_names=set(),
+                desc_limit=40,
+                sanitize_name=_sanitize_telegram_name,
+                priority_names=("zeta_skill",),
+            )
+        names = [n for n, _d, _k in entries]
+        assert names == ["zeta_skill"], (
+            f"priority-listed skill must take the single slot, got {names}"
+        )
+        assert hidden_skills == 1
+
+    def test_priority_order_among_matches(self, tmp_path, monkeypatch):
+        """Multiple priority skills appear in configured order, then the rest
+        alphabetically."""
+        from unittest.mock import patch
+        from hermes_cli.commands import (
+            _collect_gateway_skill_entries,
+            _sanitize_telegram_name,
+        )
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        fake_cmds = self._fake_skill_cmds(
+            local_dir, ["alpha-skill", "mid-skill", "zeta-skill"]
+        )
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            entries, _ = _collect_gateway_skill_entries(
+                platform="telegram",
+                max_slots=10,
+                reserved_names=set(),
+                desc_limit=40,
+                sanitize_name=_sanitize_telegram_name,
+                priority_names=("zeta_skill", "alpha_skill"),
+            )
+        assert [n for n, _d, _k in entries] == [
+            "zeta_skill",
+            "alpha_skill",
+            "mid_skill",
+        ]
+
+    def test_no_priority_keeps_alphabetical(self, tmp_path, monkeypatch):
+        """Default (no priority configured) must keep strict alphabetical order —
+        the pre-change behaviour other platforms rely on."""
+        from unittest.mock import patch
+        from hermes_cli.commands import (
+            _collect_gateway_skill_entries,
+            _sanitize_telegram_name,
+        )
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        fake_cmds = self._fake_skill_cmds(
+            local_dir, ["zeta-skill", "alpha-skill", "mid-skill"]
+        )
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            entries, _ = _collect_gateway_skill_entries(
+                platform="telegram",
+                max_slots=10,
+                reserved_names=set(),
+                desc_limit=40,
+                sanitize_name=_sanitize_telegram_name,
+            )
+        assert [n for n, _d, _k in entries] == [
+            "alpha_skill",
+            "mid_skill",
+            "zeta_skill",
+        ]
