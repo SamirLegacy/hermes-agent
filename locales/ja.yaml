@@ -66,8 +66,6 @@ gateway:
     session_plural:        "✅ コマンドを承認しました (このセッション中はパターンを許可) ({count} 件)。エージェントを再開しています..."
     always_singular:       "✅ コマンドを承認しました (パターンを永続的に許可)。エージェントを再開しています..."
     always_plural:         "✅ コマンドを承認しました (パターンを永続的に許可) ({count} 件)。エージェントを再開しています..."
-    owner_gate_unavailable: "⚠️ このゲートウェイには owner-gate プラグインが読み込まれていません。ホストパス: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
-    owner_gate_error:       "⚠️ {gate_id} の owner-gate 承認に失敗しました — ゲートウェイログを確認してください。ホストパス: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "使い方: /background <プロンプト>\n例: /background 今日の HN トップ記事を要約して\n\nプロンプトを別のセッションで実行します。チャットを続けられます — 完了したらここに結果が表示されます。"

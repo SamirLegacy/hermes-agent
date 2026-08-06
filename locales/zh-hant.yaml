@@ -66,8 +66,6 @@ gateway:
     session_plural:        "✅ 指令已批准（本次工作階段內允許該模式）（{count} 條指令）。代理正在恢復…"
     always_singular:       "✅ 指令已批准（永久允許該模式）。代理正在恢復…"
     always_plural:         "✅ 指令已批准（永久允許該模式）（{count} 條指令）。代理正在恢復…"
-    owner_gate_unavailable: "⚠️ 此閘道未載入 owner-gate 外掛。主機路徑：`ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
-    owner_gate_error:       "⚠️ {gate_id} 的 owner-gate 核准失敗 — 請查看閘道日誌。主機路徑：`ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "用法：/background <提示>\n範例：/background 摘要今天 HN 上的熱門故事\n\n在獨立工作階段中執行該提示。你可以繼續聊天 — 完成後結果將顯示於此。"

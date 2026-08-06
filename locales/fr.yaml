@@ -66,8 +66,6 @@ gateway:
     session_plural:        "✅ Commandes approuvées (modèle approuvé pour cette session) ({count} commandes). L'agent reprend..."
     always_singular:       "✅ Commande approuvée (modèle approuvé de manière permanente). L'agent reprend..."
     always_plural:         "✅ Commandes approuvées (modèle approuvé de manière permanente) ({count} commandes). L'agent reprend..."
-    owner_gate_unavailable: "⚠️ Le plugin owner-gate n'est pas chargé dans cette passerelle. Chemin hôte : `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
-    owner_gate_error:       "⚠️ L'approbation owner-gate pour {gate_id} a échoué — voir le journal de la passerelle. Chemin hôte : `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "Usage : /background <prompt>\nExemple : /background Résume les meilleures histoires HN d'aujourd'hui\n\nExécute le prompt dans une session séparée. Vous pouvez continuer à discuter — le résultat apparaîtra ici une fois terminé."

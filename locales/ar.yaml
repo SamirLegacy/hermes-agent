@@ -89,8 +89,6 @@ gateway:
     session_plural:        "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه لهذه الجلسة) ({count} أوامر). الوكيل يستأنف..."
     always_singular:       "✅ تمت الموافقة على الأمر (النمط مُوافق عليه دائمًا). الوكيل يستأنف..."
     always_plural:         "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه دائمًا) ({count} أوامر). الوكيل يستأنف..."
-    owner_gate_unavailable: "⚠️ إضافة بوابة المالك غير محمّلة في هذا المسار. مسار المضيف: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
-    owner_gate_error:       "⚠️ فشلت الموافقة على بوابة المالك لـ {gate_id} — راجع سجل المسار. مسار المضيف: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "الاستخدام: /background <prompt>\nمثال: /background لخّص أهم قصص HN اليوم\n\nيشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء."

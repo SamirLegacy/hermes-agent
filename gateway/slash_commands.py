@@ -5245,20 +5245,9 @@ class GatewaySlashCommandsMixin:
             /approve all session  — approve all + remember for session
             /approve always       — approve oldest + remember permanently
             /approve all always   — approve all + remember permanently
-            /approve og-<id>      — approve a held owner-gate action (in-chat, same surface)
         """
         source = event.source
         session_key = self._session_key_for_source(source)
-
-        # Owner-gate routing (Owner directive 2026-08-06): ``/approve og-<id>`` approves a
-        # held owner-gate action in the SAME chat surface where the block appeared — no
-        # device switch, no host shell. Routed BEFORE the dangerous-command path so it
-        # works whether or not a dangerous-command approval is pending; bare ``/approve``
-        # keeps its existing meaning. Sender attribution is structural: unauthorized
-        # senders are dropped at ingress (_is_user_authorized) before slash dispatch.
-        _og_args = (event.get_command_args() or "").strip().lower()
-        if re.fullmatch(r"og-[0-9a-f]{6,64}", _og_args):
-            return self._approve_owner_gate(_og_args)
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -5294,32 +5283,6 @@ class GatewaySlashCommandsMixin:
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         plural = "plural" if count > 1 else "singular"
         return t(f"gateway.approve.{choice}_{plural}", count=count)
-
-    def _approve_owner_gate(self, gate_id: str) -> str:
-        """Approve a held owner-gate action via the ultra_instinkt_guard plugin.
-
-        The plugin owns the pending store (it mints the og-ids and consumes the grants),
-        so the gateway delegates instead of duplicating store logic. Fail-closed on
-        absence: if the plugin or entry point is missing, the reply says so and names
-        the host CLI path — never a silent no-op.
-        """
-        try:
-            from hermes_cli.plugins import get_plugin_manager
-
-            loaded = get_plugin_manager()._plugins.get("ultra_instinkt_guard")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("owner-gate approve: plugin manager unavailable: %s", exc)
-            loaded = None
-        fn = getattr(getattr(loaded, "module", None), "owner_gate_approve_from_chat", None)
-        if fn is None:
-            return t("gateway.approve.owner_gate_unavailable", gate_id=gate_id)
-        try:
-            reply = fn(gate_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("owner-gate approve failed for %s", gate_id)
-            return t("gateway.approve.owner_gate_error", gate_id=gate_id)
-        logger.info("Owner-gate %s approved in-chat (reply: %.80s)", gate_id, reply)
-        return reply
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny command — reject pending dangerous command(s).
