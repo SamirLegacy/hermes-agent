@@ -232,6 +232,65 @@ class TestPluginDiscovery:
         assert mgr._slack_action_handlers == []
 
 
+    def test_backup_dir_does_not_shadow_live_plugin(self, tmp_path, monkeypatch):
+        """A ``<name>.bak-<tag>-<timestamp>`` dir holding a plugin.yaml must
+        never be scanned.
+
+        Regression for the VPS incident: a stray backup of a plugin sorted
+        after the live dir and silently won the winners dedupe, so every
+        gateway loaded the stale backup instead of the live plugin.
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(plugins_dir, "shadow_plugin")
+        backup_dir = plugins_dir / "shadow_plugin.bak-c6b-20260806T142403Z"
+        backup_dir.mkdir(parents=True)
+        (backup_dir / "plugin.yaml").write_text(
+            yaml.dump({
+                "name": "shadow_plugin",
+                "version": "0.0.1",
+                "description": "stale backup copy",
+            })
+        )
+        (backup_dir / "__init__.py").write_text("def register(ctx):\n    pass\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        non_bundled = {
+            n: p for n, p in mgr._plugins.items()
+            if p.manifest.source != "bundled"
+        }
+        assert set(non_bundled) == {"shadow_plugin"}
+        assert non_bundled["shadow_plugin"].manifest.path == str(
+            plugins_dir / "shadow_plugin"
+        )
+
+
+    def test_key_collision_logs_warning(self, tmp_path, monkeypatch, caplog):
+        """Two legitimately-named dirs resolving to the same key must log a
+        WARNING (last-writer-wins itself is intended cross-source behavior).
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(plugins_dir, "plugin_a", manifest_extra={"name": "dup_plugin"})
+        _make_plugin_dir(plugins_dir, "plugin_b", manifest_extra={"name": "dup_plugin"})
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            mgr.discover_and_load()
+
+        assert "collision" in caplog.text.lower()
+        assert "dup_plugin" in caplog.text
+        # Both paths are named so the shadowing is diagnosable from logs.
+        assert "plugin_a" in caplog.text
+        assert "plugin_b" in caplog.text
+        # Last writer (sorted order: plugin_b after plugin_a) still wins.
+        assert mgr._plugins["dup_plugin"].manifest.path == str(
+            plugins_dir / "plugin_b"
+        )
+
+
 # ── TestPluginLoading ──────────────────────────────────────────────────────
 
 
