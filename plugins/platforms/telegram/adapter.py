@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import faulthandler
 import inspect
@@ -27,7 +28,15 @@ logger = logging.getLogger(__name__)
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
-    text = "" if error is None else str(error)
+    if error is None:
+        return ""
+    try:
+        text = str(error)
+    except Exception:
+        # An exception whose own __str__ raises (pathological but observed in
+        # the wild via wrapped transport errors) must never break the caller's
+        # error path — fall back to the type name, which cannot carry secrets.
+        return "<telegram error: unprintable %s>" % type(error).__name__
     if not text:
         return text
     try:
@@ -244,6 +253,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
         ContextTypes,
         filters,
     )
@@ -262,6 +272,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -403,7 +414,7 @@ def check_telegram_requirements() -> bool:
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
-    global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
+    global TypeHandler, ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
     try:
@@ -422,6 +433,7 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            TypeHandler as _TH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -438,6 +450,7 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    TypeHandler = _TH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -598,6 +611,18 @@ _POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
+# NOTE: an earlier revision of this change carried a heartbeat-loop watchdog
+# (_check_drop_flag_stuck) that was intended to force-escalate a stuck
+# _drop_delayed_deliveries flag. Review proved it unreachable: the flag is
+# only set by _mark_disconnected (immediately followed by disconnect() setting
+# _polling_teardown_started) and by _set_fatal_error (which sets
+# has_fatal_error), so any heartbeat tick observing flag=True exits before the
+# watchdog can fire. The actual mitigations are:
+# (1) every consumed update is accounted at INFO (group -1 TypeHandler),
+# (2) every drop path logs WARNING with a dropped_total counter,
+# (3) disconnect() drains the PTB update queue with a WARNING count,
+# (4) _cancel_pending_delivery_tasks() accounts for discarded buffered events.
+# The flag itself is always cleared by _mark_connected on the next connect.
 # Telegram transcodes an uploaded video before it answers sendVideo, so the
 # wait for the response is unrelated to how fast the bytes went out and can
 # outlast the 20s read timeout the rest of the Bot API is tuned for. Only
@@ -768,6 +793,15 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._drop_delayed_deliveries = False
+        # Ingest accounting. Every consumed getUpdates update is logged at INFO
+        # (update_id + has_message only — NEVER content) by the group -1
+        # TypeHandler, so a silently-dropping poller can never look quiet.
+        self._updates_consumed_total: int = 0
+        self._last_update_consumed_monotonic: Optional[float] = None
+        # Events dropped by the disconnect/fatal-error flag, counted alongside
+        # the WARNING each drop now emits. Pairs with _updates_consumed_total to
+        # quantify ingest loss.
+        self._updates_dropped_total: int = 0
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
@@ -907,6 +941,81 @@ class TelegramAdapter(BasePlatformAdapter):
         torn-down session, producing stale/duplicate deliveries.
         """
         return bool(getattr(self, "_drop_delayed_deliveries", False))
+
+    def _register_ingest_handlers(self) -> None:
+        """Register the always-on ingest-accounting and PTB error handlers.
+
+        A catch-all ``TypeHandler`` at group -1 accounts for every consumed
+        update with one INFO line (update_id + has_message, never content), and
+        a global PTB error handler routes handler exceptions onto the gateway
+        logger with a traceback. PTB runs every group for a given update (one
+        handler per group), so the group -1 accounting handler runs alongside
+        the normal group 0 message/command/callback handlers — it neither
+        replaces them nor stops propagation. Both are registered on every
+        (re)built PTB app; registration is additive and must never break the
+        core handlers or connect, so failures are logged at WARNING and
+        swallowed.
+        """
+        try:
+            self._app.add_handler(
+                TypeHandler(Update, self._account_inbound_update), group=-1
+            )
+            self._app.add_error_handler(self._on_ptb_error)
+        except Exception:
+            logger.warning(
+                "[%s] Failed to register Telegram ingest-accounting/error "
+                "handlers; ingest will still work but may be quieter than "
+                "intended.",
+                self.name, exc_info=True,
+            )
+
+    async def _account_inbound_update(self, update: object, context: object) -> None:
+        """Account for every consumed Telegram update at INFO (group -1).
+
+        Runs alongside every other handler group: a TypeHandler at its own
+        group never stops propagation, so message/command/callback handlers
+        still run. Logs only ``update_id`` and whether a message is present —
+        NEVER message text/content. Must never raise: a failure in accounting
+        must not break delivery.
+        """
+        try:
+            self._updates_consumed_total += 1
+            self._last_update_consumed_monotonic = time.monotonic()
+            logger.info(
+                "[%s] update consumed: update_id=%s has_message=%s",
+                self.name,
+                getattr(update, "update_id", None),
+                bool(getattr(update, "effective_message", None)),
+            )
+        except Exception:
+            logger.warning(
+                "[%s] ingest accounting handler raised; ignoring",
+                self.name, exc_info=True,
+            )
+
+    async def _on_ptb_error(self, update: object, context: object) -> None:
+        """Route PTB handler exceptions onto the gateway logger with a traceback.
+
+        Without a registered error handler, python-telegram-bot logs handler
+        exceptions on its own ``telegram.ext`` logger, invisible to the gateway.
+        Logs only ``update_id`` and the redacted error text plus ``exc_info`` so
+        the traceback reaches gateway logs — never message content. Must never
+        raise: a broken error handler would mask the original exception.
+        """
+        try:
+            error = getattr(context, "error", None)
+            logger.error(
+                "[%s] PTB handler raised: update_id=%s error=%s",
+                self.name,
+                getattr(update, "update_id", None),
+                _redact_telegram_error_text(error),
+                exc_info=error,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] PTB error handler itself raised; ignoring",
+                self.name, exc_info=True,
+            )
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -3872,6 +3981,9 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
+            # Register ingest-accounting + PTB error handlers FIRST (group -1
+            # catch-all accounting runs alongside the group 0 handlers below).
+            self._register_ingest_handlers()
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -4004,6 +4116,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
+                        # Re-register ingest-accounting + PTB error handlers
+                        # FIRST on the rebuilt app.
+                        self._register_ingest_handlers()
                         # Re-register handlers on the new app
                         self._app.add_handler(TelegramMessageHandler(
                             filters.TEXT & ~filters.COMMAND,
@@ -4139,12 +4254,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
-                        logger.warning("[%s] Telegram network _redact_telegram_error_text(error), scheduling reconnect: %s", self.name, error)
+                        logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error))
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     else:
-                        logger.error("[%s] Telegram polling _redact_telegram_error_text(error): %s", self.name, error, exc_info=True)
+                        logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error), exc_info=True)
 
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
@@ -4177,6 +4292,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_heartbeat_task = asyncio.ensure_future(
                     self._polling_heartbeat_loop()
                 )
+            # NOTE: an earlier revision carried a heartbeat-loop drop-flag
+            # watchdog. It was removed after review proved it unreachable
+            # (flag=True always implies teardown or fatal, so the heartbeat
+            # exits before the watchdog can fire). The actual mitigations are
+            # the loud-drop accounting (WARNING per drop + dropped_total) and
+            # the queue drain in disconnect(). _mark_connected clears the flag
+            # on every connect regardless of mode.
 
             # Seed the live identity from whatever PTB cached during
             # initialize(), then keep it fresh. Polling mode rides the
@@ -4281,6 +4403,23 @@ class TelegramAdapter(BasePlatformAdapter):
         if awaitable_tasks:
             await asyncio.gather(*awaitable_tasks, return_exceptions=True)
 
+        # Account for discarded buffered events (Kimi review hole 2: these
+        # were silently cleared with no drop WARNING and no counter bump).
+        # getattr guards: some tests construct the adapter via object.__new__
+        # without __init__, so the counter may not exist yet.
+        discarded = (
+            len(self._pending_text_batches)
+            + len(self._pending_photo_batches)
+            + len(self._media_group_events)
+        )
+        if discarded:
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + discarded
+            logger.warning(
+                "[%s] DROPPED %d buffered event(s) during teardown "
+                "(reason=cancel-pending-deliveries, dropped_total=%d)",
+                self.name, discarded, self._updates_dropped_total,
+            )
+
         self._media_group_tasks.clear()
         self._media_group_events.clear()
         self._pending_photo_batch_tasks.clear()
@@ -4379,6 +4518,36 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self._cancel_pending_delivery_tasks()
 
+        # Drain the PTB update queue so stop-time queued updates are accounted
+        # (Kimi review hole 1: PTB's _update_fetcher drops them at DEBUG on the
+        # telegram.ext._application logger, invisible in gateway.log).
+        if self._app and self._app.updater:
+            try:
+                queue = self._app.updater.update_queue
+                drained = 0
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                        # Balance the queue's unfinished_tasks count so
+                        # Application.stop()'s queue.join() does not hang
+                        # (Kimi review round 5, HIGH).
+                        with contextlib.suppress(ValueError):
+                            queue.task_done()
+                        drained += 1
+                    except Exception:
+                        break
+                if drained:
+                    logger.warning(
+                        "[%s] Drained %d undispatched update(s) from PTB queue "
+                        "during disconnect (consumed at Telegram, never dispatched)",
+                        self.name, drained,
+                    )
+            except Exception:
+                logger.warning(
+                    "[%s] Failed to drain PTB update queue during disconnect",
+                    self.name, exc_info=True,
+                )
+
         if self._app:
             try:
                 # Only stop the updater if it's running.  Bounded with a
@@ -4403,6 +4572,31 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+
+        # Second drain after updater.stop(): the fetcher was still running
+        # during the first drain, so updates consumed between drain and stop
+        # would otherwise be dropped by PTB at DEBUG (unaccounted).
+        if self._app and self._app.updater:
+            try:
+                queue = self._app.updater.update_queue
+                drained_post = 0
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                        with contextlib.suppress(ValueError):
+                            queue.task_done()
+                        drained_post += 1
+                    except Exception:
+                        break
+                if drained_post:
+                    logger.warning(
+                        "[%s] Drained %d additional undispatched update(s) "
+                        "after app teardown (consumed at Telegram, never dispatched)",
+                        self.name, drained_post,
+                    )
+            except Exception:
+                pass  # best-effort; app may already be torn down
+
         self._release_platform_lock()
 
         self._app = None
@@ -8923,7 +9117,12 @@ class TelegramAdapter(BasePlatformAdapter):
         dispatching the combined message.
         """
         if self._should_drop_delayed_delivery():
-            logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+            logger.warning(
+                "[%s] DROPPED inbound event (reason=disconnect-started, "
+                "stage=text-enqueue, chars=%d, dropped_total=%d)",
+                self.name, len(event.text or ""), self._updates_dropped_total,
+            )
             return
 
         key = self._text_batch_key(event)
@@ -8986,7 +9185,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             if self._should_drop_delayed_delivery():
-                logger.debug("[Telegram] Dropping text batch flush after disconnect started")
+                self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+                logger.warning(
+                    "[%s] DROPPED inbound event (reason=disconnect-started, "
+                    "stage=text-flush, key=%s, chars=%d, dropped_total=%d)",
+                    self.name, key, len(event.text or ""), self._updates_dropped_total,
+                )
                 return
             logger.info(
                 "[Telegram] Flushing text batch %s (%d chars)",
@@ -9023,7 +9227,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             if self._should_drop_delayed_delivery():
-                logger.debug("[Telegram] Dropping photo batch flush after disconnect started")
+                self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+                logger.warning(
+                    "[%s] DROPPED inbound event (reason=disconnect-started, "
+                    "stage=photo-flush, key=%s, images=%d, dropped_total=%d)",
+                    self.name, batch_key, len(event.media_urls), self._updates_dropped_total,
+                )
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
             await self.handle_message(event)
@@ -9034,7 +9243,12 @@ class TelegramAdapter(BasePlatformAdapter):
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
         if self._should_drop_delayed_delivery():
-            logger.debug("[Telegram] Dropping photo batch enqueue after disconnect started")
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+            logger.warning(
+                "[%s] DROPPED inbound event (reason=disconnect-started, "
+                "stage=photo-enqueue, key=%s, images=%d, dropped_total=%d)",
+                self.name, batch_key, len(event.media_urls), self._updates_dropped_total,
+            )
             return
 
         existing = self._pending_photo_batches.get(batch_key)
@@ -9361,7 +9575,13 @@ class TelegramAdapter(BasePlatformAdapter):
         attachments into a single MessageEvent.
         """
         if self._should_drop_delayed_delivery():
-            logger.debug("[Telegram] Dropping media group enqueue after disconnect started")
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+            logger.warning(
+                "[%s] DROPPED inbound event (reason=disconnect-started, "
+                "stage=media-group-enqueue, key=%s, images=%d, dropped_total=%d)",
+                self.name, media_group_id, len(event.media_urls),
+                self._updates_dropped_total,
+            )
             return
 
         existing = self._media_group_events.get(media_group_id)
@@ -9388,7 +9608,13 @@ class TelegramAdapter(BasePlatformAdapter):
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
                 if self._should_drop_delayed_delivery():
-                    logger.debug("[Telegram] Dropping media group flush after disconnect started")
+                    self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
+                    logger.warning(
+                        "[%s] DROPPED inbound event (reason=disconnect-started, "
+                        "stage=media-group-flush, key=%s, images=%d, dropped_total=%d)",
+                        self.name, media_group_id, len(event.media_urls),
+                        self._updates_dropped_total,
+                    )
                     return
                 await self.handle_message(event)
         except asyncio.CancelledError:
