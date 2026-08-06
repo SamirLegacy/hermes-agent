@@ -695,6 +695,31 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_null_byte_in_command_does_not_crash_guard(self):
+        """Incident 2026-08-06: a terminal command with an embedded NUL byte
+        must not crash the guard with ``ValueError: embedded null byte``.
+
+        shlex keeps the NUL inside the script-path token, and os.open()
+        raises ValueError (not OSError) for such a path. The guard treats it
+        like any unreadable referenced script — "nothing to scan" — and
+        returns its defined result instead of crashing.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/bash /tmp/legit\x00hidden.sh"
+        )
+        assert result is False
+
+    def test_null_byte_in_script_path_does_not_crash_guard(self):
+        """Same 2026-08-06 vector through the cron ``script`` parameter: a
+        script path with an embedded NUL byte reaches os.open() via
+        _read_script_for_scanning and must produce the guard's defined
+        unreadable-script result (prompt-only scan), not an exception."""
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        check_gateway_lifecycle("clean prompt", "missing\x00script.sh")
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
