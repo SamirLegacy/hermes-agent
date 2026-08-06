@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ 命令已批准（本次会话内允许该模式）（{count} 条命令）。代理正在恢复…"
     always_singular:       "✅ 命令已批准（永久允许该模式）。代理正在恢复…"
     always_plural:         "✅ 命令已批准（永久允许该模式）（{count} 条命令）。代理正在恢复…"
+    owner_gate_unavailable: "⚠️ 此网关未加载 owner-gate 插件。主机路径：`ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
+    owner_gate_error:       "⚠️ {gate_id} 的 owner-gate 批准失败 — 请查看网关日志。主机路径：`ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "用法：/background <提示>\n示例：/background 总结今天 HN 上热门的故事\n\n在独立会话中运行该提示。你可以继续聊天 — 结果完成后将在此显示。"

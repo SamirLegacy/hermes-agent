@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ Команди схвалено (шаблон схвалено для цього сеансу) ({count} команд). Агент відновлює роботу…"
     always_singular:       "✅ Команду схвалено (шаблон схвалено назавжди). Агент відновлює роботу…"
     always_plural:         "✅ Команди схвалено (шаблон схвалено назавжди) ({count} команд). Агент відновлює роботу…"
+    owner_gate_unavailable: "⚠️ Плагін owner-gate не завантажено в цьому шлюзі. Шлях на хості: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
+    owner_gate_error:       "⚠️ Схвалення owner-gate для {gate_id} не вдалося — див. журнал шлюзу. Шлях на хості: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "Використання: /background <запит>\nПриклад: /background Підсумуй найкращі історії з HN сьогодні\n\nЗапускає запит в окремому сеансі. Можна продовжити спілкування — результат з'явиться тут після завершення."
