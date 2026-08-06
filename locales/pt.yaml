@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ Comandos aprovados (padrão aprovado para esta sessão) ({count} comandos). O agente está a retomar..."
     always_singular:       "✅ Comando aprovado (padrão aprovado permanentemente). O agente está a retomar..."
     always_plural:         "✅ Comandos aprovados (padrão aprovado permanentemente) ({count} comandos). O agente está a retomar..."
+    owner_gate_unavailable: "⚠️ O plugin owner-gate não está carregado neste gateway. Caminho do host: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
+    owner_gate_error:       "⚠️ A aprovação do owner-gate para {gate_id} falhou — veja o log do gateway. Caminho do host: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "Uso: /background <prompt>\nExemplo: /background Resume as principais histórias do HN de hoje\n\nExecuta o prompt numa sessão separada. Podes continuar a conversar — o resultado aparecerá aqui quando estiver concluído."

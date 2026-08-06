@@ -70,6 +70,8 @@ gateway:
     session_plural:        "✅ Orduithe ceadaithe (patrún ceadaithe don seisiún seo) ({count} ordú). Tá an gníomhaire ag atosú..."
     always_singular:       "✅ Ordú ceadaithe (patrún ceadaithe go buan). Tá an gníomhaire ag atosú..."
     always_plural:         "✅ Orduithe ceadaithe (patrún ceadaithe go buan) ({count} ordú). Tá an gníomhaire ag atosú..."
+    owner_gate_unavailable: "⚠️ Níl breiseán an gheata úinéara luchtaithe sa gheata seo. Conair an óstáin: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
+    owner_gate_error:       "⚠️ Theip ar fhaomhadh geata an úinéara do {gate_id} — féach loga an gheata. Conair an óstáin: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "Úsáid: /background <leid>\nSampla: /background Déan achoimre ar phríomhscéalta HN inniu\n\nRitheann an leid i seisiún ar leith. Is féidir leat leanúint leis an gcomhrá — taispeánfar an toradh anseo nuair a bheidh sé críochnaithe."

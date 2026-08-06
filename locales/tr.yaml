@@ -66,6 +66,8 @@ gateway:
     session_plural:        "✅ Komutlar onaylandı (desen bu oturum için onaylandı) ({count} komut). Ajan devam ediyor..."
     always_singular:       "✅ Komut onaylandı (desen kalıcı olarak onaylandı). Ajan devam ediyor..."
     always_plural:         "✅ Komutlar onaylandı (desen kalıcı olarak onaylandı) ({count} komut). Ajan devam ediyor..."
+    owner_gate_unavailable: "⚠️ Owner-gate eklentisi bu ağ geçidinde yüklü değil. Ana makine yolu: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
+    owner_gate_error:       "⚠️ {gate_id} için owner-gate onayı başarısız oldu — ağ geçidi günlüğüne bakın. Ana makine yolu: `ultra-instinkt-cli owner-gate-approve approve {gate_id}`"
 
   background:
     usage:                 "Kullanım: /background <prompt>\nÖrnek: /background Bugünün öne çıkan HN haberlerini özetle\n\nİstemi ayrı bir oturumda çalıştırır. Sohbete devam edebilirsin — sonuç tamamlandığında burada görünecek."
