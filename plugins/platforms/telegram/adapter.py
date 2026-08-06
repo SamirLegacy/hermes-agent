@@ -4405,13 +4405,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Account for discarded buffered events (Kimi review hole 2: these
         # were silently cleared with no drop WARNING and no counter bump).
+        # getattr guards: some tests construct the adapter via object.__new__
+        # without __init__, so the counter may not exist yet.
         discarded = (
             len(self._pending_text_batches)
             + len(self._pending_photo_batches)
             + len(self._media_group_events)
         )
         if discarded:
-            self._updates_dropped_total += discarded
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + discarded
             logger.warning(
                 "[%s] DROPPED %d buffered event(s) during teardown "
                 "(reason=cancel-pending-deliveries, dropped_total=%d)",
@@ -9115,7 +9117,7 @@ class TelegramAdapter(BasePlatformAdapter):
         dispatching the combined message.
         """
         if self._should_drop_delayed_delivery():
-            self._updates_dropped_total += 1
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
             logger.warning(
                 "[%s] DROPPED inbound event (reason=disconnect-started, "
                 "stage=text-enqueue, chars=%d, dropped_total=%d)",
@@ -9183,7 +9185,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             if self._should_drop_delayed_delivery():
-                self._updates_dropped_total += 1
+                self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
                 logger.warning(
                     "[%s] DROPPED inbound event (reason=disconnect-started, "
                     "stage=text-flush, key=%s, chars=%d, dropped_total=%d)",
@@ -9225,7 +9227,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             if self._should_drop_delayed_delivery():
-                self._updates_dropped_total += 1
+                self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
                 logger.warning(
                     "[%s] DROPPED inbound event (reason=disconnect-started, "
                     "stage=photo-flush, key=%s, images=%d, dropped_total=%d)",
@@ -9241,7 +9243,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
         if self._should_drop_delayed_delivery():
-            self._updates_dropped_total += 1
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
             logger.warning(
                 "[%s] DROPPED inbound event (reason=disconnect-started, "
                 "stage=photo-enqueue, key=%s, images=%d, dropped_total=%d)",
@@ -9573,7 +9575,7 @@ class TelegramAdapter(BasePlatformAdapter):
         attachments into a single MessageEvent.
         """
         if self._should_drop_delayed_delivery():
-            self._updates_dropped_total += 1
+            self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
             logger.warning(
                 "[%s] DROPPED inbound event (reason=disconnect-started, "
                 "stage=media-group-enqueue, key=%s, images=%d, dropped_total=%d)",
@@ -9606,7 +9608,7 @@ class TelegramAdapter(BasePlatformAdapter):
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
                 if self._should_drop_delayed_delivery():
-                    self._updates_dropped_total += 1
+                    self._updates_dropped_total = getattr(self, "_updates_dropped_total", 0) + 1
                     logger.warning(
                         "[%s] DROPPED inbound event (reason=disconnect-started, "
                         "stage=media-group-flush, key=%s, images=%d, dropped_total=%d)",
