@@ -349,7 +349,40 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_glm53_models_1m_context(self):
+        """GLM-5.3 resolves to its official 1M window on every spelling.
 
+        Official spec (docs.z.ai/guides/llm/ glm-5.3, verified 2026-08-15):
+        Context Length 1M, max output 128K — same base model as GLM-5.2,
+        which already carries 1_048_576 here.  Before this entry existed,
+        every glm-5.3 spelling fell through to the generic ``glm`` catch-all
+        (202,752) and the picker/compressor capped sessions at ~202K.
+        """
+        from unittest.mock import patch as mock_patch
+
+        assert DEFAULT_CONTEXT_LENGTHS["glm-5.3"] == 1_048_576
+        assert DEFAULT_CONTEXT_LENGTHS["zai-org/GLM-5.3"] == 1_048_576
+
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            one_m = [
+                "glm-5.3",
+                "GLM-5.3",
+                "z-ai/glm-5.3",
+                "zai-org/GLM-5.3",
+                "openrouter/z-ai/glm-5.3",
+            ]
+            for model_id in one_m:
+                actual = get_model_context_length(model_id)
+                assert actual == 1_048_576, (
+                    f"{model_id}: expected 1048576, got {actual}"
+                )
+            # Older GLM variants must still hit the generic 202K fallback.
+            assert get_model_context_length("glm-5-turbo") == 202752
+            assert get_model_context_length("GLM-5-TEE") == 202752
 
 
 
