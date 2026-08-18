@@ -1303,6 +1303,10 @@ class TestApprovalTimeoutIsNotConsent:
             "resolved": False,
             "choice": None,
             "notify_failed": True,
+            # Fork carry-over: the delivery-failure detail rides along so
+            # callers can build an honest message via
+            # _format_notify_failed_message().
+            "notify_error": "RuntimeError: private gateway failure",
         }
         assert self.SESSION_KEY not in mod._gateway_queues
         assert [name for name, _ in hook_calls] == [

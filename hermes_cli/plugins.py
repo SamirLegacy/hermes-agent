@@ -3894,7 +3894,19 @@ class PluginManager:
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
+            manifest_key = manifest.key or manifest.name
+            previous = winners.get(manifest_key)
+            if previous is not None:
+                # Last writer still wins (cross-source precedence above),
+                # but a collision must be loud: a silent same-key overwrite
+                # once let a stale backup dir shadow the live plugin.
+                logger.warning(
+                    "Plugin collision on '%s': %s overwrites %s",
+                    manifest_key,
+                    manifest.path,
+                    previous.path,
+                )
+            winners[manifest_key] = manifest
         # Standalone/user plugins that pass the gates below are collected
         # here and loaded AFTER the sweep in dependency-respecting order
         # (requires_plugins topological sort, #64165).
@@ -4202,6 +4214,13 @@ class PluginManager:
 
         for child in sorted(path.iterdir()):
             if not child.is_dir():
+                continue
+            # Backup dirs must never be scanned: a ``<name>.bak-<tag>`` copy
+            # holding a plugin.yaml sorts after the live dir and silently
+            # wins the key dedupe, shadowing the live plugin. Backups belong
+            # outside the plugins tree.
+            if ".bak-" in child.name or child.name.endswith(".bak"):
+                logger.debug("Skipping %s (backup directory)", child)
                 continue
             if depth == 0 and skip_names and child.name in skip_names:
                 continue
