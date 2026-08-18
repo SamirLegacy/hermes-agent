@@ -1241,6 +1241,7 @@ export interface Translations {
     restartGateway: string
     gatewayRestartFailed: string
     updateHermes: string
+    reloadWindow: string
     actionRunning: string
     actionDone: string
     actionFailed: string
@@ -2463,6 +2464,12 @@ export interface Translations {
       showConsole: string
       hideDevTools: string
       openDevTools: string
+      goBack: string
+      goForward: string
+      reload: string
+      address: string
+      addressPlaceholder: string
+      blankPageBody: string
       finishedRestarting: (message?: string) => string
       failedRestarting: (message: string) => string
       unknownError: string
