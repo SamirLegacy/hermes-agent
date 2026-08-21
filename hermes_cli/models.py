@@ -529,6 +529,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
+        # Free limited-time stealth model (chat_completions on the Go relay).
+        "ox-alpha-free",
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
