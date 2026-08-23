@@ -242,7 +242,11 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+            return_value={"status": "current", "pre_sha": "a", "post_sha": "a"},
+        ) as sync_mock:
             cmd_update(mock_args)
 
         expected_git_cmd = (
@@ -251,6 +255,39 @@ class TestCmdUpdateBranchFallback:
         sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """A fork sync that pulls code must continue through post-update work."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            update_cmd,
+            "_capture_head_sha",
+            return_value="bbbbbbb",
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+            return_value={"status": "advanced", "pre_sha": "aaaaaaa", "post_sha": "bbbbbbb"},
+        ), patch.object(
+            hm, "_reload_updated_runtime_modules"
+        ) as post_update_step:
+            cmd_update(mock_args)
+
+        post_update_step.assert_called_once_with()
+        captured = capsys.readouterr()
+        assert "Already up to date!" not in captured.out
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
@@ -282,6 +319,61 @@ class TestCmdUpdateBranchFallback:
             captured = capsys.readouterr()
             assert "applying safe config migrations" in captured.out
             assert "API keys require manual entry" in captured.out
+
+
+def test_diverged_fork_merges_upstream_and_preserves_local_commits(monkeypatch, tmp_path):
+    from hermes_cli import update_cmd
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(update_cmd, "_has_upstream_remote", lambda *_: True)
+    monkeypatch.setattr(update_cmd, "_get_remote_url", lambda *_: update_cmd.OFFICIAL_REPO_URL)
+    monkeypatch.setattr(update_cmd, "_count_commits_between", lambda *_: 3)
+    shas = iter(["aaaaaaa", "bbbbbbb"])
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *_: next(shas))
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    monkeypatch.setattr(update_cmd, "_sync_fork_with_upstream", lambda *_: True)
+
+    result = update_cmd._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    assert result["status"] == "advanced"
+    assert ["git", "merge", "--no-edit", "upstream/main"] in commands
+
+
+def test_diverged_fork_aborts_failed_upstream_merge(monkeypatch, tmp_path):
+    from hermes_cli import update_cmd
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd,
+            1
+            if (
+                cmd[-3:] == ["merge", "--no-edit", "upstream/main"]
+                or cmd[-3:] == ["rev-parse", "--verify", "MERGE_HEAD"]
+            )
+            else 0,
+            stdout="",
+            stderr="conflict",
+        )
+
+    monkeypatch.setattr(update_cmd, "_has_upstream_remote", lambda *_: True)
+    monkeypatch.setattr(update_cmd, "_get_remote_url", lambda *_: update_cmd.OFFICIAL_REPO_URL)
+    monkeypatch.setattr(update_cmd, "_count_commits_between", lambda *_: 3)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *_: "aaaaaaa")
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    result = update_cmd._sync_with_upstream_if_needed(["git"], tmp_path)
+
+    assert result["status"] == "conflict"
+    assert result["restored"] is True
+    assert ["git", "merge", "--abort"] in commands
 
 
 class TestCmdUpdateMigrationPrompt:

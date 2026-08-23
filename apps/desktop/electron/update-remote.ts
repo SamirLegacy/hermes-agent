@@ -62,4 +62,63 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+function resolvePassiveUpdateSource({ originUrl, upstreamUrl }) {
+  const originCanonical = canonicalGitHubRemote(originUrl)
+  const upstreamCanonical = canonicalGitHubRemote(upstreamUrl)
+
+  if (originCanonical === OFFICIAL_REPO_CANONICAL) {
+    const ssh = isOfficialSshRemote(originUrl)
+
+    return {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: ssh,
+      fetchRemote: ssh ? OFFICIAL_REPO_HTTPS_URL : 'origin',
+      trackingRemote: ssh ? 'hermes-official' : 'origin'
+    }
+  }
+
+  if (upstreamCanonical === OFFICIAL_REPO_CANONICAL) {
+    const ssh = isSshRemote(upstreamUrl)
+
+    return {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: ssh,
+      fetchRemote: ssh ? OFFICIAL_REPO_HTTPS_URL : 'upstream',
+      trackingRemote: 'upstream'
+    }
+  }
+
+  return {
+    compareUrl: OFFICIAL_REPO_HTTPS_URL,
+    explicitRefspec: true,
+    fetchRemote: OFFICIAL_REPO_HTTPS_URL,
+    trackingRemote: 'hermes-official'
+  }
+}
+
+// Build the exact git-fetch argv for a passive check. explicitRefspec fetches
+// against a raw URL (the anonymous official HTTPS path) write FETCH_HEAD, not
+// a tracking ref — so they must name the destination refspec explicitly, or
+// the checker would rev-parse a stale tracking ref afterwards.
+function buildPassiveFetchArgs({ fetchRemote, trackingRemote, explicitRefspec }, branch) {
+  if (explicitRefspec) {
+    return [
+      'fetch',
+      '--quiet',
+      fetchRemote,
+      `+refs/heads/${branch}:refs/remotes/${trackingRemote}/${branch}`
+    ]
+  }
+
+  return ['fetch', '--quiet', fetchRemote, branch]
+}
+
+export {
+  buildPassiveFetchArgs,
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolvePassiveUpdateSource
+}

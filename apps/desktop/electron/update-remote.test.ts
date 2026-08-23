@@ -20,11 +20,13 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  buildPassiveFetchArgs,
   canonicalGitHubRemote,
   isOfficialSshRemote,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
-  OFFICIAL_REPO_HTTPS_URL
+  OFFICIAL_REPO_HTTPS_URL,
+  resolvePassiveUpdateSource
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -76,4 +78,64 @@ test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
 test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
   // Invariant: the URL we substitute in must be the same repo we detect.
   assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('fork installs use the official upstream remote for passive update checks', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: false,
+      fetchRemote: 'upstream',
+      trackingRemote: 'upstream'
+    }
+  )
+})
+
+test('fork installs fall back to official HTTPS when upstream is non-official', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:someone-else/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: true,
+      fetchRemote: OFFICIAL_REPO_HTTPS_URL,
+      trackingRemote: 'hermes-official'
+    }
+  )
+})
+
+test('official SSH upstream is fetched anonymously into its tracking ref', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:NousResearch/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: true,
+      fetchRemote: OFFICIAL_REPO_HTTPS_URL,
+      trackingRemote: 'upstream'
+    }
+  )
+})
+
+test('explicit refspec fetches write the tracking ref the checker reads', () => {
+  assert.deepEqual(
+    buildPassiveFetchArgs(
+      { fetchRemote: OFFICIAL_REPO_HTTPS_URL, trackingRemote: 'hermes-official', explicitRefspec: true },
+      'main'
+    ),
+    [
+      'fetch',
+      '--quiet',
+      OFFICIAL_REPO_HTTPS_URL,
+      '+refs/heads/main:refs/remotes/hermes-official/main'
+    ]
+  )
 })

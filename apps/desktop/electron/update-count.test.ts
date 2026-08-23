@@ -229,6 +229,13 @@ test('full-clone commit logs keep the complete behind range', () => {
   })
 })
 
+test('commit logs can target a fork install\'s official upstream remote', () => {
+  assert.deepEqual(resolveCommitLogSelection({ branch: 'main', isShallow: false, remote: 'upstream' }), {
+    limit: 40,
+    revision: 'HEAD..upstream/main'
+  })
+})
+
 // The skip path produces an empty countStr; resolveBehindCount must NOT trust
 // it and must fall through to the SHA compare (mirrors the live call site).
 test('skipped-count path resolves via SHA compare, never via empty countStr', () => {
