@@ -26,6 +26,7 @@ import {
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
   OFFICIAL_REPO_HTTPS_URL,
+  resolveHealProbeRemote,
   resolvePassiveUpdateSource
 } from './update-remote'
 
@@ -122,6 +123,48 @@ test('official SSH upstream is fetched anonymously into its tracking ref', () =>
       fetchRemote: OFFICIAL_REPO_HTTPS_URL,
       trackingRemote: 'upstream'
     }
+  )
+})
+
+test('branch self-heal probes the same remote the passive check fetches from', () => {
+  // Fork install: the passive source is upstream, so the heal probe must ask
+  // upstream too. Probing origin kept a stale fork-only branch (e.g. a
+  // leftover sync/upstream-main) alive forever and stranded every later
+  // passive fetch in fetch-failed against upstream (observed live 2026-08-23).
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    'upstream'
+  )
+
+  // Vanilla HTTPS install: unchanged behavior — probe origin.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'https://github.com/NousResearch/hermes-agent.git',
+      upstreamUrl: ''
+    }),
+    'origin'
+  )
+
+  // Official SSH origin: unchanged behavior — probe the anonymous HTTPS URL
+  // so a passive heal can never trigger a FIDO2 hardware-touch prompt.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:NousResearch/hermes-agent.git',
+      upstreamUrl: ''
+    }),
+    OFFICIAL_REPO_HTTPS_URL
+  )
+
+  // No official remote anywhere: probe the official HTTPS URL directly.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:someone-else/hermes-agent.git'
+    }),
+    OFFICIAL_REPO_HTTPS_URL
   )
 })
 

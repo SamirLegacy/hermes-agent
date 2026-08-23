@@ -310,7 +310,13 @@ import {
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import { buildPassiveFetchArgs, isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL, resolvePassiveUpdateSource } from './update-remote'
+import {
+  buildPassiveFetchArgs,
+  isOfficialSshRemote,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveHealProbeRemote,
+  resolvePassiveUpdateSource
+} from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
@@ -2699,26 +2705,31 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Self-heal the tracked update branch: if origin no longer publishes it (e.g.
-// bb/gui was merged into main and deleted), fall back to main and persist so
-// every later check/apply follows main — no manual flip, even for already-
-// installed clients. Read-only ls-remote probe; only flips on a definitive
-// "ref absent" (exit 2), never on a transient network error, so a flaky
-// connection can't strand a user on the wrong branch.
+// Self-heal the tracked update branch: if the passive update source no longer
+// publishes it (e.g. bb/gui was merged into main and deleted, or a fork-only
+// sync branch was configured that never existed on the official repo), fall
+// back to main and persist so every later check/apply follows main — no manual
+// flip, even for already-installed clients. The probe MUST ask the same remote
+// the passive check fetches from (resolveHealProbeRemote); probing origin on a
+// fork install keeps a stale fork branch alive and strands the checker in a
+// permanent fetch-failed against upstream. Read-only ls-remote probe; only
+// flips on a definitive "ref absent" (exit 2), never on a transient network
+// error, so a flaky connection can't strand a user on the wrong branch.
 async function resolveHealedBranch(updateRoot, branch) {
   if (!branch || branch === 'main') {
     return branch || 'main'
   }
 
   const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const upstreamUrl = await getRemoteUrl(updateRoot, 'upstream')
+  const remote = resolveHealProbeRemote({ originUrl, upstreamUrl })
   const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
 
   if (probe.code !== 2) {
     return branch
   }
 
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
+  rememberLog(`[updates] ${remote}/${branch} is gone (merged?); falling back to main`)
   const config = readDesktopUpdateConfig()
 
   if (config.branch !== 'main') {
@@ -2831,6 +2842,25 @@ async function checkUpdates() {
     git(['rev-parse', '--abbrev-ref', 'HEAD']),
     git(['rev-parse', '--is-shallow-repository'])
   ])
+
+  // A fetch can exit 0 while the tracking ref still doesn't exist (e.g. a
+  // single-branch fetch refspec silently drops the update, observed live
+  // 2026-08-23). rev-parse then fails and echoes the ref NAME to stdout; fed
+  // into the count math that used to coerce into a silent behind=0 — "up to
+  // date" reported over a broken measurement. Fail loud instead: an
+  // unmeasurable checkout is an error, never up to date. Accepts SHA-1 (40
+  // hex) and SHA-256 (64 hex) object ids so the guard can never misfire on a
+  // measurable ref.
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+    return {
+      supported: true,
+      branch,
+      error: 'fetch-failed',
+      message: `${targetRef} is missing after fetch — cannot measure updates.`,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
 
   const isShallow = shallowStr === 'true'
 
