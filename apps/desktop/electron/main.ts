@@ -310,7 +310,13 @@ import {
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import {
+  buildPassiveFetchArgs,
+  isOfficialSshRemote,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveHealProbeRemote,
+  resolvePassiveUpdateSource
+} from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
@@ -2680,10 +2686,14 @@ function runGit(args, options: any = {}): Promise<{ code: number; stdout: string
 
 const firstLine = text => (text || '').split('\n').find(Boolean) || ''
 
-async function getOriginUrl(updateRoot) {
-  const origin = await runGit(['remote', 'get-url', 'origin'], { cwd: updateRoot })
+async function getRemoteUrl(updateRoot, remote) {
+  const result = await runGit(['remote', 'get-url', remote], { cwd: updateRoot })
 
-  return origin.code === 0 ? origin.stdout.trim() : ''
+  return result.code === 0 ? result.stdout.trim() : ''
+}
+
+async function getOriginUrl(updateRoot) {
+  return getRemoteUrl(updateRoot, 'origin')
 }
 
 function emitUpdateProgress(payload) {
@@ -2695,26 +2705,31 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Self-heal the tracked update branch: if origin no longer publishes it (e.g.
-// bb/gui was merged into main and deleted), fall back to main and persist so
-// every later check/apply follows main — no manual flip, even for already-
-// installed clients. Read-only ls-remote probe; only flips on a definitive
-// "ref absent" (exit 2), never on a transient network error, so a flaky
-// connection can't strand a user on the wrong branch.
+// Self-heal the tracked update branch: if the passive update source no longer
+// publishes it (e.g. bb/gui was merged into main and deleted, or a fork-only
+// sync branch was configured that never existed on the official repo), fall
+// back to main and persist so every later check/apply follows main — no manual
+// flip, even for already-installed clients. The probe MUST ask the same remote
+// the passive check fetches from (resolveHealProbeRemote); probing origin on a
+// fork install keeps a stale fork branch alive and strands the checker in a
+// permanent fetch-failed against upstream. Read-only ls-remote probe; only
+// flips on a definitive "ref absent" (exit 2), never on a transient network
+// error, so a flaky connection can't strand a user on the wrong branch.
 async function resolveHealedBranch(updateRoot, branch) {
   if (!branch || branch === 'main') {
     return branch || 'main'
   }
 
   const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const upstreamUrl = await getRemoteUrl(updateRoot, 'upstream')
+  const remote = resolveHealProbeRemote({ originUrl, upstreamUrl })
   const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
 
   if (probe.code !== 2) {
     return branch
   }
 
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
+  rememberLog(`[updates] ${remote}/${branch} is gone (merged?); falling back to main`)
   const config = readDesktopUpdateConfig()
 
   if (config.branch !== 'main') {
@@ -2741,6 +2756,8 @@ async function checkUpdates() {
 
   branch = await resolveHealedBranch(updateRoot, branch)
   const originUrl = await getOriginUrl(updateRoot)
+  const upstreamUrl = await getRemoteUrl(updateRoot, 'upstream')
+  const updateSource = resolvePassiveUpdateSource({ originUrl, upstreamUrl })
 
   if (isOfficialSshRemote(originUrl)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
@@ -2801,7 +2818,8 @@ async function checkUpdates() {
   // check reports 'fetch-failed' forever — git never removes these itself.
   await clearStaleGitLocks(updateRoot)
 
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+  const fetchArgs = buildPassiveFetchArgs(updateSource, branch)
+  const fetched = await runGit(fetchArgs, { cwd: updateRoot })
 
   if (fetched.code !== 0) {
     return {
@@ -2815,27 +2833,47 @@ async function checkUpdates() {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+  const targetRef = `${updateSource.trackingRemote}/${branch}`
 
   const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
-    git(['rev-parse', `origin/${branch}`]),
+    git(['rev-parse', targetRef]),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD']),
     git(['rev-parse', '--is-shallow-repository'])
   ])
 
+  // A fetch can exit 0 while the tracking ref still doesn't exist (e.g. a
+  // single-branch fetch refspec silently drops the update, observed live
+  // 2026-08-23). rev-parse then fails and echoes the ref NAME to stdout; fed
+  // into the count math that used to coerce into a silent behind=0 — "up to
+  // date" reported over a broken measurement. Fail loud instead: an
+  // unmeasurable checkout is an error, never up to date. Accepts SHA-1 (40
+  // hex) and SHA-256 (64 hex) object ids so the guard can never misfire on a
+  // measurable ref.
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+    return {
+      supported: true,
+      branch,
+      error: 'fetch-failed',
+      message: `${targetRef} is missing after fetch — cannot measure updates.`,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
   const isShallow = shallowStr === 'true'
 
   // A shallow graph cannot provide a trustworthy exact count, even when it has
   // a visible merge-base. Skip the ancestry walk and use the SHA fallback.
-  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..origin/${branch}`, '--count']) : ''
+  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..${targetRef}`, '--count']) : ''
 
   // A positive directional ancestry result remains trustworthy in a shallow
   // graph and prevents a local commit on top of origin from looking outdated.
   const targetIsAncestorOfHead =
     isShallow &&
     currentSha !== targetSha &&
-    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+    (await runGit(['merge-base', '--is-ancestor', targetRef, 'HEAD'], { cwd: updateRoot })).code === 0
 
   let behind = resolveBehindCount({
     countStr,
@@ -2850,14 +2888,15 @@ async function checkUpdates() {
   // offline, rate-limited, or non-GitHub origins keep the honest null
   // ("update available", no fabricated number).
   if (behind === null) {
-    behind = await fetchCompareBehindCount({ currentSha, originUrl, targetSha })
+    behind = await fetchCompareBehindCount({ currentSha, originUrl: updateSource.compareUrl, targetSha })
   }
 
   // behind === null means "update available, exact count unknown" (shallow
   // clone): still list what origin offers — resolveCommitLogSelection keeps
   // the shallow log to the fetched tip so the range walk can't enumerate the
   // contaminated ancestry — so "See what's new" stays useful and honest.
-  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow) : []
+  const commits =
+    behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow, updateSource.trackingRemote) : []
 
   return {
     supported: true,
@@ -2928,10 +2967,10 @@ async function fetchCompareBehindCount({ currentSha, originUrl, targetSha }) {
   }
 }
 
-async function readCommitLog(cwd, branch, isShallow) {
+async function readCommitLog(cwd, branch, isShallow, remote = 'origin') {
   const SEP = '\x1f'
   const REC = '\x1e'
-  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow })
+  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow, remote })
 
   const { stdout } = await runGit(
     ['log', revision, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', String(limit)],

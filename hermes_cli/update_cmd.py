@@ -1761,11 +1761,13 @@ OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
-def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
-    """Get the URL of the origin remote, or None if not set."""
+def _get_remote_url(
+    git_cmd: list[str], cwd: Path, remote: str
+) -> Optional[str]:
+    """Get a remote URL, or None if the remote is unavailable."""
     try:
         result = subprocess.run(
-            git_cmd + ["remote", "get-url", "origin"],
+            git_cmd + ["remote", "get-url", remote],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -1775,6 +1777,11 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    """Get the URL of the origin remote, or None if not set."""
+    return _get_remote_url(git_cmd, cwd, "origin")
 
 def _is_fork(origin_url: Optional[str]) -> bool:
     """Check if the origin remote points to a fork (not the official repo)."""
@@ -1791,6 +1798,22 @@ def _is_fork(origin_url: Optional[str]) -> bool:
         if normalized == official_normalized:
             return False
     return True
+
+
+def _normalize_remote_url(remote_url: str) -> str:
+    normalized = remote_url.strip().rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized.casefold()
+
+
+def _is_official_repo_url(remote_url: Optional[str]) -> bool:
+    """True only when the URL is NousResearch/hermes-agent (positive match)."""
+    if not remote_url:
+        return False
+    normalized = _normalize_remote_url(remote_url)
+    return any(normalized == _normalize_remote_url(official) for official in OFFICIAL_REPO_URLS)
+
 
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Check if an 'upstream' remote already exists."""
@@ -1864,23 +1887,22 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
-    """Check if fork is behind upstream and sync if safe.
 
-    This implements the fork upstream sync logic:
-    - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+def _sync_with_upstream_if_needed(
+    git_cmd: list[str], cwd: Path
+) -> dict[str, object]:
+    """Sync a fork from official upstream without discarding fork commits.
+
+    Returns a status record: ``advanced``, ``current``, ``conflict``, or
+    ``failed``. A diverged fork is merged in place; conflicts are aborted and
+    mechanically checked before the function claims restoration.
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:
-        # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return {"status": "skipped", "reason": "official upstream is not configured"}
 
-        # Ask user if they want to add upstream
         print()
         print("ℹ Your fork is not tracking the official Hermes repository.")
         print("  This means you may miss updates from NousResearch/hermes-agent.")
@@ -1902,82 +1924,120 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return {"status": "skipped", "reason": "could not add official upstream"}
         else:
             print(
                 "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
             )
             _mark_skip_upstream_prompt()
-            return
+            return {"status": "skipped", "reason": "official upstream was declined"}
 
-    # Fetch upstream main only. This sync compares upstream/main with
-    # origin/main, so there's no reason to pull every upstream ref — and a bare
-    # fetch drags in thousands of auto-generated branches.
+    upstream_url = _get_remote_url(git_cmd, cwd, "upstream")
+    if not _is_official_repo_url(upstream_url):
+        print("  ✗ Refusing upstream sync: 'upstream' is not NousResearch/hermes-agent.")
+        return {"status": "failed", "reason": "non-official upstream remote"}
+
+    pre_sha = _capture_head_sha(git_cmd, cwd)
+    if not pre_sha:
+        print("  ✗ Could not capture HEAD before upstream sync; checkout left unchanged.")
+        return {"status": "failed", "reason": "pre-sync HEAD unavailable"}
+
     print()
     print("→ Fetching upstream...")
-    try:
-        subprocess.run(
-            git_cmd + ["fetch", "upstream", "main", "--quiet"],
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "upstream", "main", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if fetch_result.returncode != 0:
+        print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
+        return {"status": "skipped", "reason": "upstream fetch failed", "pre_sha": pre_sha}
+
+    head_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "HEAD")
+    upstream_ahead = _count_commits_between(git_cmd, cwd, "HEAD", "upstream/main")
+
+    if head_ahead < 0 or upstream_ahead < 0:
+        print("  ✗ Could not compare HEAD with upstream. Skipping upstream sync.")
+        return {"status": "failed", "reason": "upstream comparison failed", "pre_sha": pre_sha}
+
+    if upstream_ahead == 0:
+        print("  ✓ Fork contains all upstream commits")
+        return {"status": "current", "pre_sha": pre_sha, "post_sha": pre_sha}
+
+    if head_ahead > 0:
+        print()
+        print(
+            f"→ Fork diverged: preserving {head_ahead} fork commit(s) while "
+            f"merging {upstream_ahead} upstream commit(s)..."
+        )
+        merge_args = ["merge", "--no-edit", "upstream/main"]
+    else:
+        print()
+        print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
+        print("→ Fast-forwarding from upstream...")
+        merge_args = ["merge", "--ff-only", "upstream/main"]
+
+    merge_result = subprocess.run(
+        git_cmd + merge_args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if merge_result.returncode != 0:
+        abort_result = subprocess.run(
+            git_cmd + ["merge", "--abort"],
             cwd=cwd,
             capture_output=True,
-            check=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
-
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
-    )
-
-    if origin_ahead < 0 or upstream_ahead < 0:
-        print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
-
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
-
-    # If upstream is not ahead, fork is up to date
-    if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return
-
-    # origin/main is strictly behind upstream/main (can fast-forward)
-    print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
+        post_abort_sha = _capture_head_sha(git_cmd, cwd)
+        merge_head = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "MERGE_HEAD"],
             cwd=cwd,
-            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
-        return
+        merge_in_progress = merge_head.returncode == 0
+        abort_ok = abort_result.returncode == 0 or not merge_in_progress
+        restored = abort_ok and post_abort_sha == pre_sha and not merge_in_progress
+        if restored:
+            print("  ✗ Upstream merge conflicted; restored the pre-update fork checkout.")
+        else:
+            print("  ✗ Upstream merge failed and automatic restoration could not be proven.")
+        return {
+            "status": "conflict" if restored else "failed",
+            "reason": "upstream merge conflict",
+            "pre_sha": pre_sha,
+            "post_sha": post_abort_sha,
+            "restored": restored,
+        }
 
-    print("  ✓ Updated from upstream")
+    post_sha = _capture_head_sha(git_cmd, cwd)
+    if not post_sha or post_sha == pre_sha:
+        print("  ✗ Upstream sync reported success but HEAD did not advance.")
+        return {
+            "status": "failed",
+            "reason": "upstream sync did not advance HEAD",
+            "pre_sha": pre_sha,
+            "post_sha": post_sha,
+        }
 
-    # Try to sync fork back to origin
+    print("  ✓ Updated from upstream while preserving fork commits")
     print("→ Syncing fork...")
     if _sync_fork_with_upstream(git_cmd, cwd):
         print("  ✓ Fork synced with upstream")
     else:
-        print(
-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
-        )
-        print("    Your local repo is updated, but your fork on GitHub may be behind.")
+        print("  ℹ Local runtime updated; fork push was rejected or unavailable.")
+    return {"status": "advanced", "pre_sha": pre_sha, "post_sha": post_sha}
 
 def _invalidate_update_cache():
     """Delete the update-check cache for ALL profiles so no banner
@@ -5004,12 +5064,47 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # not behind, fall through to the up-to-date path.
             commit_count = counted if counted is not None else -1
 
+        upstream_sync_pre_sha = None
+
+        # A fork can match origin while still trailing upstream. Detect a HEAD
+        # move before taking the no-update return so dependency refreshes,
+        # Desktop rebuilds, and gateway restarts run for the merged code.
+        if commit_count == 0 and is_fork and branch == "main":
+            sync_result = _m()._sync_with_upstream_if_needed(
+                git_cmd, _m().PROJECT_ROOT
+            )
+            sync_status = str(sync_result.get("status") or "failed")
+            pre_sync_sha = str(sync_result.get("pre_sha") or "")
+            post_sync_sha = str(sync_result.get("post_sha") or "")
+            if sync_status == "advanced":
+                upstream_sync_pre_sha = pre_sync_sha or None
+                synced_count = _count_commits_between(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_sync_sha,
+                    post_sync_sha,
+                )
+                commit_count = max(1, synced_count)
+            elif sync_status in {"current", "skipped"}:
+                pass
+            else:
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                print(
+                    "✗ Update blocked: "
+                    + str(sync_result.get("reason") or "official upstream sync failed")
+                )
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                sys.exit(1)
+
         if commit_count == 0:
             _invalidate_update_cache()
-
-            # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
-                _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved.
             # EXCEPTION: a parked feature branch we verified clean + fully
@@ -5149,7 +5244,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # orphan merge-conflict markers in hermes_cli/config.py bricked
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        pre_pull_sha = upstream_sync_pre_sha or _capture_head_sha(
+            git_cmd, _m().PROJECT_ROOT
+        )
         try:
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
