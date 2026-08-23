@@ -216,6 +216,59 @@ class TestCmdUpdateTermuxUvBootstrap:
         mock_run.assert_not_called()
 
 
+class TestUpdateManagedPythonEnvIsolation:
+    """Regression for the uv-env isolation fix (third-party UV_PYTHON_INSTALL_DIR
+    must not hijack the update's pip install).
+
+    The update path builds uv_env via managed_python_env() (drops
+    VIRTUAL_ENV/PYTHONPATH/UV_PYTHON, pins UV_MANAGED_PYTHON=1 + UV_NO_CONFIG=1,
+    forces UV_PYTHON_INSTALL_DIR to .hermes-runtime/python), then re-points
+    VIRTUAL_ENV at this install's venv. These tests lock that contract in.
+    """
+
+    def test_managed_env_drops_third_party_uv_install_dir(self):
+        from hermes_cli.managed_uv import managed_python_env
+
+        poisoned = {
+            "UV_PYTHON_INSTALL_DIR": r"C:\WorkBuddy\python",
+            "UV_PYTHON": r"C:\WorkBuddy\python\python.exe",
+            "UV_SYSTEM_PYTHON": "1",
+            "UV_NO_MANAGED_PYTHON": "1",
+            "VIRTUAL_ENV": r"C:\Some\Other\venv",
+            "PYTHONPATH": r"C:\Some\site-packages",
+        }
+        env = managed_python_env()
+
+        # Third-party UV_PYTHON_INSTALL_DIR must not survive into the env.
+        assert env.get("UV_PYTHON_INSTALL_DIR", "") != r"C:\WorkBuddy\python"
+        assert "WorkBuddy" not in env.get("UV_PYTHON_INSTALL_DIR", "")
+        # Managed pins are set; the hijack guards are explicitly cleared.
+        assert env.get("UV_MANAGED_PYTHON") == "1"
+        assert env.get("UV_NO_CONFIG") == "1"
+        assert env.get("UV_PYTHON") is None
+        assert env.get("UV_SYSTEM_PYTHON") is None
+        assert env.get("UV_NO_MANAGED_PYTHON") is None
+        assert env.get("VIRTUAL_ENV") is None
+        assert env.get("PYTHONPATH") is None
+        # Sanity: the poisoned values did exist on input (guards the test itself).
+        assert poisoned["UV_PYTHON_INSTALL_DIR"].startswith("C:\\WorkBuddy")
+
+    def test_update_uv_env_points_venv_and_runtime_store(self):
+        """The update's final uv_env must carry VIRTUAL_ENV=this venv while the
+        managed store path is still the UV_PYTHON_INSTALL_DIR."""
+        from hermes_cli import main as hm
+        from hermes_cli.managed_uv import managed_python_env
+
+        uv_env = managed_python_env()
+        uv_env["VIRTUAL_ENV"] = str(PROJECT_ROOT / "venv")
+
+        assert uv_env["VIRTUAL_ENV"] == str(PROJECT_ROOT / "venv")
+        # Managed store stays the install-scoped runtime dir, not a third-party one.
+        assert ".hermes-runtime" in uv_env.get("UV_PYTHON_INSTALL_DIR", "")
+        assert uv_env.get("UV_MANAGED_PYTHON") == "1"
+        assert uv_env.get("UV_NO_CONFIG") == "1"
+
+
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
@@ -268,6 +321,13 @@ class TestCmdUpdateBranchFallback:
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
         )
+
+        # The reads bracket the pull inside the normal update path
+        # (aaaaaaa -> bbbbbbb) — the head-moved no-op guard exits 1 when that
+        # pair is equal, so the mock must show the pull advancing HEAD. The
+        # fork sync itself is mocked via its status-dict contract below.
+        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
+
         with patch.object(
             hm,
             "_get_origin_url",
@@ -275,16 +335,49 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(
             update_cmd,
             "_capture_head_sha",
-            return_value="bbbbbbb",
+            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
+        ), patch(
+            # The full post-update path runs the fleet version check, which
+            # reads the REAL machine's profile gateway_state.json files —
+            # live gateways on a dev box read as STALE vs this checkout and
+            # exit 1. Pin an empty fleet: this test asserts the post-update
+            # path RUNS, not the fleet's health.
+            "hermes_cli.update_receipt.collect_fleet_versions",
+            return_value=[],
+        ), patch(
+            # Same isolation for the restart phase: without these, the real
+            # machine's live gateways enter the restart discovery, the
+            # mocked-subprocess restart phase can't verify replacements, and
+            # the fail-closed contract (#78574) exits 1 (locally the
+            # live-system guard blocks the os.kill outright).
+            "hermes_cli.gateway.find_gateway_pids",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway._get_service_pids",
+            return_value=set(),
         ), patch.object(
             hm,
             "_sync_with_upstream_if_needed",
+            # The fork-safe call site consumes a status contract, not a bare
+            # call: 'advanced' + the SHA pair drive the post-update path.
             return_value={"status": "advanced", "pre_sha": "aaaaaaa", "post_sha": "bbbbbbb"},
         ), patch.object(
-            hm, "_reload_updated_runtime_modules"
+            hm,
+            "_reload_updated_runtime_modules",
+            # Reaching the reload step IS the proof the post-update path ran
+            # (the bug returned from "Already up to date!" before it). Abort
+            # the pipeline right here: everything past this point (skills
+            # sync, desktop rebuild, gateway restart, fleet check) would run
+            # for real against the host machine.
+            side_effect=SystemExit(0),
         ) as post_update_step:
-            cmd_update(mock_args)
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(mock_args)
 
+        assert exit_info.value.code == 0
         post_update_step.assert_called_once_with()
         captured = capsys.readouterr()
         assert "Already up to date!" not in captured.out
@@ -977,7 +1070,15 @@ class TestNodeRuntimeNpmResolution:
         )
 
     def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
-        """The Windows ZIP fallback restores Desktop after replacing ``apps/``."""
+        """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
+
+        Contract updated for the #70337/#87331 release-dir graft: the built
+        desktop app (release/win-unpacked/Hermes.exe) is preserved THROUGH
+        the swap — previously this test pinned the old repair shape (exe
+        deleted by the swap, then rebuilt from scratch). The rebuild hook
+        still runs (mocked _desktop_build_needed=True), but it now finds
+        the packaged exe alive rather than missing.
+        """
         import zipfile
 
         from hermes_cli import main as hm
@@ -1063,7 +1164,12 @@ class TestNodeRuntimeNpmResolution:
                 gateway_mode=False,
             )
 
-        assert desktop_builds == [True]
+        # Release-dir graft (#70337): the packaged exe SURVIVES the swap, so
+        # the rebuild hook observed it present (False), and the bytes are the
+        # original build — never deleted, never rebuilt from nothing.
+        assert desktop_builds == [False]
+        assert packaged_exe.exists()
+        assert packaged_exe.read_bytes() == b"desktop"
 
 
 class TestUpdateNodeDependencies:
