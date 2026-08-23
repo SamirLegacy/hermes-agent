@@ -316,6 +316,10 @@ const $botsHomeFronted = atom(false)
 
 let botsHomeClose = null
 let suppressBotsHomeReopen = false
+// Latched while a re-front attempt has not yet been answered with visibility.
+// Cleared the moment the home is actually fronted, and whenever the tab is
+// retired — a fresh open starts the budget over. See openBotsHomeWorkspace.
+let botsHomeRefrontTried = false
 
 function saveSelectedRosterBot(bot) {
   const key = botRosterKey(bot)
@@ -503,7 +507,8 @@ const GROUP_ACTIVITY_LABELS = {
   failed: 'hit an error',
   cancelled: 'turn interrupted by a newer message',
   settled: 'turn settled',
-  delivered: 'delivered a late reply'
+  delivered: 'delivered a late reply',
+  held: 'is held (stopped by you) — @mention it or say resume to release'
 }
 
 const GROUP_ACTIVITY_GLYPHS = {
@@ -515,7 +520,8 @@ const GROUP_ACTIVITY_GLYPHS = {
   failed: 'error',
   cancelled: 'close',
   settled: 'check-all',
-  delivered: 'mail-read'
+  delivered: 'mail-read',
+  held: 'debug-pause'
 }
 
 /** Text tone for an activity row: quiet for pass/cancel/settle, accent for
@@ -6313,6 +6319,10 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
         // with the pre-turn message baseline. Survives reloads so finished
         // work is still harvested after a window restart.
         stranded: room.stranded || {},
+        // #93129: sticky per-member stop holds. Watermarks persist, so holds
+        // must too — otherwise a window restart silently releases a bot the
+        // user explicitly stopped.
+        holds: room.holds || {},
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
@@ -6552,6 +6562,17 @@ function appendGroupChatEntry(group, from, text, thread, images) {
     // [{ name, data }] — data URLs. Persisted with the room log so reloads
     // keep showing what the members were shown.
     entry.images = images
+  }
+
+  // #93127 insurance: a residual double-append path (stale loop + fresh
+  // loop both committing the same member reply) lands back-to-back and
+  // byte-identical. Drop the echo instead of flooding the room. User
+  // entries and non-adjacent repeats are never touched.
+  const priorLog = ($groupChats.get()[group] || {}).log || []
+  const lastEntry = priorLog[priorLog.length - 1]
+
+  if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
+    return lastEntry
   }
 
   updateGroupChat(group, room => {
@@ -7042,6 +7063,138 @@ async function harvestStrandedGroupReply(group, member) {
   }
 }
 
+// --- room-turn decision helpers (#93127) — pure, vm-sliced by tests ---
+
+/** #93127: whether a finished member turn may still commit (append its reply
+ *  and advance its watermark). A turn dispatched under an older epoch was
+ *  superseded mid-flight by a newer user send — its late result must be
+ *  dropped, because the new send's own loop re-drives this member with the
+ *  full delta and committing both is exactly the double-delivery bug.
+ *
+ *  The re-drive premise is only true for a send in the SAME thread (delta
+ *  filters are thread-scoped): a cross-thread epoch bump must NOT discard
+ *  finished work no fresh loop will regenerate. Callers pass whether a newer
+ *  USER entry landed in this thread since dispatch; the default (true)
+ *  preserves the conservative drop when the caller can't tell. */
+function shouldCommitMemberTurn(epochAtDispatch, currentEpoch, newerUserEntryInThread = true) {
+  if (epochAtDispatch === currentEpoch) {
+    return true
+  }
+
+  return !newerUserEntryInThread
+}
+
+/** #93127 insurance: byte-identical member echo detection. TRUE only when
+ *  the immediately-preceding log entry has the same author (kind + name +
+ *  source), same thread, and identical text, within a short recency window —
+ *  a residual double-append fires back-to-back; two legitimately identical
+ *  replies hours apart (or with anything in between) are never dropped. */
+const GROUP_DUPLICATE_APPEND_WINDOW_MS = 10 * 60 * 1000
+
+function isDuplicateGroupAppend(lastEntry, from, text, thread, now = Date.now()) {
+  if (!lastEntry || !from || from.kind !== 'member' || lastEntry.from?.kind !== 'member') {
+    return false
+  }
+
+  if (String(lastEntry.from?.name || '') !== String(from.name || '')) {
+    return false
+  }
+
+  if (String(lastEntry.from?.source || '') !== String(from.source || '')) {
+    return false
+  }
+
+  if (String(lastEntry.thread || 'legacy') !== String(thread || 'legacy')) {
+    return false
+  }
+
+  if (now - (lastEntry.at || 0) > GROUP_DUPLICATE_APPEND_WINDOW_MS) {
+    return false
+  }
+
+  return String(lastEntry.text || '') === String(text || '').trim()
+}
+
+// --- end room-turn decision helpers ---
+
+// --- member-hold helpers (#93129) — pure, vm-sliced by tests ---
+
+/** #93129: classify a USER room message's effect on member holds. Only user
+ *  sends ever reach this (bot replies are appended by the round loop, never
+ *  through sendToGroupChat), so a bot saying "stopped working on it" can
+ *  never set a hold. Conservative on purpose: any standalone stop/halt/pause
+ *  word next to a mention holds those members — "don't stop @x" therefore
+ *  also holds, which errs toward the bot staying quiet until re-addressed
+ *  (a wrongly-held bot is one mention away from release; a wrongly-running
+ *  one keeps doing work it was told to stop). A non-stop direct mention
+ *  releases the mentioned members — the user addressing a bot directly
+ *  overrides its hold. */
+function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
+  const value = String(text || '')
+  const mentioned = [...(mentionedKeys || [])]
+  const stop = /\b(stop|halt|pause)\b/i.test(value)
+  const resume = /\b(resume|continue|go|proceed)\b/i.test(value)
+
+  if (stop) {
+    // "@all stop" holds every member — symmetric with "@all resume".
+    return { hold: mentioned, holdAll: Boolean(everyone), release: [], releaseAll: false }
+  }
+
+  if (resume) {
+    return { hold: [], holdAll: false, release: mentioned, releaseAll: Boolean(everyone) }
+  }
+
+  return { hold: [], holdAll: false, release: mentioned, releaseAll: false }
+}
+
+/** #93129: next holds map after one user message. Holds are keyed by
+ *  memberKey at ROOM scope (not thread scope): every main-composer send
+ *  mints a NEW thread, so a thread-scoped hold would never block the next
+ *  send's turns and the stop would not stick. Returns the same object when
+ *  nothing changed. */
+function applyGroupHoldDirective(holds, mentions, text, stamp, allMemberKeys = []) {
+  const prior = holds && typeof holds === 'object' ? holds : {}
+  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone))
+
+  if (action.releaseAll) {
+    return Object.keys(prior).length ? {} : prior
+  }
+
+  // "@all stop": expand to every member key the caller knows about.
+  const toHold = action.holdAll ? [...allMemberKeys] : action.hold
+
+  let next = prior
+
+  for (const key of toHold) {
+    if (next === prior) {
+      next = { ...prior }
+    }
+
+    next[key] = { at: stamp?.at || Date.now(), byMessageId: stamp?.byMessageId || null, thread: stamp?.thread || null }
+  }
+
+  for (const key of action.release) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) {
+      if (next === prior) {
+        next = { ...prior }
+      }
+
+      delete next[key]
+    }
+  }
+
+  return next
+}
+
+/** #93129: a held member's skip must consume its delta exactly once —
+ *  advance the watermark past the current log so the same entries never
+ *  re-trigger the skip. Null = nothing to consume (no write, no spin). */
+function heldMemberWatermarkAdvance(seen, logLength) {
+  return logLength > (seen || 0) ? logLength : null
+}
+
+// --- end member-hold helpers ---
+
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
  *  a time. A newer user send bumps the room epoch; this loop notices at the
  *  next member boundary, bails, and the newest send's own loop takes over.
@@ -7104,6 +7257,35 @@ async function runGroupChatRounds(group, members, thread) {
           continue
         }
 
+        // #93129: a member the user told to stop is HELD — no turn until an
+        // explicit release (resume / @all resume / a direct non-stop
+        // mention). Consume the delta exactly once (watermark past the
+        // current log) so the same entries never re-trigger this skip, and
+        // surface WHY the bot is silent in the activity feed the first time.
+        const heldEntry = (room.holds || {})[memberKey]
+
+        if (heldEntry) {
+          const advance = heldMemberWatermarkAdvance(seen, room.log.length)
+
+          updateGroupChat(group, r => {
+            if (advance !== null) {
+              r.watermarks[markKey] = advance
+            }
+
+            if (r.holds?.[memberKey] && !r.holds[memberKey].noted) {
+              r.holds = { ...r.holds, [memberKey]: { ...r.holds[memberKey], noted: true } }
+            }
+
+            return r
+          })
+
+          if (!heldEntry.noted) {
+            recordGroupActivity(group, { kind: 'held', member: member.name, thread })
+          }
+
+          continue
+        }
+
         const prompt = buildGroupChatTurnPrompt({
           groupName: group,
           members,
@@ -7141,6 +7323,33 @@ async function runGroupChatRounds(group, members, thread) {
           recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
           noteBotAttention(groupMemberKey(member), error?.message || error)
           reply = null // a failed turn is a pass, never a room error
+        }
+
+        // #93127: the turn may have finished AFTER a newer user send bumped
+        // the room epoch. That newer send's loop re-drives this member with
+        // the full delta, so committing this stale result (watermark advance
+        // + append) would double-deliver the same reply. Drop it here —
+        // BEFORE the watermark advance and BEFORE the append. Only a newer
+        // USER entry in THIS thread makes the re-drive premise true: a
+        // cross-thread send bumps the epoch too, but its loop filters this
+        // thread out and would never regenerate the finished reply. The
+        // during-turn tail is anchored by entry id, not index — the history
+        // trim drops entries from the FRONT, so an index slice could
+        // overshoot after a mid-turn trim and silently commit a stale turn.
+        const roomNow = $groupChats.get()[group] || { log: [] }
+        const epochNow = roomNow.epoch || 0
+        const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
+        const anchorIdx = anchorId === null ? -1 : roomNow.log.findIndex(e => e.id === anchorId)
+        // Anchor trimmed away ⇒ every pre-turn entry was dropped, so every
+        // surviving entry is newer — scanning the whole log stays exact.
+        const turnTail = anchorIdx >= 0 ? roomNow.log.slice(anchorIdx + 1) : roomNow.log
+        const newerUserEntryInThread = turnTail.some(
+          e => e.from?.kind === 'user' && groupThreadOf(e) === thread
+        )
+
+        if (!shouldCommitMemberTurn(startEpoch, epochNow, newerUserEntryInThread)) {
+          recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
+          return
         }
 
         // The member has now seen everything up to the pre-reply log length.
@@ -7253,13 +7462,24 @@ function sendToGroupChat(group, members, text, thread, images) {
     room.members = durableGroupChatMembers(members)
     return room
   })
-  appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
+  const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
 
   const wasRunning = ($groupChats.get()[group] || {}).running === true
 
   updateGroupChat(group, room => {
     room.epoch = (room.epoch || 0) + 1
     room.running = true
+    // #93129: user text is the ONLY input that changes member holds. An
+    // explicit "stop @member" sets a sticky hold; "@member resume" (or
+    // @all resume, or any direct non-stop mention of the held member)
+    // releases it. Bot replies never flow through this function.
+    room.holds = applyGroupHoldDirective(
+      room.holds,
+      parseGroupChatMentions(trimmed, members),
+      trimmed,
+      { at: sent?.at, byMessageId: sent?.id, thread: target },
+      members.map(member => groupMemberKey(member))
+    )
     return room
   })
 
@@ -9994,7 +10214,117 @@ function scheduleLabel(schedule) {
   return schedule || ''
 }
 
-function RoutineRow({ job, owner }) {
+/** Absolute + relative rendering of a cron timestamp, or null when the job
+ *  has never carried one (a job that has not run yet has no `last_run_at`). */
+function routineTimestamp(value) {
+  const ms = value ? new Date(value).getTime() : Number.NaN
+  return Number.isFinite(ms) ? `${relativeTime(ms)} · ${new Date(ms).toLocaleString()}` : null
+}
+
+/** The facts `cron.manage list` already sends with every job, as label/value
+ *  rows. Pure so the detail contract is testable without a renderer, and so
+ *  the dialog cannot invent a field the gateway never sent: an absent value
+ *  drops its row instead of rendering "undefined". */
+function routineDetailRows(job) {
+  const paused = job?.enabled === false || job?.state === 'paused'
+  const label = scheduleLabel(job?.schedule)
+  const raw = String(job?.schedule || '').trim()
+
+  return [
+    ['Status', paused ? 'Paused' : 'Active'],
+    ['Schedule', label],
+    // `scheduleLabel` humanizes "every 1440m" and cron expressions; keep the
+    // raw string when it says something the label dropped.
+    ['Schedule (raw)', raw && raw !== label ? raw : null],
+    ['Repeat', job?.repeat],
+    ['Next run', paused ? null : routineTimestamp(job?.next_run_at)],
+    ['Last run', routineTimestamp(job?.last_run_at)],
+    ['Last result', job?.last_status],
+    ['Delivers to', job?.deliver],
+    ['Model', job?.model],
+    ['Working directory', job?.workdir]
+  ]
+    .filter(([, value]) => typeof value === 'string' && value.trim())
+    .map(([name, value]) => ({ label: name, value: value.trim() }))
+}
+
+/** Why a job is not doing what the user expects. The row only ever showed
+ *  "paused"; the scheduler's own reason and the last fire/delivery failures
+ *  had no surface in Bot Mode at all. */
+function routineDetailIssue(job) {
+  const reasons = [job?.last_fire_error, job?.last_delivery_error, job?.paused_reason]
+  const first = reasons.find(value => typeof value === 'string' && value.trim())
+
+  return first ? first.trim() : null
+}
+
+/** Read-only inspector for one cronjob, rendered from the list payload the
+ *  pane already holds — no extra RPC, and no second mutation path beside the
+ *  row's own switch and delete. */
+function RoutineDetailDialog({ job, onClose, open }) {
+  const rows = job ? routineDetailRows(job) : []
+  const issue = job ? routineDetailIssue(job) : null
+  const instruction = String(job?.prompt_preview || '').trim()
+
+  return jsx(Dialog, {
+    open: Boolean(open && job),
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { className: 'truncate', children: routineTitle(job) }),
+            jsx(DialogDescription, { children: 'What this cronjob runs, and when it runs next.' })
+          ]
+        }),
+        jsxs('div', {
+          className: 'grid gap-3.5',
+          children: [
+            issue
+              ? jsx('div', {
+                  className:
+                    'rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs leading-5 text-(--ui-accent)',
+                  children: issue
+                })
+              : null,
+            jsx('div', {
+              className: 'grid gap-1.5',
+              children: rows.map(row =>
+                jsxs('div', {
+                  className: 'flex items-baseline justify-between gap-3 text-xs',
+                  children: [
+                    jsx('span', { className: 'shrink-0 text-(--ui-text-tertiary)', children: row.label }),
+                    jsx('span', { className: 'min-w-0 truncate text-right', children: row.value })
+                  ]
+                }, row.label)
+              )
+            }),
+            instruction
+              ? labeled(
+                  'Instruction',
+                  jsx('div', {
+                    className:
+                      'max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs leading-5 text-(--ui-text-secondary)',
+                    children: instruction
+                  })
+                )
+              : null
+          ]
+        }),
+        jsx(DialogFooter, {
+          children: jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Close' })
+        })
+      ]
+    })
+  })
+}
+
+function RoutineRow({ job, onOpen, owner }) {
   const profile = typeof owner === 'string' ? owner : owner?.name
   const [busy, setBusy] = useState(false)
   // Optimistic overlay: null = trust server state. Set immediately on
@@ -10039,13 +10369,24 @@ function RoutineRow({ job, owner }) {
       jsxs('div', {
         className: 'flex items-center gap-2',
         children: [
-          jsx('span', {
-            'aria-hidden': true,
-            className: cn('size-1.5 shrink-0 rounded-full', active ? 'bg-emerald-500' : 'bg-(--ui-text-quaternary)')
-          }),
-          jsx('span', {
-            className: cn('min-w-0 flex-1 truncate text-xs font-medium', !active && 'text-(--ui-text-tertiary)'),
-            children: routineTitle(job)
+          // The row's own button, not a click handler on the card: the switch
+          // and delete control are siblings, so opening the details can never
+          // swallow a toggle (and a nested button would be invalid markup).
+          jsxs('button', {
+            type: 'button',
+            title: 'Cronjob details',
+            className: 'flex min-w-0 flex-1 items-center gap-2 text-left transition-colors hover:text-foreground',
+            onClick: () => onOpen?.(job),
+            children: [
+              jsx('span', {
+                'aria-hidden': true,
+                className: cn('size-1.5 shrink-0 rounded-full', active ? 'bg-emerald-500' : 'bg-(--ui-text-quaternary)')
+              }),
+              jsx('span', {
+                className: cn('min-w-0 flex-1 truncate text-xs font-medium', !active && 'text-(--ui-text-tertiary)'),
+                children: routineTitle(job)
+              })
+            ]
           }),
           jsx(Switch, {
             checked: active,
@@ -10515,6 +10856,10 @@ function RoutinesPane() {
   const { data, error, isLoading, refetch } = useRoutines(owner)
   const [createOpen, setCreateOpen] = useState(false)
   const [createOwner, setCreateOwner] = useState(null)
+  // Hold the id, not the record: the 20s poll replaces every job object, and
+  // an open inspector must follow the live row (next run, pause, last error)
+  // instead of freezing the snapshot that was on screen when it opened.
+  const [detailJobId, setDetailJobId] = useState(null)
   const createTarget = owner ? routineCreateTarget(createOwner, bot) : null
 
   const openCreate = () => {
@@ -10538,6 +10883,7 @@ function RoutinesPane() {
     $lastJobs.set(view.live)
   }
   const jobs = view.jobs
+  const detailJob = detailJobId ? jobs.find(job => job.job_id === detailJobId) || null : null
   const staleNotice = error && !view.live && view.all.length
     ? 'Could not refresh cronjobs. Showing the last list we had.'
     : null
@@ -10641,9 +10987,16 @@ function RoutinesPane() {
               className: 'min-h-0 flex-1',
               children: jsx('div', {
                 className: 'grid gap-1.5 px-2.5 py-2',
-                children: jobs.map(job => jsx(RoutineRow, { job, owner }, job.job_id))
+                children: jobs.map(job =>
+                  jsx(RoutineRow, { job, onOpen: opened => setDetailJobId(opened.job_id), owner }, job.job_id)
+                )
               })
             }),
+      jsx(RoutineDetailDialog, {
+        job: detailJob,
+        open: Boolean(detailJob),
+        onClose: () => setDetailJobId(null)
+      }),
       jsx(CreateRoutineDialog, {
         bot: createTarget,
         open: createOpen,
@@ -12773,6 +13126,10 @@ function closeBotsHomeWorkspace() {
   const close = botsHomeClose
   botsHomeClose = null
   suppressBotsHomeReopen = true
+  // Retiring the tab ends the current attempt's budget: the next open is a
+  // new surface, and it gets its own re-front chance. The re-front path sets
+  // the latch again AFTER calling us, so this cannot erase its own attempt.
+  botsHomeRefrontTried = false
 
   try {
     close()
@@ -12860,10 +13217,27 @@ function openBotsHomeWorkspace(explicit = false) {
   // and each of those either legitimately claims the center or cleared it.
   if (botsHomeClose) {
     if (botsHomeVisible()) {
+      botsHomeRefrontTried = false
+
+      return true
+    }
+
+    // A re-front is a close + re-open, so it REMOUNTS the whole Bots view.
+    // That is affordable once, against the backgrounded-tab case above. It is
+    // not affordable per signal: the shell does not always answer a reveal
+    // with the active slot (revealTreePane returns early for a pane in
+    // $hiddenTreePanes without activating it; a minimized zone and a pane the
+    // tree never adopted are never visible either). Pinned in one of those
+    // states the old code re-fronted on every passive pass — sidebar flips,
+    // focus churn and group changes all reach here — and the view strobed.
+    // One attempt proves whether this shell will front the tab; if it will
+    // not, keep the surface and wait for a signal that changes the answer.
+    if (botsHomeRefrontTried && !explicit) {
       return true
     }
 
     closeBotsHomeWorkspace()
+    botsHomeRefrontTried = true
   }
 
   try {
@@ -12880,6 +13254,15 @@ function openBotsHomeWorkspace(explicit = false) {
         }
       }
     })
+
+    // The reveal has already either granted the tab its zone's active slot or
+    // refused it, so settle the re-front budget on that answer directly rather
+    // than waiting for a visibility notification to schedule another pass. A
+    // computed store stays silent when the value does not change, so on the
+    // shells that refuse, no such pass is coming.
+    if (botsHomeVisible()) {
+      botsHomeRefrontTried = false
+    }
 
     return typeof botsHomeClose === 'function'
   } catch {
@@ -14110,6 +14493,10 @@ export default {
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
+                  // #93129: rehydrate sticky stop holds with the same shape
+                  // guard as the other maps — a held bot stays held across
+                  // window restarts until explicitly released.
+                  holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
