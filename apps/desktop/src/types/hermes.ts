@@ -580,6 +580,8 @@ export interface SessionMessage {
   args?: unknown
   codex_reasoning_items?: unknown
   content: unknown
+  /** Backend-projected user-visible content when a physical row also carries internal model scaffolding. */
+  display_content?: unknown
   context?: unknown
   name?: string
   reasoning?: null | string
@@ -671,9 +673,11 @@ export interface SessionResumeResponse {
   // class as pending_approval: emitted-while-detached prompts are restored
   // from the resume snapshot instead of being lost until server-side timeout.
   pending_clarify?: {
+    answers?: Record<string, unknown>
     choices?: null | string[]
     multi_select?: boolean
     question?: string
+    questions?: unknown
     request_id?: string
   }
   info?: SessionRuntimeInfo
