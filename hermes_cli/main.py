@@ -4210,6 +4210,7 @@ def select_provider_and_model(args=None):
         "nvidia",
         "ollama-cloud",
         "tencent-tokenhub",
+        "tencent-tokenplan",
         "lmstudio",
     } or _is_profile_api_key_provider(selected_provider):
         _model_flow_api_key_provider(config, selected_provider, current_model)
@@ -11166,7 +11167,7 @@ def cmd_profile(args):
 
             # Profile dir for display
             try:
-                profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+                profile_dir_display = "~/" + profile_dir.relative_to(Path.home()).as_posix()
             except ValueError:
                 profile_dir_display = str(profile_dir)
 
