@@ -11189,7 +11189,8 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id
+        connectionId: id,
+        sharedRemote: true
       }
     }
   }
