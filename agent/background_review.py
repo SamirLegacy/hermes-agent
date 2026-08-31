@@ -1675,13 +1675,47 @@ def _run_review_in_thread(
                 clear_thread_tool_whitelist,
             )
 
+            # Fork hardening: background review is candidate-ledger only —
+            # the default whitelist is EMPTY (no memory/skills/file tools),
+            # so the review fork cannot write memory, skills, config, or
+            # external side effects.  Upstream's profile-configured opt-in
+            # (#44672, salvage #82146): ``auxiliary.background_review.
+            # extra_tools`` may admit named parent tools to the whitelist —
+            # e.g. a human-gated proposal tool.  Default-empty keeps the
+            # fork's deny-all posture; a listed tool must already exist in
+            # the parent's inherited schema (the whitelist can only admit,
+            # never advertise).  Read from task_cfg so no extra config I/O
+            # happens per review.
             review_whitelist: set[str] = set()
+            configured_extra_tools: set = set()
+            try:
+                _extra_raw = _background_review_task_config(task_cfg).get(
+                    "extra_tools", []
+                )
+                if isinstance(_extra_raw, list):
+                    configured_extra_tools = {
+                        name.strip()
+                        for name in _extra_raw
+                        if isinstance(name, str) and name.strip()
+                    }
+                    review_whitelist |= configured_extra_tools
+            except Exception:
+                logger.debug(
+                    "background_review extra_tools parse failed", exc_info=True
+                )
+            _extra_deny_note = (
+                " Configured extra tools are allowed: "
+                + ", ".join(sorted(configured_extra_tools)) + "."
+                if configured_extra_tools
+                else ""
+            )
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
                     "Background review denied tool call: {tool_name}. "
                     "Background review is candidate-ledger only and cannot "
                     "write memory, skills, config, or external side effects."
+                    + _extra_deny_note
                 ),
             )
             try:
@@ -1707,11 +1741,19 @@ def _run_review_in_thread(
                         user_message=(
                             prompt
                             # Fork hardening: background review is candidate-
-                            # ledger only (empty tool whitelist above), so the
-                            # prompt must promise deny-all, not memory/skill
-                            # tools.
+                            # ledger only (empty default tool whitelist above),
+                            # so the prompt must promise deny-all — except any
+                            # profile-configured extra_tools.
                             + "\n\nDo not call tools. Tool calls are denied. "
                             "Return only the candidate_signals JSON object described above."
+                            + (
+                                " Exception — these configured tools are "
+                                "allowed: "
+                                + ", ".join(sorted(configured_extra_tools))
+                                + "."
+                                if configured_extra_tools
+                                else ""
+                            )
                         ),
                         conversation_history=_review_history,
                     )

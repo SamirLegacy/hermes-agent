@@ -6449,7 +6449,15 @@ def run_job(
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
-            request_overrides=request_overrides,
+            # Merge of both sides (sync 2026-08-31): the fork forwards the
+            # resolved runtime's provider request_overrides (extra_body /
+            # extra_headers — commit 792dbea777), upstream computes fast-mode
+            # overrides from cron/agent service_tier. Key spaces are disjoint;
+            # fast-mode overrides apply on top of the provider ones.
+            request_overrides={
+                **(runtime.get("request_overrides") or {}),
+                **request_overrides,
+            },
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
