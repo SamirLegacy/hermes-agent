@@ -1,0 +1,179 @@
+/**
+ * Tests for electron/update-remote.ts — the remote-detection helpers that
+ * keep passive update checks off the SSH origin for official installs.
+ *
+ * Run with: node --test electron/update-remote.test.ts
+ * (Wired into npm test:desktop:platforms in package.json.)
+ *
+ * Why this matters: a public install can carry
+ * origin=git@github.com:NousResearch/hermes-agent.git. A background
+ * `git fetch origin` then authenticates over SSH and, with a FIDO2/passkey
+ * key, triggers an unexplained hardware-touch prompt. isOfficialSshRemote
+ * must reliably recognize the official SSH remote (in every URL form,
+ * case-insensitively) so the caller can swap in the anonymous HTTPS path —
+ * while NOT misclassifying forks, other hosts, or the HTTPS remote (which
+ * never prompts and should keep the normal fetch path).
+ */
+
+import assert from 'node:assert/strict'
+
+import { test } from 'vitest'
+
+import {
+  buildPassiveFetchArgs,
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveHealProbeRemote,
+  resolvePassiveUpdateSource
+} from './update-remote'
+
+test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
+  assert.equal(canonicalGitHubRemote('git@github.com:NousResearch/hermes-agent.git'), OFFICIAL_REPO_CANONICAL)
+  assert.equal(canonicalGitHubRemote('git@github.com:NousResearch/hermes-agent'), OFFICIAL_REPO_CANONICAL)
+  assert.equal(canonicalGitHubRemote('ssh://git@github.com/NousResearch/hermes-agent.git'), OFFICIAL_REPO_CANONICAL)
+  assert.equal(canonicalGitHubRemote('https://github.com/NousResearch/hermes-agent.git'), OFFICIAL_REPO_CANONICAL)
+  // Case-insensitive: an uppercased owner still canonicalizes to the same repo.
+  assert.equal(canonicalGitHubRemote('git@github.com:nousresearch/hermes-agent.git'), OFFICIAL_REPO_CANONICAL)
+  // Trailing slashes are stripped.
+  assert.equal(canonicalGitHubRemote('https://github.com/NousResearch/hermes-agent/'), OFFICIAL_REPO_CANONICAL)
+})
+
+test('canonicalGitHubRemote is empty for falsy input', () => {
+  assert.equal(canonicalGitHubRemote(''), '')
+  assert.equal(canonicalGitHubRemote(null), '')
+  assert.equal(canonicalGitHubRemote(undefined), '')
+})
+
+test('isSshRemote detects scp-like and ssh:// forms only', () => {
+  assert.equal(isSshRemote('git@github.com:NousResearch/hermes-agent.git'), true)
+  assert.equal(isSshRemote('ssh://git@github.com/NousResearch/hermes-agent.git'), true)
+  assert.equal(isSshRemote('https://github.com/NousResearch/hermes-agent.git'), false)
+  assert.equal(isSshRemote(''), false)
+  assert.equal(isSshRemote(null), false)
+})
+
+test('isOfficialSshRemote is true only for the official repo over SSH', () => {
+  assert.equal(isOfficialSshRemote('git@github.com:NousResearch/hermes-agent.git'), true)
+  assert.equal(isOfficialSshRemote('git@github.com:NousResearch/hermes-agent'), true)
+  assert.equal(isOfficialSshRemote('ssh://git@github.com/NousResearch/hermes-agent.git'), true)
+  // Case-insensitive owner/repo match.
+  assert.equal(isOfficialSshRemote('git@github.com:nousresearch/hermes-agent.git'), true)
+})
+
+test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
+  // A fork over SSH belongs to the user — fetching it is their own remote,
+  // not the official upstream, so the SSH-avoidance swap must not apply.
+  assert.equal(isOfficialSshRemote('git@github.com:someuser/hermes-agent.git'), false)
+  // Same repo name on a different host is not the official repo.
+  assert.equal(isOfficialSshRemote('git@gitlab.com:NousResearch/hermes-agent.git'), false)
+  // HTTPS to the official repo never prompts for SSH/FIDO2, so it keeps the
+  // normal fetch path — must not be flagged as an official SSH remote.
+  assert.equal(isOfficialSshRemote('https://github.com/NousResearch/hermes-agent.git'), false)
+  assert.equal(isOfficialSshRemote(''), false)
+  assert.equal(isOfficialSshRemote(null), false)
+})
+
+test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
+  // Invariant: the URL we substitute in must be the same repo we detect.
+  assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('fork installs use the official upstream remote for passive update checks', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: false,
+      fetchRemote: 'upstream',
+      trackingRemote: 'upstream'
+    }
+  )
+})
+
+test('fork installs fall back to official HTTPS when upstream is non-official', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:someone-else/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: true,
+      fetchRemote: OFFICIAL_REPO_HTTPS_URL,
+      trackingRemote: 'hermes-official'
+    }
+  )
+})
+
+test('official SSH upstream is fetched anonymously into its tracking ref', () => {
+  assert.deepEqual(
+    resolvePassiveUpdateSource({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:NousResearch/hermes-agent.git'
+    }),
+    {
+      compareUrl: OFFICIAL_REPO_HTTPS_URL,
+      explicitRefspec: true,
+      fetchRemote: OFFICIAL_REPO_HTTPS_URL,
+      trackingRemote: 'upstream'
+    }
+  )
+})
+
+test('branch self-heal probes the same remote the passive check fetches from', () => {
+  // Fork install: the passive source is upstream, so the heal probe must ask
+  // upstream too. Probing origin kept a stale fork-only branch (e.g. a
+  // leftover sync/upstream-main) alive forever and stranded every later
+  // passive fetch in fetch-failed against upstream (observed live 2026-08-23).
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    'upstream'
+  )
+
+  // Vanilla HTTPS install: unchanged behavior — probe origin.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'https://github.com/NousResearch/hermes-agent.git',
+      upstreamUrl: ''
+    }),
+    'origin'
+  )
+
+  // Official SSH origin: unchanged behavior — probe the anonymous HTTPS URL
+  // so a passive heal can never trigger a FIDO2 hardware-touch prompt.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:NousResearch/hermes-agent.git',
+      upstreamUrl: ''
+    }),
+    OFFICIAL_REPO_HTTPS_URL
+  )
+
+  // No official remote anywhere: probe the official HTTPS URL directly.
+  assert.equal(
+    resolveHealProbeRemote({
+      originUrl: 'git@github.com:SamirLegacy/hermes-agent.git',
+      upstreamUrl: 'git@github.com:someone-else/hermes-agent.git'
+    }),
+    OFFICIAL_REPO_HTTPS_URL
+  )
+})
+
+test('explicit refspec fetches write the tracking ref the checker reads', () => {
+  assert.deepEqual(
+    buildPassiveFetchArgs(
+      { fetchRemote: OFFICIAL_REPO_HTTPS_URL, trackingRemote: 'hermes-official', explicitRefspec: true },
+      'main'
+    ),
+    ['fetch', '--quiet', OFFICIAL_REPO_HTTPS_URL, '+refs/heads/main:refs/remotes/hermes-official/main']
+  )
+})

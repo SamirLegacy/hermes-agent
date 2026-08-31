@@ -18,6 +18,7 @@ from functools import lru_cache
 from typing import Any, Optional
 
 _TITLE_COLOR = "#E8C463"
+_CHARTED_SIGNAL_MIN_CONTRAST = 4.5
 
 
 def _build_payload() -> dict[str, Any]:
@@ -58,6 +59,57 @@ def _fade(base: Optional[str], alpha: float) -> Optional[str]:
 def _resolve(style: str, alpha: float) -> Optional[str]:
     """Fade the style's base ink toward the background by ``alpha`` (rgba-over-bg)."""
     return _fade(_palette().get(style), alpha)
+
+
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
+    def channel(value: int) -> float:
+        normalized = value / 255
+        return (
+            normalized / 12.92
+            if normalized <= 0.03928
+            else ((normalized + 0.055) / 1.055) ** 2.4
+        )
+
+    red, green, blue = (channel(value) for value in rgb)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _contrast_ratio(
+    foreground: tuple[int, int, int], background: tuple[int, int, int]
+) -> float:
+    foreground_luminance = _relative_luminance(foreground)
+    background_luminance = _relative_luminance(background)
+    high, low = sorted((foreground_luminance, background_luminance), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def _ensure_contrast(
+    color: Optional[str], background: str, minimum: float
+) -> Optional[str]:
+    """Lift a foreground toward the readable pole until it clears ``minimum``."""
+    if not color:
+        return None
+
+    from agent.learning_graph_render import hex_to_rgb, mix_rgb, rgb_to_hex
+
+    foreground_rgb = hex_to_rgb(color)
+    background_rgb = hex_to_rgb(background)
+    if _contrast_ratio(foreground_rgb, background_rgb) >= minimum:
+        return color
+
+    pole = (0, 0, 0) if _relative_luminance(background_rgb) > 0.5 else (255, 255, 255)
+    for step in range(1, 21):
+        candidate = mix_rgb(foreground_rgb, pole, step * 0.05)
+        if _contrast_ratio(candidate, background_rgb) >= minimum:
+            return rgb_to_hex(candidate)
+    return rgb_to_hex(pole)
+
+
+def _resolve_charted_signal(style: str, alpha: float) -> Optional[str]:
+    """Keep age tinting without allowing explanatory labels to disappear."""
+    return _ensure_contrast(
+        _resolve(style, alpha), _palette()["bg"], _CHARTED_SIGNAL_MIN_CONTRAST
+    )
 
 
 def _row_to_text(row: list, color: bool):
@@ -155,8 +207,13 @@ def _frame_renderable(payload, *, cols, rows, reveal, color):
         def label_row(item) -> Text:
             row = Text("  ")
             row.append(f"{item['key']} ", style="grey70" if color else None)
-            row.append(f"{item['glyph']} ", style=_resolve(item["style"], float(item.get("alpha", 1.0))) if color else None)
-            row.append(str(item["label"]), style=_resolve(item["style"], float(item.get("alpha", 1.0))) if color else None)
+            signal_style = (
+                _resolve_charted_signal(item["style"], float(item.get("alpha", 1.0)))
+                if color
+                else None
+            )
+            row.append(f"{item['glyph']} ", style=signal_style)
+            row.append(str(item["label"]), style=signal_style)
             meta = str(item["meta"])
             row.append(f"  {meta if len(meta) <= 32 else meta[:29] + '…'}", style="grey54" if color else None)
             return row
@@ -171,6 +228,17 @@ def _frame_renderable(payload, *, cols, rows, reveal, color):
     return Group(*parts)
 
 
+def _console(*, color: bool, width: Optional[int] = None, force: bool = False):
+    """A Rich console. ``force`` emits truecolor ANSI even into a captured
+    stream — the interactive CLI grabs that output and re-renders it through
+    prompt_toolkit (raw escapes to a real terminal would otherwise be
+    swallowed). Mirrors the ``ChatConsole`` idiom in ``cli.py``."""
+    from rich.console import Console
+
+    extra = {"force_terminal": True, "color_system": "truecolor"} if force else {}
+    return Console(no_color=not color, width=width, **extra)
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     from rich.console import Console
 
@@ -183,7 +251,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     payload = _build_payload()
     color = not bool(getattr(args, "no_color", False))
     cols, rows = _term_size(getattr(args, "width", None), getattr(args, "height", None))
-    console = Console(no_color=not color, width=cols)
+    console = _console(color=color, width=cols, force=bool(getattr(args, "force_color", False)))
 
     if not payload.get("nodes"):
         console.print(
@@ -222,6 +290,84 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
+# ── list / delete / edit ─────────────────────────────────────────────────────
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    from agent.learning_graph_render import format_date
+
+    console = _console(color=not bool(getattr(args, "no_color", False)), force=bool(getattr(args, "force_color", False)))
+    nodes = sorted(_build_payload().get("nodes", []), key=lambda n: n.get("timestamp") or 0)
+    if not nodes:
+        console.print("[grey62]No learning yet.[/grey62]")
+        return 0
+    for node in nodes:
+        glyph = "◆" if node.get("kind") == "memory" else "●"
+        date = format_date(node.get("timestamp"))
+        console.print(f"[grey54]{node['id']}[/grey54]  {glyph} {node.get('label', '')}  [grey54]{date}[/grey54]")
+    return 0
+
+
+def _cmd_delete(args: argparse.Namespace) -> int:
+    from agent.learning_mutations import delete_node, node_detail
+
+    detail = node_detail(args.node)
+    if not detail.get("ok"):
+        print(f"  {detail.get('message', 'not found')}")
+        return 1
+    if not getattr(args, "yes", False):
+        try:
+            if input(f"  Delete {detail['label']!r}? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("  aborted")
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print("\n  aborted")
+            return 1
+    res = delete_node(args.node)
+    print(f"  {res['message']}")
+    return 0 if res.get("ok") else 1
+
+
+def _cmd_edit(args: argparse.Namespace) -> int:
+    from agent.learning_mutations import edit_node, node_detail
+
+    detail = node_detail(args.node)
+    if not detail.get("ok"):
+        print(f"  {detail.get('message', 'not found')}")
+        return 1
+    suffix = ".md" if detail["kind"] == "skill" else ".txt"
+    edited = _open_in_editor(detail["content"], suffix=suffix)
+    if edited is None or edited.strip() == detail["content"].strip():
+        print("  no changes")
+        return 0
+    res = edit_node(args.node, edited)
+    print(f"  {res['message']}")
+    return 0 if res.get("ok") else 1
+
+
+def _open_in_editor(initial: str, *, suffix: str) -> Optional[str]:
+    import os
+    import subprocess
+    import tempfile
+
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as fh:
+        fh.write(initial)
+        path = fh.name
+    try:
+        subprocess.call([*editor.split(), path])
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        print(f"  editor failed: {exc}")
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def register_cli(parent: argparse.ArgumentParser) -> None:
     parent.add_argument(
         "--reveal",
@@ -235,8 +381,26 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     parent.add_argument("--width", type=int, default=None, help="Override render width in columns.")
     parent.add_argument("--height", type=int, default=None, help="Override render height in rows.")
     parent.add_argument("--no-color", action="store_true", help="Disable color output.")
+    # Force ANSI even when stdout is captured — the interactive CLI re-renders it.
+    parent.add_argument("--force-color", action="store_true", help=argparse.SUPPRESS)
     parent.add_argument("--json", action="store_true", help="Print the raw graph payload as JSON and exit.")
     parent.set_defaults(func=_cmd_show)
+
+    sub = parent.add_subparsers(dest="journey_action")
+
+    p_list = sub.add_parser("list", help="List node ids (for delete/edit).")
+    p_list.add_argument("--no-color", action="store_true")
+    p_list.add_argument("--force-color", action="store_true", help=argparse.SUPPRESS)
+    p_list.set_defaults(func=_cmd_list)
+
+    p_del = sub.add_parser("delete", help="Delete a learned skill (archived) or memory by node id.")
+    p_del.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt.")
+    p_del.set_defaults(func=_cmd_delete)
+
+    p_edit = sub.add_parser("edit", help="Edit a learned skill or memory by node id in $EDITOR.")
+    p_edit.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_edit.set_defaults(func=_cmd_edit)
 
 
 def cmd_journey(args: argparse.Namespace) -> int:
