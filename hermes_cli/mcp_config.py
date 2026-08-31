@@ -10,6 +10,7 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -770,7 +771,16 @@ def cmd_mcp_test(args):
     auth_type = cfg.get("auth", "")
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
-        _info("Auth: OAuth 2.1 PKCE")
+        oauth_config = cfg.get("oauth", {})
+        grant_type = (
+            oauth_config.get("grant_type", "authorization_code")
+            if isinstance(oauth_config, dict)
+            else "authorization_code"
+        )
+        if grant_type == "client_credentials":
+            _info("Auth: OAuth 2.1 client_credentials")
+        else:
+            _info("Auth: OAuth 2.1 PKCE")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
@@ -852,12 +862,16 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _login_connect_timeout = server_config.get("connect_timeout")
         try:
             _login_connect_timeout = float(_login_connect_timeout)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            _login_connect_timeout = 0.0
+        if not math.isfinite(_login_connect_timeout):
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
+        probe_config = dict(server_config)
+        probe_config["connect_timeout"] = _login_connect_timeout
         with force_interactive_oauth():
             tools = _probe_single_server(
-                name, server_config, connect_timeout=_login_connect_timeout
+                name, probe_config, connect_timeout=_login_connect_timeout
             )
         # A clean probe is NOT proof of authentication. Some MCP servers
         # (notably Google's official Drive server) serve initialize +
