@@ -112,12 +112,7 @@ function resolveHealProbeRemote({ originUrl, upstreamUrl }) {
 // the checker would rev-parse a stale tracking ref afterwards.
 function buildPassiveFetchArgs({ fetchRemote, trackingRemote, explicitRefspec }, branch) {
   if (explicitRefspec) {
-    return [
-      'fetch',
-      '--quiet',
-      fetchRemote,
-      `+refs/heads/${branch}:refs/remotes/${trackingRemote}/${branch}`
-    ]
+    return ['fetch', '--quiet', fetchRemote, `+refs/heads/${branch}:refs/remotes/${trackingRemote}/${branch}`]
   }
 
   return ['fetch', '--quiet', fetchRemote, branch]

@@ -174,11 +174,6 @@ test('explicit refspec fetches write the tracking ref the checker reads', () => 
       { fetchRemote: OFFICIAL_REPO_HTTPS_URL, trackingRemote: 'hermes-official', explicitRefspec: true },
       'main'
     ),
-    [
-      'fetch',
-      '--quiet',
-      OFFICIAL_REPO_HTTPS_URL,
-      '+refs/heads/main:refs/remotes/hermes-official/main'
-    ]
+    ['fetch', '--quiet', OFFICIAL_REPO_HTTPS_URL, '+refs/heads/main:refs/remotes/hermes-official/main']
   )
 })

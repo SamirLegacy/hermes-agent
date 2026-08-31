@@ -3073,8 +3073,7 @@ async function checkUpdates() {
   // clone): still list what origin offers — resolveCommitLogSelection keeps
   // the shallow log to the fetched tip so the range walk can't enumerate the
   // contaminated ancestry — so "See what's new" stays useful and honest.
-  const commits =
-    behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow, updateSource.trackingRemote) : []
+  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow, updateSource.trackingRemote) : []
 
   return {
     supported: true,

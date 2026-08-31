@@ -229,7 +229,7 @@ test('full-clone commit logs keep the complete behind range', () => {
   })
 })
 
-test('commit logs can target a fork install\'s official upstream remote', () => {
+test("commit logs can target a fork install's official upstream remote", () => {
   assert.deepEqual(resolveCommitLogSelection({ branch: 'main', isShallow: false, remote: 'upstream' }), {
     limit: 40,
     revision: 'HEAD..upstream/main'
