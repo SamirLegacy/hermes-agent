@@ -92,13 +92,19 @@ VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 # markdown docs are executable-by-proxy (the agent runs what the doc says), so
 # third-party content keeps its gate (judge finding + FP inventory, 2026-08-02:
 # 62/107 profile skills flagged, 43 dangerous, almost all doc-mention noise).
+# Doc-mention classes that are noise in .md documentation (2026-08-02
+# inventory: 62/107 profile skills flagged, almost all doc-mention noise).
+# These are DOWNGRADED to "high" in markdown so community installs block at
+# caution while agent-authored docs flow.
+#
+# Persistence patterns are deliberately NOT in this table: a modification
+# instruction aimed at an agent-config file is a persistence vector, not
+# doc noise — it keeps its scored critical severity in every file type.
 _DOC_CONTEXT_DOWNGRADE = {
     "echo_pipe_exec": "high",      # documented `echo ... | bash script` idiom
     "curl_pipe_shell": "high",     # documented `curl ... | sh` install idiom
     "curl_pipe_python": "high",    # documented `curl ... | python` install idiom
     "env_exfil_curl": "high",      # doc curl example with $TOKEN to first-party API
-    "agent_config_mod": "high",    # mention of AGENTS.md/CLAUDE.md/.cursorrules
-    "hermes_config_mod": "high",   # mention of .hermes/config.yaml / SOUL.md
 }
 
 
