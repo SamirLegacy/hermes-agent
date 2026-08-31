@@ -302,6 +302,45 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    @pytest.mark.parametrize(
+        ("oauth_config", "expected_auth"),
+        [
+            ({}, "Auth: OAuth 2.1 PKCE"),
+            ({"grant_type": "authorization_code"}, "Auth: OAuth 2.1 PKCE"),
+            (
+                {"grant_type": "client_credentials"},
+                "Auth: OAuth 2.1 client_credentials",
+            ),
+        ],
+    )
+    def test_test_reports_configured_oauth_grant(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+        oauth_config,
+        expected_auth,
+    ):
+        _seed_config(tmp_path, {
+            "gbrain": {
+                "url": "http://127.0.0.1:7331/mcp",
+                "auth": "oauth",
+                "oauth": oauth_config,
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="gbrain"))
+
+        out = capsys.readouterr().out
+        assert expected_auth in out
+        if oauth_config.get("grant_type") == "client_credentials":
+            assert "Auth: OAuth 2.1 PKCE" not in out
+
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
         import asyncio
@@ -783,6 +822,55 @@ class TestMcpLogin:
         # The login path must grant a human enough time to finish the browser
         # OAuth round-trip — far longer than the 30s probe default.
         assert seen["connect_timeout"] >= 180
+
+    @pytest.mark.parametrize(
+        ("configured_timeout", "expected_timeout"),
+        [
+            (12, 315.0),
+            (400, 400.0),
+            ("not-a-number", 315.0),
+            ("nan", 315.0),
+            ("inf", 315.0),
+            (0, 315.0),
+            (-1, 315.0),
+            (10**400, 315.0),
+        ],
+    )
+    def test_login_applies_configured_probe_timeout(
+        self,
+        tmp_path,
+        monkeypatch,
+        configured_timeout,
+        expected_timeout,
+    ):
+        """OAuth login floors the probe timeout at 315s, honors larger configured values, and never breaks on invalid input."""
+        _seed_config(tmp_path, {
+            "realserver": {
+                "url": "https://mcp.example.com/mcp",
+                "auth": "oauth",
+                "connect_timeout": configured_timeout,
+            },
+        })
+        observed = {}
+
+        def mock_probe(name, cfg, **kwargs):
+            observed["config_timeout"] = cfg["connect_timeout"]
+            observed.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._oauth_tokens_present", lambda name: True
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="realserver"))
+
+        assert observed["connect_timeout"] == expected_timeout
+        assert observed["config_timeout"] == expected_timeout
 
 
 # ---------------------------------------------------------------------------
