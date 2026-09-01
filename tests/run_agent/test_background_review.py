@@ -267,11 +267,15 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
-def test_background_review_candidate_extractor_receives_captured_messages_after_close(monkeypatch):
-    """Candidate extraction must see review messages even after close cleanup.
+def test_background_review_candidate_extractor_receives_captured_messages_after_teardown(monkeypatch):
+    """Candidate extraction must see review messages after fork teardown.
 
-    close() may clear _session_messages, so the review messages must be
-    snapshotted before teardown and then passed to the candidate extractor.
+    The review fork shares the foreground session ID for prompt-cache parity,
+    so teardown must release only the fork's own clients (release_clients)
+    and must NOT call close()/shutdown_memory_provider() — those are
+    session-bound lifecycle operations that would tear down the live session.
+    The review messages are snapshotted before the fork is dropped and then
+    passed to the candidate extractor.
     """
     import agent.background_review as bg_review
 
@@ -295,6 +299,10 @@ def test_background_review_candidate_extractor_receives_captured_messages_after_
 
         def close(self):
             events.append("close")
+            self._session_messages = []
+
+        def release_clients(self):
+            events.append("release_clients")
             self._session_messages = []
 
     def fake_extract(review_messages, *, agent, messages_snapshot):
@@ -322,8 +330,7 @@ def test_background_review_candidate_extractor_receives_captured_messages_after_
 
     assert events == [
         "run_conversation",
-        "shutdown_memory_provider",
-        "close",
+        "release_clients",
         "extract",
     ]
     assert captured["review_messages"] == [review_assistant_message]

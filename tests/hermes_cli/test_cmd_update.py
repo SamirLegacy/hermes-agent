@@ -388,7 +388,14 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed"), patch.object(
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+            # Fork-safe status contract (dict), same as the sibling fork
+            # tests: 'current' lets the flow proceed to the current-checkout
+            # repair path this test exercises.
+            return_value={"status": "current", "pre_sha": "a", "post_sha": "a"},
+        ), patch.object(
             update_cmd,
             "_venv_core_imports_healthy",
             side_effect=[
@@ -442,7 +449,13 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed"), patch.object(
+        ), patch.object(
+            hm,
+            "_sync_with_upstream_if_needed",
+            # Fork-safe status contract (dict): 'current' reaches the
+            # node-repair path under test.
+            return_value={"status": "current", "pre_sha": "a", "post_sha": "a"},
+        ), patch.object(
             update_cmd,
             "_repair_node_deps_on_current_checkout",
             return_value=False,
