@@ -40,7 +40,11 @@ def fork_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     _git(upstream_src, "init", "-b", "main")
     _commit(upstream_src, "upstream root", "upstream base\n")
     upstream = tmp_path / "upstream.git"
-    _git(upstream_src, "init", "--bare", str(upstream))
+    # Pin the default branch in the bare repo: on hosts without a global
+    # init.defaultBranch (CI runners) a bare init points HEAD at
+    # refs/heads/master, and every clone of it checks out nothing
+    # ("remote HEAD refers to nonexistent ref").
+    _git(upstream_src, "init", "--bare", "-b", "main", str(upstream))
     _git(upstream_src, "push", str(upstream), "main")
 
     fork = tmp_path / "fork.git"
@@ -57,6 +61,11 @@ def fork_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
         capture_output=True,
     )
     _git(local, "remote", "add", "upstream", str(upstream))
+    # Repo-local identity so merge commits work on hosts without a global
+    # git identity (CI runners). Scoped to the fixture repo; never touches
+    # global config.
+    _git(local, "config", "user.email", "test@example.com")
+    _git(local, "config", "user.name", "Test")
     return local, upstream, fork
 
 
