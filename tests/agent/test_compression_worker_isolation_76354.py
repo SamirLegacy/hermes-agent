@@ -157,9 +157,18 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     db.create_session(session_id, source="cli")
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
+    # SamirLegacy fork patch: upstream's (0.05, 0.1) assumes the summary
+    # dispatch lands within 100 ms of fence-arm. On the fork's 4-vCPU
+    # ubuntu-latest runners under 4-way pytest parallelism the dispatch
+    # thread is routinely starved past the ceiling, so the fence cancels
+    # BEFORE dispatch ("Compression cancelled before summary dispatch") and
+    # provider_started never fires (failed 3 of 4 CI attempts 2026-09-02).
+    # (0.5, 1.0) preserves the contract under test — the fence still fires
+    # while the provider is blocked (10s ceiling) and the owner must still
+    # unwind without holding the pool slot.
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda cfg=None: (0.05, 0.1),
+        lambda cfg=None: (0.5, 1.0),
     )
 
     provider_started = threading.Event()
