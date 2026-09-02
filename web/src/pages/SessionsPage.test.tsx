@@ -119,6 +119,9 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
+  // SamirLegacy fork patch: 30s timeout — this full expand→export→rename→
+  // delete DOM walk exceeds vitest's 5s default on the fork's standard
+  // ubuntu-latest runners (upstream runs JS on 32-core XL runners).
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
@@ -150,5 +153,5 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+  }, 30000);
 });
