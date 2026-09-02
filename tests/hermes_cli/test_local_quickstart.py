@@ -20,6 +20,22 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    # --- SamirLegacy fork patch ------------------------------------------------
+    # The fork's CI runs the suite on standard ubuntu-latest runners while
+    # upstream uses 96-core XL runners. The real probe_budget() then finds no
+    # GPU and ~16 GB RAM, no catalog variant fits, and the quickstart POST
+    # 409s at fit/engine preflight — deterministically. Stub the probe and
+    # the engine gate so these tests exercise route logic, not host hardware.
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    _fat_budget = HardwareBudget(usable_vram_bytes=1 << 40,
+                                 total_device_bytes=1 << 40,
+                                 ram_available_bytes=1 << 40, uma=True)
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **_: _fat_budget)
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.local_models._engine_too_old", lambda _: False)
+    # --- end fork patch --------------------------------------------------------
     from hermes_cli import web_server
 
     test_client = TestClient(web_server.app)
