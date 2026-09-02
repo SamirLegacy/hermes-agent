@@ -81,4 +81,9 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # FORK: standard ubuntu-latest is 4 vCPU / 16 GB. The default
+        # availableParallelism() concurrency runs 4 check workers at once,
+        # each with its own vitest/tsc/eslint pool — memory pressure kills
+        # vitest silently (apps/desktop :: check:test:ui exited 1 with no
+        # test summary in 2 of 3 runs on 2026-09-02). Cap at 2.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
