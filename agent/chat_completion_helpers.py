@@ -2685,10 +2685,15 @@ def _record_fallback_in_session(
        compaction handoff rows — filtered out of the model context on
        resume) recording old→new model, the failover reason, and a
        timestamp.
-    2. The session row's model_config route (``gateway_runtime`` +
-       ``fallback_from``/``fallback_reason``) so a later ``--resume``
-       restores the model that actually answered last instead of
-       re-resolving the ambient config default.
+    2. A timestamped OVERLAY on the session row's model_config
+       (``fallback = {from, to, provider, reason, at}``) — never the
+       fallback route itself. The ``model`` column and ``gateway_runtime``
+       keep the Owner's chosen primary, so a later ``--resume`` restores
+       the primary and prints one line naming the fallback detour; if the
+       primary fails again, the normal fallback chain fires and is
+       announced. A deliberate /model switch
+       (``_persist_model_switch_to_session``) or a successful primary
+       restore (``restore_primary_runtime``) deletes the overlay.
     """
     try:
         session_db = getattr(agent, "_session_db", None)
@@ -2717,31 +2722,40 @@ def _record_fallback_in_session(
             )
         except Exception:
             logger.debug("Fallback transcript marker write failed", exc_info=True)
-        # Same write discipline as the CLI /model persist: explicit None
-        # deletes stale keys in BOTH the nested gateway_runtime dict and the
-        # top-level keys.
-        route = {
-            "provider": new_provider or None,
-            "base_url": getattr(agent, "base_url", None) or None,
-            "api_mode": getattr(agent, "api_mode", None) or None,
-        }
         try:
-            session_db.update_session_model(
-                session_id, new_model, provider=new_provider or None
-            )
             session_db.patch_session_model_config(
                 session_id,
                 {
-                    "gateway_runtime": route,
-                    **route,
-                    "fallback_from": str(old_model or ""),
-                    "fallback_reason": reason_value,
+                    "fallback": {
+                        "from": str(old_model or ""),
+                        "to": str(new_model or ""),
+                        "provider": str(new_provider or ""),
+                        "reason": reason_value,
+                        "at": timestamp,
+                    },
                 },
             )
         except Exception:
-            logger.debug("Fallback route persistence failed", exc_info=True)
+            logger.debug("Fallback overlay persistence failed", exc_info=True)
     except Exception:
         logger.debug("Fallback session persistence skipped", exc_info=True)
+
+
+def _clear_fallback_overlay(agent) -> None:
+    """Delete the session row's fallback overlay (best-effort, never raises).
+
+    The overlay says "the last turn was answered by a fallback"; once the
+    primary answered again (or the operator deliberately switched models)
+    that statement is stale, and a later resume must not print it.
+    """
+    try:
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None) or ""
+        if session_db is None or not session_id:
+            return
+        session_db.patch_session_model_config(session_id, {"fallback": None})
+    except Exception:
+        logger.debug("Fallback overlay clear failed", exc_info=True)
 
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
@@ -3210,8 +3224,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
-        # Durable record: transcript marker row + persisted fallback route so
-        # a later resume restores the model that actually answered.
+        # Durable record: transcript marker row + timestamped fallback
+        # overlay. The session row keeps the stored PRIMARY route — a later
+        # resume restores the Owner's chosen model and announces the detour,
+        # never the fallback (D4).
         _record_fallback_in_session(
             agent, old_model, old_provider, fb_model, fb_provider, reason
         )

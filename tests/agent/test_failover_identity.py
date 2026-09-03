@@ -363,6 +363,11 @@ class TestPeelReferenceGuidanceRoundTrip:
 # transcript — a later resume re-resolved the ambient default instead of the
 # model that actually answered; the classifier's reason was DEBUG-only; and
 # the user-facing notice died with the suppressed -q status channel.
+# The first fix persisted the FALLBACK route into the session row — which
+# pinned every later resume to the fallback even after the primary recovered.
+# Now the row keeps the stored primary and carries a timestamped
+# model_config.fallback overlay ({from, to, provider, reason, at}) instead;
+# resume restores the primary and prints the detour as one line.
 
 
 class _MockFallbackClient:
@@ -396,11 +401,20 @@ def _fallback_agent_with_db(db, session_id):
     agent.model = "claude-fable-5"
     agent.provider = "vibeproxy-claude"
     agent.base_url = "http://127.0.0.1:8317/v1"
+    # _primary_runtime is the restore target — it must carry the same
+    # primary identity (AIAgent captured it at construction, before this
+    # harness reassigned the live attributes).
+    agent._primary_runtime.update({
+        "model": "claude-fable-5",
+        "provider": "vibeproxy-claude",
+        "requested_provider": "vibeproxy-claude",
+        "base_url": "http://127.0.0.1:8317/v1",
+    })
     return agent
 
 
 class TestFallbackPersistsRoute:
-    def test_marker_row_and_session_route_recorded(self, tmp_path):
+    def test_marker_row_and_fallback_overlay_recorded(self, tmp_path):
         import json
         from unittest.mock import patch
 
@@ -442,18 +456,58 @@ class TestFallbackPersistsRoute:
             assert dm.get("reason") == "server_error"
             assert dm.get("timestamp")
 
-            # (b) The session row carries the fallback route so a later
-            # resume (with the D1 restore) runs the model that actually
-            # answered — plus provenance of the switch.
+            # (b) The session row keeps the Owner's chosen PRIMARY — the
+            # fallback is a timestamped overlay, never the stored route, so a
+            # later resume restores the primary (D4). If the primary fails
+            # again, the normal fallback chain fires and is announced.
             meta = db.get_session("FB1")
-            assert meta["model"] == "kimi-k3"
+            assert meta["model"] == "claude-fable-5"
             config = json.loads(meta["model_config"])
-            assert config["gateway_runtime"]["provider"] == "kimi-coding"
-            assert config["gateway_runtime"]["base_url"] == (
-                "https://api.moonshot.cn/v1"
+            assert "gateway_runtime" not in config
+            assert "fallback_from" not in config
+            assert "fallback_reason" not in config
+            overlay = config["fallback"]
+            assert overlay["from"] == "claude-fable-5"
+            assert overlay["to"] == "kimi-k3"
+            assert overlay["provider"] == "kimi-coding"
+            assert overlay["reason"] == "server_error"
+            assert overlay["at"] > 0
+        finally:
+            db.close()
+
+    def test_primary_restore_clears_fallback_overlay(self, tmp_path):
+        """A successful restore_primary_runtime means the primary answers the
+        next turn — the 'last turn answered by fallback' overlay is stale and
+        must be deleted so a later resume doesn't announce it."""
+        import json
+        from unittest.mock import patch
+
+        from agent.agent_runtime_helpers import restore_primary_runtime
+        from agent.error_classifier import FailoverReason
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(
+                session_id="FB3", source="cli", model="claude-fable-5"
             )
-            assert config["fallback_from"] == "claude-fable-5"
-            assert config["fallback_reason"] == "server_error"
+            agent = _fallback_agent_with_db(db, "FB3")
+            with patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_MockFallbackClient(), "kimi-k3"),
+            ):
+                assert agent._try_activate_fallback(
+                    FailoverReason.server_error
+                ) is True
+            config = json.loads(db.get_session("FB3")["model_config"])
+            assert config["fallback"]["to"] == "kimi-k3"
+
+            with patch("run_agent.OpenAI"):
+                assert restore_primary_runtime(agent) is True
+
+            assert agent.model == "claude-fable-5"
+            config = json.loads(db.get_session("FB3")["model_config"] or "{}")
+            assert "fallback" not in config
         finally:
             db.close()
 

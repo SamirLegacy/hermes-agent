@@ -1934,6 +1934,12 @@ def restore_primary_runtime(agent) -> bool:
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
+        # The session row's fallback overlay described the transient detour;
+        # with the primary answering again it is stale — clear it so a later
+        # resume doesn't announce a fallback that no longer applies (D4).
+        from agent.chat_completion_helpers import _clear_fallback_overlay
+        _clear_fallback_overlay(agent)
+
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,

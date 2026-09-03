@@ -595,3 +595,83 @@ def test_single_query_resume_quiet_stderr_names_ignored_config_default(
         "Resumed session RQ1 on stored model kimi-k3 (kimi-coding) — "
         "config default ambient-model ignored"
     ) in err
+
+
+# ── D4 overlay: resume restores the stored PRIMARY, never the fallback ────
+#
+# Incident 2026-09-02 follow-up: the first D4 fix persisted the FALLBACK
+# route into the session row, pinning every later resume to kimi-k3 even
+# after fable-5 recovered. The row now keeps the stored primary and carries
+# model_config.fallback = {from, to, provider, reason, at} as a timestamped
+# overlay; resume prints one line naming the detour.
+
+
+def _fallback_overlay_row():
+    return _row(
+        model="claude-fable-5",
+        model_config={
+            "gateway_runtime": {
+                "provider": "vibeproxy-claude",
+                "base_url": "http://127.0.0.1:8317/v1",
+            },
+            "fallback": {
+                "from": "claude-fable-5",
+                "to": "kimi-k3",
+                "provider": "kimi-coding",
+                "reason": "server_error",
+                "at": 1788438000.0,
+            },
+        },
+    )
+
+
+def test_restore_session_model_keeps_primary_and_announces_fallback_overlay():
+    notes = []
+    stub = _make_stub(_console_print=lambda s: notes.append(s))
+    stub._restore_session_model(_fallback_overlay_row())
+    # The stored PRIMARY is restored — never the fallback that answered last.
+    assert stub.model == "claude-fable-5"
+    assert stub.provider == "vibeproxy-claude"
+    line = next(
+        (n for n in notes if "last turn of this session" in n), None
+    )
+    assert line is not None, notes
+    assert "fallback kimi-k3 (server_error," in line
+    assert "resuming on primary claude-fable-5" in line
+
+
+def test_restore_session_model_fallback_overlay_goes_to_stderr_when_quiet(capsys):
+    stub = _make_stub()
+    stub._restore_session_model(_fallback_overlay_row(), quiet=True)
+    err = capsys.readouterr().err
+    assert "last turn of this session was answered by fallback kimi-k3" in err
+    assert "resuming on primary claude-fable-5" in err
+
+
+def test_restore_session_model_without_overlay_prints_nothing():
+    notes = []
+    stub = _make_stub(_console_print=lambda s: notes.append(s))
+    stub._restore_session_model(_row())
+    assert not [n for n in notes if "last turn of this session" in n]
+
+
+def test_persist_model_switch_clears_fallback_overlay(tmp_path, monkeypatch):
+    """A deliberate /model switch supersedes the fallback detour: the overlay
+    is deleted (explicit None), so the next resume prints no stale line."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="ov1", source="cli", model="claude-fable-5")
+    db.patch_session_model_config("ov1", {
+        "fallback": {
+            "from": "claude-fable-5",
+            "to": "kimi-k3",
+            "provider": "kimi-coding",
+            "reason": "server_error",
+            "at": 1788438000.0,
+        },
+    })
+    stub = _make_stub(_session_db=db, session_id="ov1")
+    stub._persist_model_switch_to_session(_Result())
+    config = json.loads(db.get_session("ov1")["model_config"])
+    assert "fallback" not in config
+    assert config["model"] == "deepseek-v4-flash-free"

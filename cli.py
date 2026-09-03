@@ -9432,6 +9432,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             db.patch_session_model_config(sid, {
                 "gateway_runtime": route,
                 **route,
+                # A deliberate /model switch supersedes a mid-turn fallback
+                # overlay: the next turn is answered by the operator's choice,
+                # so the "last turn was answered by fallback" note is stale
+                # (None deletes the key — D4).
+                "fallback": None,
             })
         except Exception:
             logger.debug(
@@ -9461,6 +9466,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Skips when the session has no model recorded or when the CLI was
         launched with an explicit ``-m`` override (user intent wins).
+
+        D4 overlay: when the session's last turn was answered by a provider
+        fallback, ``model_config.fallback = {from, to, provider, reason,
+        at}`` records the detour while the ``model`` column keeps the stored
+        primary. Resume restores the PRIMARY (never the fallback) and prints
+        one line naming the detour; if the primary fails again the normal
+        fallback chain fires and is announced.
         """
         stored_model = (session_meta or {}).get("model")
         # Fresh attempt — a stale route error from an earlier resume must
@@ -9471,6 +9483,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # An explicit -m / --model on the command line overrides resume.
         if getattr(self, "_explicit_model_override", False):
             return
+        self._announce_fallback_overlay(session_meta, stored_model, quiet=quiet)
         # Stored provider/endpoint via the canonical row-level reader
         # (prefers model_config.gateway_runtime, falls back to the TUI
         # gateway's top-level keys).
@@ -9578,6 +9591,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(msg, file=sys.stderr)
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
+
+    def _announce_fallback_overlay(
+        self, session_meta: dict, stored_model: str, *, quiet: bool = False
+    ) -> None:
+        """Print the one-line D4 note when the session's last turn fell back.
+
+        The overlay (``model_config.fallback = {from, to, provider, reason,
+        at}``) is written by ``_record_fallback_in_session`` and deleted by a
+        successful primary restore or a deliberate /model switch — so its
+        presence here means the session's stored primary is what we resume
+        on, and the fallback was the transient detour that answered last.
+        """
+        raw_config = (session_meta or {}).get("model_config")
+        try:
+            parsed = (
+                json.loads(raw_config)
+                if isinstance(raw_config, str)
+                else (raw_config or {})
+            )
+        except Exception:
+            return
+        overlay = parsed.get("fallback") if isinstance(parsed, dict) else None
+        if not isinstance(overlay, dict) or not overlay.get("to"):
+            return
+        at = overlay.get("at")
+        try:
+            at_text = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(float(at))
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            at_text = str(at or "?")
+        line = (
+            "last turn of this session was answered by fallback "
+            f"{overlay.get('to')} ({overlay.get('reason') or 'unknown'}, "
+            f"{at_text}); resuming on primary {overlay.get('from') or stored_model}"
+        )
+        if quiet:
+            print(line, file=sys.stderr)
+        else:
+            self._console_print(f"[dim]{_escape(line)}[/dim]")
 
 
 

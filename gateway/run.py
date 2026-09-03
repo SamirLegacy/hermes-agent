@@ -9122,6 +9122,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
 
+        # A mid-turn provider fallback is a transient detour, not the
+        # session's model: _record_fallback_in_session already recorded the
+        # event as a timestamped model_config.fallback overlay, and the row
+        # must keep the Owner's chosen primary so a later resume restores IT
+        # (never the fallback — D4). Skip the model/route rewrite while the
+        # fallback is active; the next primary turn syncs normally again.
+        if runtime.get("fallback_active"):
+            return
+
         try:
             db = self._session_db._db
             row = db.get_session(session_id)
