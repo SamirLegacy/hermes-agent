@@ -100,6 +100,13 @@ def _run_fork_sync(tmp_path: Path, main_checkout: Path, *args: str, extra_env: d
     # Test isolation: a leak from the operator's shell (e.g. a background
     # deploy run with the gate open) must never flip the swap gate mid-test.
     env.pop("FORK_SYNC_ALLOW_APP_SWAP", None)
+    # Pin git identity exactly like _git() does — CI runners have no ambient
+    # identity (and may inject an empty user.name), which makes git behavior
+    # diverge from any dev machine mid-merge.
+    env.setdefault("GIT_AUTHOR_NAME", "t")
+    env.setdefault("GIT_AUTHOR_EMAIL", "t@t.t")
+    env.setdefault("GIT_COMMITTER_NAME", "t")
+    env.setdefault("GIT_COMMITTER_EMAIL", "t@t.t")
     env["FORK_SYNC_MAIN_CHECKOUT"] = str(main_checkout)
     env["FORK_SYNC_WORKTREE"] = str(tmp_path / "wt")
     env["FORK_SYNC_HERMES_PROFILE"] = "desktop-local"

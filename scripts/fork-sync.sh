@@ -31,6 +31,17 @@ SUMMARY="ok"
 receipt() { printf 'FORK-SYNC %s rc=%s %s\n' "$1" "$2" "$3"; }
 trap 'rc=$?; [ -n "$SUB" ] || SUB="usage"; receipt "$SUB" "$rc" "$SUMMARY"' EXIT
 
+# Deterministic git identity for every mutation this script performs —
+# including the auto-commit inside a CLEAN `git merge --no-edit`, which needs
+# an identity before MERGE_HEAD even exists. `:=` (not `:-`) also overrides
+# empty values: CI runners inject user.name="" (fatal: empty ident name) and
+# have no ~/.gitconfig at all (Committer identity unknown). Fork automation
+# convention: contributors/emails/samir@local.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:=Samir}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:=samir@local}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:=Samir}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:=samir@local}"
+
 usage() {
   sed -n '2,13p' "$0"
 }
