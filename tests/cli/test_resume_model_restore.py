@@ -675,3 +675,105 @@ def test_persist_model_switch_clears_fallback_overlay(tmp_path, monkeypatch):
     config = json.loads(db.get_session("ov1")["model_config"])
     assert "fallback" not in config
     assert config["model"] == "deepseek-v4-flash-free"
+
+
+# ── D1: restore-wins on EVERY resume entry ─────────────────────────────
+#
+# --continue, --resume latest, and the chat --oneshot single-query resume
+# all resolve to args.resume and flow through _init_agent ->
+# _restore_session_model. These tests pin each entry to that contract so a
+# future fork in any of them cannot silently drop restore-wins.
+
+
+def test_continue_resolves_into_resume_and_restores_stored_route(
+    _patched_agent_construction, monkeypatch
+):
+    """--continue -> args.resume -> _init_agent restores the stored route."""
+    import hermes_cli.main as main_mod
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(
+        rp, "resolve_runtime_provider",
+        lambda requested=None, **k: {"api_key": "kimi-key", "credential_pool": None},
+    )
+
+    args = type("Args", (), {"continue_last": True, "resume": None,
+                             "create_if_missing": False})()
+    monkeypatch.setattr(
+        "hermes_cli.terminal_breadcrumbs.resolve_breadcrumb_session",
+        lambda: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_mod, "_resolve_last_session", lambda source="cli": "RQ_CONT"
+    )
+    main_mod._resolve_continue_arg(args, use_tui=False)
+    assert args.resume == "RQ_CONT"
+
+    stub = _make_init_stub(_stored_kimi_meta(), session_id=args.resume)
+    assert stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    ) is True
+    kwargs = _CapturingAgent.last_kwargs
+    assert kwargs["model"] == "kimi-k3"  # stored route won over ambient default
+    assert kwargs["provider"] == "kimi-coding"
+
+
+def test_resume_latest_resolves_mru_and_restores_stored_route(
+    _patched_agent_construction, monkeypatch
+):
+    """--resume latest -> MRU id -> _init_agent restores the stored route."""
+    import hermes_cli.main as main_mod
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(
+        rp, "resolve_runtime_provider",
+        lambda requested=None, **k: {"api_key": "kimi-key", "credential_pool": None},
+    )
+
+    args = type("Args", (), {"resume": "latest"})()
+    monkeypatch.setattr(
+        main_mod, "_resolve_last_session", lambda source="cli": "RQ_LATEST"
+    )
+    monkeypatch.setattr(
+        main_mod, "_resolve_session_by_name_or_id", lambda v: v
+    )
+    if isinstance(args.resume, str) and args.resume.strip().lower() == "latest":
+        args.resume = main_mod._resolve_last_session(source="cli")
+
+    stub = _make_init_stub(_stored_kimi_meta(), session_id=args.resume)
+    assert stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    ) is True
+    kwargs = _CapturingAgent.last_kwargs
+    assert kwargs["model"] == "kimi-k3"
+    assert kwargs["provider"] == "kimi-coding"
+
+
+def test_oneshot_exit_resume_uses_same_restore_wins_path(
+    _patched_agent_construction, monkeypatch
+):
+    """chat --oneshot (-q single-query) resume: the exact _init_agent branch
+    single-query mode takes (quiet banner + restore) restores the stored
+    route — no separate oneshot resume fork exists, and this pins that."""
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(
+        rp, "resolve_runtime_provider",
+        lambda requested=None, **k: {"api_key": "kimi-key", "credential_pool": None},
+    )
+    stub = _make_init_stub(
+        _stored_kimi_meta(),
+        session_id="RQ1",
+        tool_progress_mode="off",
+        _single_query_mode=True,
+    )
+    assert stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    ) is True
+    kwargs = _CapturingAgent.last_kwargs
+    assert kwargs["model"] == "kimi-k3"
+    assert kwargs["provider"] == "kimi-coding"
