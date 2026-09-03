@@ -111,6 +111,12 @@ cmd_pack() {
 enforce_backup_retention() {
   # Owner rule: at most BACKUP_KEEP (default 2) newest backups remain; older
   # ones are deleted in the same swap run. Timestamps sort chronologically.
+  # BACKUP_KEEP < 1 is refused: keep=0 would delete EVERY backup including
+  # the one this swap just created, leaving no rollback path.
+  if ! [ "$BACKUP_KEEP" -ge 1 ] 2>/dev/null; then
+    echo "refusing FORK_SYNC_BACKUP_KEEP=$BACKUP_KEEP: must be >= 1 (keep=0 deletes the just-created backup)" >&2
+    return 25
+  fi
   local base old
   base="$(basename "$APP_TARGET")"
   while IFS= read -r old; do
@@ -163,7 +169,8 @@ cmd_swap() {
   fi
   rm -rf "${APP_TARGET}.old" 2>/dev/null || true
 
-  enforce_backup_retention
+  enforce_backup_retention \
+    || { SUMMARY="backup retention refused (FORK_SYNC_BACKUP_KEEP=$BACKUP_KEEP < 1) — swap DONE, fix the env"; return 25; }
   SUMMARY="swapped app bundle: $old_ver -> $new_ver (backup $(basename "$backup"), keep $BACKUP_KEEP)"
 }
 

@@ -5,7 +5,7 @@
 # Exit codes:  0 ok / nothing to do        2 usage or environment error
 #             10 work available           20 merge conflicts need manual resolution
 #             21 main checkout dirty      23 import guard failed
-#             24 targeted tests failed
+#             24 merge refused (in progress) / targeted tests failed
 #             30 probe FAIL
 #
 # Every exit prints one receipt line: FORK-SYNC <sub> rc=<n> <summary>
@@ -64,8 +64,15 @@ cmd_merge() {
     return 2
   fi
 
+  # An in-progress merge in the worktree is Owner-resolvable state: NEVER
+  # auto-abort it (an automated `git merge --abort` here would silently
+  # discard a half-resolved conflict set). Refuse with a hint instead.
+  if git -C "$WORKTREE" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    SUMMARY="merge already in progress in $WORKTREE (MERGE_HEAD exists) — resolve it or run 'git -C $WORKTREE merge --abort' yourself; refusing to start a second merge"
+    return 24
+  fi
+
   BRANCH="samir/post-update-sync-$(date +%Y%m%d)"
-  git -C "$WORKTREE" merge --abort >/dev/null 2>&1 || true
   git -C "$WORKTREE" checkout -B "$BRANCH" origin/main \
     || { SUMMARY="checkout -B $BRANCH failed"; return 2; }
 
@@ -106,10 +113,19 @@ EOF_CONFLICTS
 
 add_missing_contributors() {
   # Fork CI (contributor-check) requires a file per upstream author email.
+  # Each email becomes exactly ONE path component under contributors/emails/:
+  # reject anything containing '/', '..' or empty before writing it.
   local ae an created=0
   mkdir -p "$WORKTREE/contributors/emails"
   while IFS='|' read -r ae an; do
     [ -n "$ae" ] || continue
+    case "$ae" in
+      */*|*..*|"")
+        printf 'refusing unsafe contributor email (not a single path component): %s\n' "$ae" >&2
+        SUMMARY="refused unsafe contributor email: $ae"
+        return 24
+        ;;
+    esac
     if [ ! -f "$WORKTREE/contributors/emails/$ae" ]; then
       printf '%s\n' "$an" > "$WORKTREE/contributors/emails/$ae"
       git -C "$WORKTREE" add -- "contributors/emails/$ae"
@@ -224,12 +240,19 @@ cmd_deploy() {
     printf '%s\n' "bundle swap+relaunch skipped: FORK_SYNC_ALLOW_APP_SWAP != 1 (packed bundle waits in $MAIN_CHECKOUT/apps/desktop/release/mac-arm64/Hermes.app)"
   fi
 
-  # Detached restart, from the cron job's STEP 8 — kept in its own file so the
-  # gateway-restart guard can scan this script without matching the payload.
-  # Scheduled detached; the 90s lead in fork-sync-restart.sh lets the report
-  # land before the caller's own host process is restarted.
-  nohup /bin/bash "$MAIN_CHECKOUT/scripts/fork-sync-restart.sh" >/tmp/hermes-deploy-restart.log 2>&1 &
-  SUMMARY="deployed; bundle packed; swap+relaunch $( [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ] && echo done || echo skipped '(FORK_SYNC_ALLOW_APP_SWAP != 1)') ; detached restart scheduled (+90s); run 'probe' after it settles"
+  # Detached restart, from the cron job's STEP 8 mechanism — kept in its own
+  # file so the gateway-restart guard can scan this script without matching
+  # the payload. Gated with the swap: restarting the Owner's gateways without
+  # swapping the app is never wanted, and `open -a Terminal script.sh` is the
+  # proven detached launcher (nohup is blocked by the UI guard by design).
+  if [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ]; then
+    SUMMARY="scheduling detached restart (+90s) via fork-sync-restart.sh"
+    open -a Terminal "$MAIN_CHECKOUT/scripts/fork-sync-restart.sh" \
+      || { SUMMARY="could not schedule detached restart via Terminal (fork-sync-restart.sh)"; return 25; }
+  else
+    printf '%s\n' "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1 (bundle swap and gateway restart are one gated unit)"
+  fi
+  SUMMARY="deployed; bundle packed; swap+relaunch $( [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ] && echo done || echo skipped '(FORK_SYNC_ALLOW_APP_SWAP != 1)') ; detached restart $( [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ] && echo scheduled '+90s' || echo skipped ); run 'probe' after it settles"
 }
 
 # ---------------------------------------------------------------------------

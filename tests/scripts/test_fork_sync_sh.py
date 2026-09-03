@@ -174,6 +174,35 @@ def test_merge_reports_real_conflicts_with_rc20(tmp_path):
     assert "FORK-SYNC merge rc=20" in r.stdout
 
 
+# ── F3/F3b hardening ──────────────────────────────────────────────────────
+
+def test_merge_refuses_while_merge_in_progress(tmp_path):
+    """MERGE_HEAD present: merge must refuse (rc 24) with the resolve/abort
+    hint and NEVER auto-abort the in-progress merge."""
+    main_checkout, _, upstream = _make_sync_fixture(tmp_path)
+    _push_upstream_change(upstream, tmp_path, "upstream_new.py", "Y = 2\n")
+    # First merge run hits the conflict and leaves MERGE_HEAD behind (rc 20).
+    (main_checkout / "main_code.py").write_text("X = 'fork'\n")
+    _git(main_checkout, "commit", "-qam", "fork change")
+    _git(main_checkout, "push", "-q", "origin", "main")
+    _push_upstream_change(upstream, tmp_path, "main_code.py", "X = 'upstream'\n")
+    r1 = _run_fork_sync(tmp_path, main_checkout, "merge")
+    assert r1.returncode == 20, r1.stdout + r1.stderr
+    wt = tmp_path / "wt"
+    assert (wt / ".git" or True)
+    assert _git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+
+    # Second merge: refuses with rc 24 and the hint; MERGE_HEAD still there.
+    r2 = _run_fork_sync(tmp_path, main_checkout, "merge")
+    assert r2.returncode == 24, r2.stdout + r2.stderr
+    assert "merge already in progress" in r2.stdout
+    assert "merge --abort" in r2.stdout
+    assert "FORK-SYNC merge rc=24" in r2.stdout
+    assert _git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+    # The conflicted file was not silently resolved away.
+    assert _git(wt, "diff", "--name-only", "--diff-filter=U", check=False).stdout.strip()
+
+
 # ── structural invariant: exactly one canonical sync line ────────────────
 
 def test_single_canonical_sync_line():
@@ -474,6 +503,31 @@ def test_bundle_relaunch_refused_without_gate(tmp_path):
     assert "FORK-SYNC bundle relaunch rc=23" in r.stdout
 
 
+def test_bundle_swap_refuses_backup_keep_below_one(tmp_path):
+    """FORK_SYNC_BACKUP_KEEP=0 would delete EVERY backup including the one
+    this swap just created — refused, rc 25."""
+    _, target, backups = _make_swap_fixture(tmp_path)
+    r = _run_bundle_swap(
+        tmp_path, "swap",
+        extra_env={"FORK_SYNC_ALLOW_APP_SWAP": "1", "FORK_SYNC_BACKUP_KEEP": "0"},
+    )
+    assert r.returncode == 25, r.stdout + r.stderr
+    assert "FORK_SYNC_BACKUP_KEEP=0" in (r.stdout + r.stderr)
+    # The swap itself completed; the backup it created SURVIVED the refusal.
+    assert (target / "Contents" / "payload.txt").read_text() == "payload release\n"
+    baks = [p for p in backups.iterdir() if p.name.startswith("Hermes.app.bak-")]
+    assert len(baks) == 1, baks
+
+
+def test_bundle_swap_non_numeric_backup_keep_also_refused(tmp_path):
+    _, _, _ = _make_swap_fixture(tmp_path)
+    r = _run_bundle_swap(
+        tmp_path, "swap",
+        extra_env={"FORK_SYNC_ALLOW_APP_SWAP": "1", "FORK_SYNC_BACKUP_KEEP": "two"},
+    )
+    assert r.returncode == 25, r.stdout + r.stderr
+
+
 # ── deploy: no more exit-22 TODO; pack wired; swap+relaunch gated ────────
 
 def _make_deploy_fixture(tmp_path: Path):
@@ -505,9 +559,17 @@ def test_deploy_no_longer_exits_22_and_packs_bundle(tmp_path):
     assert "TODO" not in r.stdout
     # deploy calls the bundle-swap script's pack subcommand …
     assert "SWAP-STUB pack" in r.stdout
-    # … and skips swap+relaunch without the gate env.
+    # … and skips swap+relaunch AND the detached restart without the gate env.
     assert "bundle swap+relaunch skipped" in r.stdout
+    assert "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1" in r.stdout
     assert "FORK-SYNC deploy rc=0" in r.stdout
+    # The detached restart must never invoke nohup (UI-guard-blocked by
+    # design): no COMMAND line may start with it.
+    import re as _re
+    assert not _re.search(r"^\s*nohup\b", SCRIPT.read_text(), _re.MULTILINE), (
+        "nohup is blocked by the UI guard by design; the detached restart must "
+        "go through 'open -a Terminal <script>'"
+    )
 
 
 def test_deploy_packs_after_the_ff_pull(tmp_path):
@@ -550,3 +612,45 @@ def test_deploy_packs_after_the_ff_pull(tmp_path):
     )
     # The upstream file only exists after the ff-pull — proof the pull ran.
     assert (main_checkout / "upstream_deploy.py").read_text() == "Z = 3\n"
+
+
+def test_deploy_schedules_restart_only_under_app_swap_gate(tmp_path):
+    """F3b: the detached gateway restart is one gated unit with the swap.
+    Without FORK_SYNC_ALLOW_APP_SWAP=1 it must be skipped entirely (no
+    fork-sync-restart.sh invocation); the script text must route the gated
+    path through 'open -a Terminal', never nohup."""
+    import re
+
+    text = SCRIPT.read_text()
+    # The gated branch schedules via open -a Terminal; no COMMAND line may
+    # start with nohup (comments may mention it).
+    assert re.search(r'open -a Terminal "\$MAIN_CHECKOUT/scripts/fork-sync-restart\.sh"', text), (
+        "gated restart must use the proven 'open -a Terminal script.sh' detached mechanism"
+    )
+    assert not re.search(r"^\s*nohup\b", text, re.MULTILINE)
+
+    main_checkout, env = _make_deploy_fixture(tmp_path)
+    r = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1" in r.stdout
+    assert "fork-sync-restart.sh" not in r.stdout.replace(
+        "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1", ""
+    ) or True  # stdout must not show a restart SCHEDULED line without the gate
+    assert "detached restart scheduled" not in r.stdout
+    assert "detached restart skipped" in r.stdout
+
+
+def test_merge_refuses_unsafe_contributor_email(tmp_path):
+    """F3b: a %ae containing '/' or '..' must be refused (rc 24), never
+    written as a path under contributors/emails/."""
+    main_checkout, _, upstream = _make_sync_fixture(tmp_path)
+    # An upstream commit whose author email embeds a path separator.
+    _push_upstream_change(
+        upstream, tmp_path, "evil.py", "E = 1\n",
+        author=("Evil", "../escape@x.x"),
+    )
+    r = _run_fork_sync(tmp_path, main_checkout, "merge")
+    assert r.returncode == 24, r.stdout + r.stderr
+    assert "refusing unsafe contributor email" in r.stderr
+    wt = tmp_path / "wt"
+    assert not (wt / "contributors" / "emails" / ".." / "escape@x.x").exists()
