@@ -3141,6 +3141,19 @@ def get_model_context_length(
     # This closes the gap where /model switch and display paths used to fall
     # back to 128K despite the user having a per-model context_length set.
     # See #15779.
+    # D2 (R2 review): callers that pass custom_providers=None still deserve
+    # the catalog honor — load them lazily (mirroring the MoA branch above)
+    # so providers.<name>.models.<model>.context_length applies on EVERY
+    # call path, not only those that thread the argument explicitly.
+    if custom_providers is None:
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config,
+            )
+            custom_providers = get_compatible_custom_providers(load_config() or {})
+        except Exception:
+            custom_providers = None
     if custom_providers and base_url and model:
         try:
             from hermes_cli.config import get_custom_provider_context_length

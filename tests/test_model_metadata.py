@@ -97,3 +97,34 @@ def test_genuine_probe_down_names_actual_default_and_both_keys(
         for m in messages
     ), messages
 
+
+def test_caller_without_custom_providers_still_honors_catalog(monkeypatch, probes_down):
+    """D2 (R2 review): a caller passing custom_providers=None still gets the
+    providers.<name>.models.<model>.context_length value — the function loads
+    the compatible providers itself instead of silently skipping step 0c."""
+    import json
+
+    fake_config = {
+        "custom_providers": [
+            {
+                "name": "vibeproxy-claude",
+                "base_url": _CUSTOM_BASE_URL,
+                "models": {
+                    "claude-fable-5": {"context_length": 777_777},
+                },
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: fake_config, raising=True
+    )
+
+    ctx = get_model_context_length(
+        "claude-fable-5",
+        base_url=_CUSTOM_BASE_URL,
+        api_key="",
+        provider="custom",
+        custom_providers=None,
+    )
+    assert ctx == 777_777
+
