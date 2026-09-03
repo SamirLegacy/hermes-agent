@@ -31,9 +31,13 @@ usage() {
 }
 
 # ditto (mac, resource forks) > rsync -a > cp -R — same tree-copy semantics.
+# rsync needs the trailing slash on the source: without it rsync nests the
+# source dir INTO the destination (dst/Hermes.app/Contents/...) — silently
+# breaking the swap on Linux (macOS takes the ditto branch, which is why this
+# only ever failed in CI).
 copy_tree() {
   if command -v ditto >/dev/null 2>&1; then ditto "$1" "$2"
-  elif command -v rsync >/dev/null 2>&1; then rsync -a "$1" "$2"
+  elif command -v rsync >/dev/null 2>&1; then rsync -a "$1/" "$2"
   else cp -R "$1" "$2"; fi
 }
 

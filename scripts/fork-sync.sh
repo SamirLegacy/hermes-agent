@@ -122,11 +122,16 @@ add_missing_contributors() {
 }
 
 finalize_merge_commit() {
+  # Deterministic committer identity — fork convention for automation
+  # (contributors/emails/samir@local: "fork-local git identity for Hermes
+  # self-improvement commits"). CI runners have no ambient git identity,
+  # without this both commits below die with "Committer identity unknown".
+  local idargs=(-c "user.name=Samir" -c "user.email=samir@local")
   if git -C "$WORKTREE" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-    git -C "$WORKTREE" commit --no-edit
+    git -C "$WORKTREE" "${idargs[@]}" commit --no-edit
     SUMMARY="merge committed on $BRANCH (auto-resolved emails + $NEW_CONTRIB new mapping(s) included)"
   elif [ "${NEW_CONTRIB:-0}" -gt 0 ]; then
-    git -C "$WORKTREE" commit -m "chore(contributors): map new upstream author emails"
+    git -C "$WORKTREE" "${idargs[@]}" commit -m "chore(contributors): map new upstream author emails"
     SUMMARY="branch $BRANCH ready ($NEW_CONTRIB new contributor mapping(s))"
   else
     SUMMARY="branch $BRANCH ready (clean merge, no new mappings)"
