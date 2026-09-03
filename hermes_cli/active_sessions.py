@@ -162,6 +162,8 @@ class ActiveSessionRefusal(str):
     """
 
     reason: str
+    # Machine-readable holder facts, attached only on SESSION_NOT_OWNED refusals (see _lease_holder_payload).
+    holder: Optional[dict[str, Any]] = None
 
     def __new__(cls, message: str, reason: str) -> "ActiveSessionRefusal":
         obj = super().__new__(cls, message)
@@ -189,15 +191,40 @@ def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -
     return existing_live == incoming_live
 
 
+def _wall_clock(timestamp: float) -> str:
+    return time.strftime("%H:%M", time.localtime(timestamp))
+
+
+def _lease_holder_payload(session_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Structured holder facts for a SESSION_NOT_OWNED refusal.
+
+    The message is for people; this is for clients. A desktop tile or bot relay that
+    wants to render "who owns this session" must never re-parse the refusal prose (the
+    reason-constant comment at the top of this file is the contract), so the
+    refusal carries the same facts the message names, machine-readable.
+    """
+    started = _optional_float(entry.get("started_at"))
+    return {
+        "session_id": str(session_id),
+        "surface": str(entry.get("surface") or "another surface"),
+        "pid": entry.get("pid"),
+        "started_at": started,
+        "age_s": round(time.time() - started, 1) if started else None,
+    }
+
+
 def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str:
     surface = str(entry.get("surface") or "another surface")
     pid = entry.get("pid")
     started = _optional_float(entry.get("started_at"))
     age = f", running {format_age(time.time() - started)}" if started else ""
+    since = f", since {_wall_clock(started)}" if started else ""
     return (
-        f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}). "
+        f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}{since}). "
         "Only one surface at a time may run a session, because a second one would "
-        "reason from a transcript that does not include the first one's work."
+        "reason from a transcript that does not include the first one's work.\n"
+        f"To take over from that holder: hermes chat --resume {session_id} --takeover\n"
+        "To see all live session owners: hermes status"
     )
 
 
@@ -633,10 +660,12 @@ def try_acquire_active_session(
                     existing.get("pid"),
                     existing.get("surface"),
                 )
-                return None, ActiveSessionRefusal(
+                refusal = ActiveSessionRefusal(
                     session_already_owned_message(key, existing),
                     SESSION_NOT_OWNED,
                 )
+                refusal.holder = _lease_holder_payload(key, existing)
+                return None, refusal
 
         # Capacity second, and only when an operator asked for one.
         if max_sessions is not None:
@@ -663,6 +692,113 @@ def try_acquire_active_session(
         state_path=state_path,
         lock_path=lock_path,
         track_liveness=track_liveness,
+    ), None
+
+
+def takeover_active_session(
+    *,
+    session_id: str,
+    surface: str,
+    config: Any,
+    metadata: Optional[dict[str, Any]] = None,
+    registry_home: str | Path | None = None,
+) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
+    """Force-claim a session from its live owner (``--takeover``).
+
+    A normal claim refuses a session with a live owner; this is the explicit operator override. Under the
+    same file lock that prunes dead owners, it drops the holder's entry and writes ours, so the steal is one
+    atomic decision: verify the holder (liveness pruning already ran, same-session match), drop its
+    entry, write ours. A dead holder never reaches the steal — pruning already reclaimed it, and the normal
+    claim path would have succeeded without the flag.
+
+    What a takeover does NOT do: fence the old owner out of its own process. A live surface never re-reads the
+    registry on its per-turn fast path (cli.py's ``if lease is not None: return True`` / the gateway's
+    equivalent), so the old owner keeps its in-memory lease and can keep driving turns until its process
+    exits — the claim site warns about that; closing the old surface is what actually ends its writes.
+    """
+    max_sessions = resolve_max_concurrent_sessions(config)
+    lease_id = uuid.uuid4().hex
+    key = str(session_id or "")
+
+    # An empty key is exempt, mirroring try_acquire: nothing to steal, nothing to record.
+    if not key:
+        return ActiveSessionLease(
+            lease_id=lease_id,
+            session_id=key,
+            surface=str(surface),
+            enabled=False,
+        ), None
+
+    entry = _lease_entry(
+        lease_id=lease_id,
+        session_id=key,
+        surface=str(surface),
+        metadata=metadata,
+    )
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
+    with _FileLock(lock_path):
+        try:
+            raw_entries = _read_entries(state_path, strict=True)
+            entries = _prune_dead(raw_entries)
+        except ActiveSessionRegistryError:
+            # Same fail-closed posture as try_acquire: an unprovable ownership
+            # state must not be collapsed into a go-ahead, here or there.
+            logger.warning(
+                "Active-session registry is unavailable; refusing the takeover"
+            )
+            return None, ActiveSessionRefusal(
+                (
+                    "Hermes could not read the active-session registry at "
+                    f"{state_path}, so it cannot prove who holds this session. "
+                    "Fix or remove that file and try again."
+                ),
+                SESSION_COORDINATION_UNAVAILABLE,
+            )
+        pruned = len(raw_entries) - len(entries)
+        if pruned:
+            logger.info("Pruned %d stale active session lease(s)", pruned)
+
+        kept: list[dict[str, Any]] = []
+        stolen: Optional[dict[str, Any]] = None
+        for existing in entries:
+            if str(existing.get("session_id") or "") != key:
+                kept.append(existing)
+                continue
+            if _is_same_writer(existing, metadata):
+                # Already ours — a takeover re-claiming our own live session
+                # replaces our own entry rather than logging a steal against
+                # ourselves (try_acquire re-entrancy parity).
+                continue
+            stolen = existing
+        # Capacity second, mirroring try_acquire: a steal swaps one entry for one
+        # entry (count unchanged); an empty-holder takeover is a plain acquire.
+        if max_sessions is not None and len(kept) >= max_sessions:
+            _write_entries(state_path, entries)
+            logger.info(
+                "Active session limit reached during takeover: active=%d max=%d surface=%s",
+                len(kept),
+                max_sessions,
+                surface,
+            )
+            return None, ActiveSessionRefusal(
+                active_session_limit_message(len(kept), max_sessions, kept),
+                MAX_CONCURRENT_SESSIONS,
+            )
+        kept.append(entry)
+        _write_entries(state_path, kept)
+    if stolen is not None:
+        logger.info(
+            "took over session %s from pid=%s surface=%s",
+            key,
+            stolen.get("pid"),
+            stolen.get("surface"),
+        )
+    return ActiveSessionLease(
+        lease_id=lease_id,
+        session_id=key,
+        surface=str(surface),
+        state_path=state_path,
+        lock_path=lock_path,
     ), None
 
 

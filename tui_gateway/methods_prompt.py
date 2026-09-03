@@ -436,11 +436,18 @@ def _(rid, params: dict) -> dict:
         # and before _start_agent_build: no user row is persisted and no model turn
         # begins, so a refusal leaves the session exactly as it was.
         reason = getattr(limit_message, "reason", None)
+        data = {"reason": reason} if reason else None
+        holder = getattr(limit_message, "holder", None)
+        if data is not None and isinstance(holder, dict):
+            # SESSION_NOT_OWNED refusals also carry the machine-readable holder
+            # facts the refusal message names, so a client renders "who owns this"
+            # without ever parsing prose.
+            data["holder"] = holder
         return _err(
             rid,
             4090,
             str(limit_message),
-            {"reason": reason} if reason else None,
+            data,
         )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD

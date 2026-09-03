@@ -5211,6 +5211,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        takeover: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5801,6 +5802,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
+        # --takeover: claim steals the live owner's lease instead of refusing.
+        self._active_session_takeover = bool(takeover)
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -5860,7 +5863,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._active_session_lease is not None:
             return True
         try:
-            from hermes_cli.active_sessions import try_acquire_active_session
+            from hermes_cli.active_sessions import (
+                SESSION_NOT_OWNED,
+                takeover_active_session,
+                try_acquire_active_session,
+            )
 
             lease, message = try_acquire_active_session(
                 session_id=self.session_id,
@@ -5871,6 +5878,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # instead of fencing itself out.
                 metadata={"live_session_id": str(self.session_id)},
             )
+            if (
+                message is not None
+                and getattr(self, "_active_session_takeover", False)
+                and getattr(message, "reason", None) == SESSION_NOT_OWNED
+            ):
+                holder = getattr(message, "holder", None)
+                lease, message = takeover_active_session(
+                    session_id=self.session_id,
+                    surface=surface,
+                    config=self.config,
+                    metadata={"live_session_id": str(self.session_id)},
+                )
+                if lease is not None and isinstance(holder, dict):
+                    # One-line warning naming the limitation: the registry entry
+                    # moved, but the old owner's process never re-reads it, so it
+                    # keeps writing from its in-memory lease until it exits.
+                    self._print_takeover_warning(holder, stderr=stderr)
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
             return True
@@ -5886,6 +5910,74 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
         return True
+
+    def _print_takeover_warning(self, holder: dict, *, stderr: bool = False) -> None:
+        surface = holder.get("surface") or "another surface"
+        pid = holder.get("pid")
+        warning = (
+            f"Warning: --takeover moved the registry lease, but the old owner "
+            f"({surface}, pid {pid}) never re-reads it — it can keep writing to this "
+            f"session until its process exits; close that surface to avoid interleaved turns."
+        )
+        if stderr:
+            print(warning, file=sys.stderr)
+        else:
+            self._console_print(f"[bold yellow]{warning}[/]")
+
+    def _reanchor_active_session_lease(self) -> None:
+        """Move the CLI's active-session lease onto the live session id after a compression rekey.
+
+        Mid-turn and manual /compress rotate self.session_id onto the continuation
+        session while the lease entry still names the ended parent — leaving the
+        continuation unprotected (a second surface resuming it directly would be
+        admitted mid-write) and the refusal message naming a dead id. Mirrors the
+        gateway's _transfer_active_session_slot, including reserve-before-release:
+        if the in-place transfer fails, reserve the new slot BEFORE releasing the old
+        one so this session is never left without any lease.
+        """
+        lease = getattr(self, "_active_session_lease", None)
+        if lease is None:
+            return
+        new_id = str(self.session_id or "")
+        if not new_id or new_id == str(lease.session_id or ""):
+            return
+        try:
+            from hermes_cli.active_sessions import (
+                transfer_active_session,
+                try_acquire_active_session,
+            )
+
+            if transfer_active_session(
+                lease,
+                session_id=new_id,
+                metadata={"live_session_id": new_id},
+            ):
+                return
+            new_lease, limit_message = try_acquire_active_session(
+                session_id=new_id,
+                surface=lease.surface,
+                config=self.config,
+                metadata={"live_session_id": new_id},
+            )
+        except Exception as exc:
+            logger.warning(
+                "Compression session lease did not re-anchor (kept old lease): %s",
+                exc,
+            )
+            return
+        if new_lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                logger.debug("Failed to release stale active session slot", exc_info=True)
+            self._active_session_lease = new_lease
+        else:
+            logger.warning(
+                "Compression session lease did not re-anchor (kept old lease): "
+                "new_session_id=%s reason=%s",
+                new_id,
+                limit_message,
+            )
 
     def _release_active_session(self) -> None:
         lease = getattr(self, "_active_session_lease", None)
@@ -14165,6 +14257,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     and self.agent.session_id != self.session_id
                 ):
                     self.session_id = self.agent.session_id
+                    self._reanchor_active_session_lease()
                     getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                     self._pending_title = None
                     # Manual /compress replaces conversation_history with a new
@@ -17518,6 +17611,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ):
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
+                self._reanchor_active_session_lease()
                 getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                 self._pending_title = None
 
@@ -21779,6 +21873,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    takeover: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21981,6 +22076,7 @@ def main(
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            takeover=takeover,
         )
     except ImportError as e:
         # Direct `python cli.py` / `python -m cli` bypasses cmd_chat's

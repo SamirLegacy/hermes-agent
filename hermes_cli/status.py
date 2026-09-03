@@ -663,10 +663,12 @@ def show_status(args):
         else:
             print(f"  Active:       {_session_count if _session_count is not None else 0}")
 
-    # Slot usage, only when max_concurrent_sessions is set. The cap is shared
-    # across CLI, desktop/TUI and the messaging gateway, so the surface that
-    # gets rejected is rarely the one holding the slots — without this the only
-    # way to find out is reading runtime/active_sessions.json by hand.
+    # Live session owners — printed whenever any exist, cap or no cap. Per-session exclusivity
+    # engages unconditionally (exclusivity is correctness, the cap is policy), so the holder table
+    # must not hide behind an optional max_concurrent_sessions: without it the only way to see a
+    # lock holder is reading runtime/active_sessions.json by hand — exactly the anti-pattern this
+    # section exists to prevent. The cap is shared across CLI, desktop/TUI and the messaging
+    # gateway, so the surface that gets rejected is rarely the one holding the slots.
     try:
         from hermes_cli.active_sessions import (
             active_session_registry_snapshot,
@@ -677,11 +679,11 @@ def show_status(args):
         _cap = resolve_max_concurrent_sessions(config)
     except Exception:
         _cap = None
+    try:
+        _held = active_session_registry_snapshot()
+    except Exception:
+        _held = []
     if _cap:
-        try:
-            _held = active_session_registry_snapshot()
-        except Exception:
-            _held = []
         _full = len(_held) >= _cap
         print(
             "  Slots:        "
@@ -689,12 +691,17 @@ def show_status(args):
                 f"{len(_held)}/{_cap} in use", Colors.YELLOW if _full else Colors.GREEN
             )
         )
+    elif _held:
+        print(f"  Live owners:  {len(_held)} session(s) live-owned")
+    if _held:
         _now = time.time()
         for _entry in sorted(_held, key=lambda e: e.get("started_at") or 0):
-            _age = format_age(_now - float(_entry.get("started_at") or _now))
+            _started = _entry.get("started_at")
+            _age = format_age(_now - float(_started or _now))
+            _clock = time.strftime(" at %H:%M", time.localtime(float(_started))) if _started else ""
             print(
                 f"                {_entry.get('surface') or 'unknown':<17} "
-                f"{_entry.get('session_id') or '?':<24} {_age}"
+                f"{_entry.get('session_id') or '?':<24} {_age} (pid {_entry.get('pid') or '?'}){_clock}"
             )
 
     # =========================================================================

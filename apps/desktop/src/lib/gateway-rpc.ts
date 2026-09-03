@@ -37,3 +37,66 @@ export function isBusySessionModelSwitch(error: unknown): boolean {
 
   return /session busy/i.test(message) && /switching models/i.test(message)
 }
+
+/** Holder facts the gateway ships on a SESSION_NOT_OWNED refusal (4090). */
+export interface SessionOwnerRefusal {
+  age_s?: null | number
+  pid?: null | number | string
+  session_id?: string
+  started_at?: null | number
+  surface?: string
+}
+
+/** The machine-readable holder payload attached to a 4090 refusal's `data`. */
+export function sessionOwnerRefusalOf(error: unknown): SessionOwnerRefusal | null {
+  const code = (error as { code?: unknown })?.code
+  const data = (error as { data?: unknown })?.data
+
+  if (code !== 4090 || typeof data !== 'object' || data === null) {
+    return null
+  }
+
+  if ((data as { reason?: unknown }).reason !== 'SESSION_NOT_OWNED') {
+    return null
+  }
+
+  const holder = (data as { holder?: unknown }).holder
+
+  return typeof holder === 'object' && holder !== null ? (holder as SessionOwnerRefusal) : {}
+}
+
+/** True when an RPC failed because the session already has a live owner.
+ *
+ *  This refusal is terminal-for-now: retrying can never succeed while the holder lives,
+ *  so it must NOT ride the reconnect/resume retry ladders (which keep re-dialing at
+ *  attempt-0 cadence because ws-open resets the backoff attempt — the measured 200ms
+ *  storm). The reason travels as typed data, not prose; never match the message text. */
+export function isSessionNotOwnedError(error: unknown): boolean {
+  return sessionOwnerRefusalOf(error) !== null
+}
+
+/** One-line human summary of a SESSION_NOT_OWNED refusal, from its holder facts. */
+export function describeSessionOwner(error: unknown): string {
+  const holder = sessionOwnerRefusalOf(error)
+
+  if (!holder) {
+    return error instanceof Error ? error.message : String(error)
+  }
+
+  const surface = holder.surface || 'another surface'
+  const pid = holder.pid ?? '?'
+  const age =
+    typeof holder.age_s === 'number' && holder.age_s >= 0
+      ? ` for ${Math.max(0, Math.round(holder.age_s / 60))}m`
+      : ''
+  const since =
+    typeof holder.started_at === 'number' && holder.started_at > 0
+      ? ` since ${new Date(holder.started_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+      : ''
+  const sessionId = holder.session_id ? ` ${holder.session_id}` : ''
+
+  return (
+    `Session${sessionId} is live-owned by ${surface} (pid ${pid})${age}${since}.` +
+    (sessionId ? ` Take over from that holder with: hermes chat --resume${sessionId} --takeover` : '')
+  )
+}

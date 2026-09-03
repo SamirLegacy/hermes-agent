@@ -461,6 +461,16 @@ def build_top_level_parser():
         ),
     )
     chat_parser.add_argument(
+        "--takeover",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "With --resume: steal the session from its live owner instead of "
+            "refusing (the old owner keeps running until it exits — see the "
+            "printed warning)."
+        ),
+    )
+    chat_parser.add_argument(
         "--no-restore-cwd",
         action="store_true",
         default=argparse.SUPPRESS,

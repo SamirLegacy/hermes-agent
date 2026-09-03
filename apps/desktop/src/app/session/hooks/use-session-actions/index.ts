@@ -22,7 +22,7 @@ import {
   stripPendingClarifyProjectionForCache,
   toChatMessages
 } from '@/lib/chat-messages'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { describeSessionOwner, isMissingRpcMethod, isSessionNotOwnedError } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
@@ -1875,6 +1875,21 @@ export function useSessionActions({
         }
 
         if (!isCurrentResume()) {
+          return
+        }
+
+        // SESSION_NOT_OWNED is terminal-for-now: retrying can never succeed while the holder lives, so this refusal must NOT arm
+        // $resumeFailedSessionId (the bounded retry ladder) or the error toast storm — the reconnect ladder rides
+        // attempt-0 cadence forever because ws-open resets the backoff attempt on every successful socket open, which is
+        // exactly the 200ms refusal storm measured in the 2026-09-02 incident (L3 §2). The REST fallback above still painted the
+        // transcript; render the holder facts once with the takeover hint and leave a manual reselect as the only retry
+        // path — a manual resume always stays possible via reselect/reconnect.
+        if (isSessionNotOwnedError(err)) {
+          notify({
+            kind: 'info',
+            title: 'Session has a live owner',
+            message: describeSessionOwner(err)
+          })
           return
         }
 
