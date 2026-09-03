@@ -58,6 +58,32 @@ def test_repaired_load_is_stable_under_prerequest_repair(db):
 
 
 
+def test_session_meta_marker_does_not_mask_same_role_pair(db):
+    """R2 (session_meta filter before repair): a session_meta marker row
+    mid-transcript separates two same-role turns (user, session_meta, user).
+    The repair ran BEFORE the caller-side filter and saw legal alternation,
+    so the filter then handed the agent consecutive same-role messages.
+    Live-replay load now drops marker rows before repairing."""
+    db.create_session("sm1", "system prompt")
+    db.append_message(session_id="sm1", role="user", content="first ask")
+    db.append_message(session_id="sm1", role="assistant", content="first reply")
+    db.append_message(session_id="sm1", role="session_meta", content='{"k": "v"}')
+    db.append_message(session_id="sm1", role="user", content="second ask")
+    db.append_message(session_id="sm1", role="assistant", content="second reply")
+
+    messages = db.get_messages_as_conversation("sm1", repair_alternation=True)
+    roles = [m["role"] for m in messages]
+    assert "session_meta" not in roles
+    # Alternation holds across the removed marker — no same-role pair.
+    for prev, cur in zip(roles, roles[1:]):
+        assert prev != cur or prev == "tool", roles
+
+    # The inspection/export projection keeps marker rows verbatim.
+    verbatim = db.get_messages_as_conversation("sm1", repair_alternation=False)
+    assert any(m["role"] == "session_meta" for m in verbatim)
+
+
+
 
 # ---------------------------------------------------------------------------
 # The live-replay restore SITES must pass repair_alternation=True. The initial

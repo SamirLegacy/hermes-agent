@@ -14020,6 +14020,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # whole accumulated lineage for every user row.
         exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
         for row in rows:
+            # session_meta marker rows are transcript BOOKKEEPING, never
+            # conversation turns. On the live-replay projection
+            # (repair_alternation=True) they must be dropped BEFORE the
+            # alternation repair runs: a marker row mid-transcript separates
+            # two same-role turns (user, session_meta, user), the repair sees
+            # legal alternation and does nothing, and the caller-side filter
+            # then leaves consecutive same-role messages in the model feed.
+            # Inspection/export (repair_alternation=False) keeps them verbatim.
+            if repair_alternation and row["role"] == "session_meta":
+                continue
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
