@@ -5834,6 +5834,16 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if db is None:
         return
 
+    # A mid-turn provider fallback is a transient detour, not the session's
+    # model: the fallback overlay in model_config (written by the agent's
+    # chat-completion helpers) is the ONLY fallback record, and the row must
+    # keep the Owner's chosen primary so a later resume restores IT (never
+    # the fallback — D4). Skip the model/route rewrite while the fallback is
+    # active, mirroring gateway/run.py's _sync_session_runtime skip; the next
+    # primary turn syncs normally again.
+    if getattr(agent, "_fallback_activated", False):
+        return
+
     try:
         row = db.get_session(session_key) or {}
         raw_config = row.get("model_config")

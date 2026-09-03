@@ -4170,6 +4170,74 @@ def test_persist_live_session_runtime_preserves_explicit_normal_tier():
     assert updates["config"]["service_tier"] == "normal"
 
 
+def test_persist_live_session_runtime_skips_while_fallback_active():
+    """D4/R3-2: while a provider fallback is active, agent.model IS the
+    fallback model — persisting it would rewrite sessions.model and
+    model_config.model, so the next resume restores the fallback instead of
+    the Owner's chosen primary. The fallback overlay in model_config (written
+    by the agent's chat-completion helpers) stays the only fallback record;
+    the row is left untouched until the next primary turn."""
+    updates = []
+
+    class FakeDB:
+        def get_session(self, _session_id):
+            return {"model_config": '{"model":"claude-fable-5"}'}
+
+        def update_session_meta(self, *args, **kwargs):
+            updates.append(("meta", args, kwargs))
+
+        def update_session_model(self, *args, **kwargs):
+            updates.append(("model", args, kwargs))
+
+    agent = types.SimpleNamespace(
+        model="kimi-k3-fallback",
+        provider="moonshot",
+        base_url="",
+        api_mode="",
+        reasoning_config=None,
+        service_tier=None,
+        _fallback_activated=True,  # mid-turn fallback live
+        _session_db=FakeDB(),
+    )
+
+    server._persist_live_session_runtime(
+        {"agent": agent, "session_key": "stored-session"}
+    )
+
+    assert updates == [], "fallback-active persist must not rewrite the row"
+
+
+def test_persist_live_session_runtime_writes_when_fallback_inactive():
+    """Counterpart: with no fallback active, the runtime sync writes as
+    before — the skip must not leak into normal persistence."""
+    updates = {}
+
+    class FakeDB:
+        def get_session(self, _session_id):
+            return {"model_config": '{"model":"claude-fable-5"}'}
+
+        def update_session_meta(self, session_id, model_config_json, model=None):
+            updates["meta"] = (session_id, json.loads(model_config_json), model)
+
+    agent = types.SimpleNamespace(
+        model="claude-fable-5",
+        provider="anthropic",
+        base_url="",
+        api_mode="",
+        reasoning_config=None,
+        service_tier=None,
+        _fallback_activated=False,
+        _session_db=FakeDB(),
+    )
+
+    server._persist_live_session_runtime(
+        {"agent": agent, "session_key": "stored-session"}
+    )
+
+    assert updates["meta"][1]["model"] == "claude-fable-5"
+    assert updates["meta"][2] == "claude-fable-5"
+
+
 def test_status_callback_emits_kind_and_text():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]
