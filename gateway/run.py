@@ -51,6 +51,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
+    COMPACTION_HEARTBEAT_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -131,7 +132,8 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    rf"|{re.escape(COMPACTION_STATUS)}"
+    rf"|{re.escape(COMPACTION_HEARTBEAT_STATUS)}"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -391,20 +393,27 @@ async def run_codex_hygiene_compaction(
     loop = asyncio.get_running_loop()
     compressor = getattr(agent, "context_compressor", None)
     count_before = getattr(compressor, "compression_count", 0)
+    worker_future = loop.run_in_executor(
+        None,
+        # Keep the caller's multiplexed profile secret scope and HERMES_HOME
+        # override in the worker. The default executor does not propagate
+        # ContextVars on the Python runtimes Hermes currently ships.
+        copy_context().run,
+        lambda: agent._compress_context(
+            history,
+            "",
+            approx_tokens=approx_tokens,
+        ),
+    )
+    track_worker = getattr(gateway, "_track_deferred_agent_worker", None)
+    if callable(track_worker):
+        # ``wait_for`` only cancels the asyncio wrapper; the executor thread
+        # keeps running. Keep it visible to gateway shutdown until the real
+        # worker finishes, just like the detached local-compressor path.
+        track_worker(worker_future, agent)
     try:
         await asyncio.wait_for(
-            # copy_context().run: keep the caller's profile secret scope /
-            # HERMES_HOME override in the worker (multiplex_profiles) — same
-            # class as the detached-agent hygiene path below.
-            loop.run_in_executor(
-                None,
-                copy_context().run,
-                lambda: agent._compress_context(
-                    history,
-                    "",
-                    approx_tokens=approx_tokens,
-                ),
-            ),
+            asyncio.shield(worker_future),
             timeout=max(float(timeout_seconds), 1.0),
         )
     except asyncio.TimeoutError:
@@ -526,6 +535,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_HEARTBEAT_STATUS,
             COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -9427,6 +9437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_deferred_agent_worker_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9479,6 +9490,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("Failed interrupting api_server runs during shutdown: %s", exc)
             return 0
+
+    def _active_deferred_agent_worker_count(self) -> int:
+        """Count executor workers that outlived their owning gateway turn.
+
+        A timed-out hygiene compression keeps running in its executor thread.
+        Some paths defer agent cleanup; the live Codex path keeps its cached
+        agent. In both cases the turn can finish before the worker does, so
+        ``_running_agents`` no longer represents it. Count the worker itself.
+        """
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        return sum(1 for future in list(workers) if not future.done())
+
+    def _track_deferred_agent_worker(
+        self,
+        future: asyncio.Future,
+        agent: Any,
+    ) -> None:
+        """Expose an executor worker to drain/interrupt until it really exits."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if workers is None:
+            workers = {}
+            self._deferred_agent_workers = workers
+        workers[future] = agent
+
+        def _discard_worker(done_future: asyncio.Future) -> None:
+            workers.pop(done_future, None)
+            # Some tracked workers intentionally outlive the coroutine that
+            # started them and therefore have no later waiter. Consume their
+            # terminal exception so asyncio does not emit an unhandled-future
+            # warning after the worker eventually unwinds (#98973).
+            if not done_future.cancelled():
+                try:
+                    done_future.exception()
+                except Exception:
+                    pass
+
+        future.add_done_callback(_discard_worker)
+
+    def _interrupt_deferred_agent_workers(self, reason: str) -> int:
+        """Request cancellation of detached executor-backed agent work."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        interrupted = 0
+        seen: set[int] = set()
+        for future, agent in list(workers.items()):
+            if future.done() or agent is None or id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            try:
+                request_hard_interrupt(agent, reason)
+                interrupted += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed interrupting deferred agent worker during shutdown: %s",
+                    exc,
+                )
+        return interrupted
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -11644,25 +11715,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_deferred_count = self._active_deferred_agent_worker_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_deferred_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            deferred_count = self._active_deferred_agent_worker_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or deferred_count != last_deferred_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_deferred_count = deferred_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -11671,7 +11747,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_deferred_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -11692,7 +11773,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_deferred_agent_worker_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -11708,6 +11791,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_deferred_agent_worker_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -11727,6 +11811,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+        interrupted_deferred = self._interrupt_deferred_agent_workers(reason)
+        if interrupted_deferred:
+            logger.debug(
+                "Interrupted %d deferred agent worker(s) during shutdown",
+                interrupted_deferred,
+            )
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -12165,6 +12255,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
             await self._cleanup_agent_resources_off_loop(agent, context=context)
+
+        self._track_deferred_agent_worker(future, agent)
 
         task = asyncio.create_task(_cleanup_when_done())
         tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
@@ -14342,10 +14434,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # transcription is forwarded without requiring /voice join.
                 self._bind_voice_input_callback(adapter)
                 connected_count += 1
+                _degraded = adapter.send_path_degraded
                 self._update_platform_runtime_status(
-                    platform.value, platform_state="connected", error_code=None, error_message=None,
+                    platform.value,
+                    platform_state="retrying" if _degraded else "connected",
+                    error_code=None,
+                    error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                 )
-                logger.info("\u2713 %s connected", platform.value)
+                logger.info("\u2713 %s connected%s", platform.value, " (degraded)" if _degraded else "")
             else:  # outcome == "failed"
                 logger.warning("\u2717 %s failed to connect", platform.value)
                 # Defensive cleanup: a failed connect() may have allocated resources
@@ -16106,15 +16202,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._bind_voice_input_callback(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        # connect() returning True does not mean the adapter's
+                        # receive path is confirmed -- Telegram's degraded
+                        # reconnect returns True so the gateway stays up while
+                        # its own ladder retries. Stamping "connected" here
+                        # would undo the adapter's accurate status (#101391).
+                        _degraded = adapter.send_path_degraded
                         self._update_platform_runtime_status(
                             platform.value,
-                            platform_state="connected",
+                            platform_state="retrying" if _degraded else "connected",
                             error_code=None,
-                            error_message=None,
+                            error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                             needs_attention=False,
                             retrying_since=None,
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
+                        if _degraded:
+                            logger.info("⚠ %s reconnected in degraded mode (receive path not yet confirmed)", platform.value)
+                        else:
+                            logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Final responses rejected while this adapter was down
                         # are still owned by this live process, so startup
@@ -16404,6 +16509,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
+                    "active_deferred_agent_workers": getattr(
+                        self,
+                        "_active_deferred_agent_worker_count",
+                        lambda: 0,
+                    )(),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -16430,6 +16540,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _watchdog_done.set()
 
         async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+            # Shutdown-path tests and third-party runner doubles may only
+            # implement the older drain-count surface.
+            _deferred_worker_count = getattr(
+                self,
+                "_active_deferred_agent_worker_count",
+                lambda: 0,
+            )
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -16495,6 +16612,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _deferred_at_start = _deferred_worker_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -16529,7 +16647,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "deferred_at_start=%d, deferred_now=%d)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -16539,6 +16658,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _deferred_at_start,
+                _deferred_worker_count(),
             )
 
             if not timed_out:
@@ -16558,12 +16679,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), and "
+                    "%d deferred agent worker(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _deferred_worker_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -16618,7 +16741,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # to stop gets its tool subprocesses killed below before it can
                 # unwind — the exact amputation this interrupt exists to avoid.
                 while (
-                    self._running_agents or self._active_api_run_count()
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
                 ) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
@@ -16633,7 +16758,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # at settle-loop exit, re-signal so a late-materializing
                 # agent gets a cooperative interrupt instead of going
                 # straight to the tool-subprocess kill.
-                if self._running_agents or self._active_api_run_count():
+                if (
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
+                ):
                     self._interrupt_running_agents(
                         _INTERRUPT_REASON_GATEWAY_RESTART
                         if self._restart_requested
@@ -24594,8 +24723,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # init on the loop thread before the first read.
                 await self._warm_goals_session_db("loop wakeup")
 
+                # Every SessionDB call in this scan runs off the loop thread.
+                # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) that
+                # take the writer lock; a slow writer elsewhere (FTS merge, WAL
+                # checkpoint, a long flush) holding it while the watcher blocked
+                # the loop on the same lock froze the gateway for 90+ s until
+                # the liveness watchdog force-exited. list_active_loops() reads
+                # via _read_ctx (lock-free under WAL) but still convoys on the
+                # writer lock when WAL is unavailable, so it goes off-loop too.
+                # _run_in_executor_with_context keeps the profile HERMES_HOME
+                # override alive under multiplex, like the warm-up above.
+                active_loops = await self._run_in_executor_with_context(list_active_loops)
+
                 now = time.time()
-                for sid, state in list_active_loops():
+                for sid, state in active_loops:
                     if state.awaiting_response or now < state.next_due_at:
                         continue
                     route = state.route or {}
@@ -24643,7 +24784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     mgr = LoopManager(session_id=sid)
                     if not mgr.is_due(now):
                         continue
-                    wakeup = mgr.fire_tick()
+                    wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
                     if not wakeup:
                         continue
                     try:
@@ -24663,7 +24804,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await self._run_in_executor_with_context(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:
@@ -27327,17 +27468,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not error:
             return
 
-        from hermes_state import classify_persistence_error, format_session_db_unavailable
+        from hermes_state import (
+            _default_db_path,
+            classify_persistence_error,
+            format_session_db_unavailable,
+        )
 
         cause = classify_persistence_error(error)
         hint = format_session_db_unavailable()
         if cause == "corrupt":
+            # Copy-pasteable, so name the real store (profiles / HERMES_HOME
+            # do not live under ~/.hermes).
+            db_path = _default_db_path()
             message = (
                 "⚠️ Session database corruption detected. Messages may not be "
                 "persisted. Recovery options:\n"
                 "1. Run `hermes doctor --fix`\n"
-                "2. Salvage with: sqlite3 ~/.hermes/state.db \".recover\" "
-                "(then replace state.db)\n"
+                "2. Stop the gateway, then recover with:\n"
+                f"   hermes sessions recover --source {db_path} "
+                "--inspect-only\n"
+                "   (if it reports recoverable) hermes sessions recover "
+                f"--source {db_path} --output recovered-state.db\n"
+                "   — recovery snapshots the damaged file first; do NOT run "
+                "`sqlite3 ... \".recover\"` against the live state.db, a "
+                "vulnerable sqlite3 CLI can corrupt it further\n"
                 "3. Restore from a backup in ~/.hermes/backups/\n"
                 "Run `hermes doctor` for sanitized diagnostics."
             )
@@ -33114,7 +33268,42 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
+def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
+    """Drain each profile's worker queue through its matching live adapters."""
+    from cron import scheduler as cron_scheduler
+
+    if runner is None:
+        if adapters is not None:
+            cron_scheduler.drain_delivery_queue(adapters, loop)
+        return
+    for profile_name, profile_home in _handoff_watch_scopes(runner):
+        scoped_home = profile_home or get_hermes_home()
+        if profile_name is None:
+            profile_adapters = adapters
+        else:
+            profile_adapters = getattr(runner, "_profile_adapters", {}).get(
+                profile_name
+            )
+        if profile_adapters is None:
+            continue
+        with _profile_runtime_scope(scoped_home):
+            if profile_name is not None and not profile_adapters and adapters:
+                routes = cron_scheduler._primary_profile_routes_for_current_home()
+                if routes:
+                    profile_adapters = cron_scheduler.SharedRouteAdapters(
+                        adapters, routes
+                    )
+            cron_scheduler.drain_delivery_queue(profile_adapters, loop)
+
+
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    cron_provider=None,
+    runner=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -33168,6 +33357,16 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        # Restart-safe cron workers run outside the gateway cgroup and queue
+        # their final send for whichever gateway instance is live.  Drain on
+        # the gateway-wide housekeeper rather than the built-in scheduler tick:
+        # external providers do not run that ticker.
+        if adapters is not None or runner is not None:
+            try:
+                _drain_restart_safe_cron_deliveries(adapters, loop, runner)
+            except Exception as exc:
+                logger.debug("Cron durable delivery queue drain error: %s", exc)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -34350,6 +34549,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "adapters": runner.adapters,
             "loop": asyncio.get_running_loop(),
             "cron_provider": cron_provider,
+            "runner": runner,
         },
         daemon=True,
         name="gateway-housekeeping",
