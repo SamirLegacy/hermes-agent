@@ -2284,6 +2284,36 @@ class TestServerFailureGrowthCapLastResort:
         assert result == msgs  # still aborting — usage nowhere near the limit
         assert c._last_summary_server_fallback_last_resort is False
 
+    def test_unresolved_window_does_not_veto_last_resort(self, caplog):
+        """R3/6: an unresolved context window must not disable the growth
+        cap — with the window unknown and >=3 consecutive server-failure
+        aborts, the streak falls back to the metadata default window (or
+        decides alone) instead of vetoing the last resort forever."""
+        import logging as _logging
+
+        c = self._compressor()
+        # Force the unresolved-window branch: resolution returns nothing.
+        c._resolved_context_length = None
+        c._resolve_context_length = lambda: 0
+        c._consecutive_server_failure_aborts = 3
+        with caplog.at_level(_logging.WARNING, logger="agent.context_compressor"):
+            due = c._server_failure_last_resort_due(current_tokens=240_000)
+        assert due is True, (
+            "unresolved window + 3 aborts must commit the last resort"
+        )
+        assert any(
+            "context window unresolved" in r.getMessage() for r in caplog.records
+        )
+
+    def test_unresolved_window_below_default_cap_still_aborts(self):
+        """The default-window fallback still respects the 90% cap: far below
+        it, the growth cap does not fire on the streak alone."""
+        c = self._compressor()
+        c._resolved_context_length = None
+        c._resolve_context_length = lambda: 0
+        c._consecutive_server_failure_aborts = 3
+        assert c._server_failure_last_resort_due(current_tokens=10_000) is False
+
     def test_success_resets_streak(self):
         c = self._compressor()
         err = _StubProviderError(

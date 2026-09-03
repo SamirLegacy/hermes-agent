@@ -3201,9 +3201,33 @@ class ContextCompressor(ContextEngine):
         window = self._resolved_context_length
         if window is None:
             window = self._resolve_context_length()
-        if not window:
-            return False
         real_usage = self.last_real_prompt_tokens or current_tokens or 0
+        if not window:
+            # Unresolved window: growth cannot be measured against a cap, but
+            # the summarizer-down failure class must not stay unbounded either
+            # — the streak alone is sufficient for the last resort. Fall back
+            # to the metadata default the rest of the compressor uses for its
+            # threshold math (CONTEXT_PROBE_TIERS[0]); if even that is
+            # unavailable, >=3 consecutive aborts decide.
+            try:
+                from agent.model_metadata import CONTEXT_PROBE_TIERS
+
+                default_window = int(CONTEXT_PROBE_TIERS[0])
+            except Exception:
+                default_window = 0
+            if default_window > 0:
+                logger.warning(
+                    "Server-failure last resort: context window unresolved; "
+                    "using default %d for the growth cap",
+                    default_window,
+                )
+                return real_usage > 0.9 * default_window
+            logger.warning(
+                "Server-failure last resort: context window and default both "
+                "unavailable; %d consecutive aborts decide",
+                getattr(self, "_consecutive_server_failure_aborts", 0),
+            )
+            return True
         return real_usage > 0.9 * window
 
     def update_model(
