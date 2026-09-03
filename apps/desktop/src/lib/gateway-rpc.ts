@@ -52,7 +52,9 @@ export function sessionOwnerRefusalOf(error: unknown): SessionOwnerRefusal | nul
   const code = (error as { code?: unknown })?.code
   const data = (error as { data?: unknown })?.data
 
-  if (code !== 4090 || typeof data !== 'object' || data === null) {
+  // The code may arrive as number OR string after JSON round-trips.
+  const codeMatches = code === 4090 || code === '4090'
+  if (!codeMatches || typeof data !== 'object' || data === null) {
     return null
   }
 
@@ -72,7 +74,19 @@ export function sessionOwnerRefusalOf(error: unknown): SessionOwnerRefusal | nul
  *  attempt-0 cadence because ws-open resets the backoff attempt — the measured 200ms
  *  storm). The reason travels as typed data, not prose; never match the message text. */
 export function isSessionNotOwnedError(error: unknown): boolean {
-  return sessionOwnerRefusalOf(error) !== null
+  // The transport wraps RPC errors inconsistently: the code rides the top
+  // level or a nested `.error`, and may arrive as number OR string after
+  // JSON round-trips through logs/bridges. Read every shape before giving up.
+  const candidates = [
+    error,
+    (error as { error?: unknown })?.error,
+  ]
+  for (const candidate of candidates) {
+    if (sessionOwnerRefusalOf(candidate) !== null) {
+      return true
+    }
+  }
+  return false
 }
 
 /** One-line human summary of a SESSION_NOT_OWNED refusal, from its holder facts. */
