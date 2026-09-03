@@ -25,9 +25,11 @@ STEP 2 - Push + PR exactly as printed by `all` (title "sync: merge upstream/main
   sync PR is already open, adopt it instead of stacking a second one.
 
 STEP 3 - bash /Users/sd/.hermes/hermes-agent/scripts/fork-sync.sh deploy
-  (owner-gated; restarts gateways + app detached) and then
+  (owner-gated; restarts gateways + app detached). swap+relaunch of the desktop
+  app bundle additionally need FORK_SYNC_ALLOW_APP_SWAP=1 — set it only after
+  Samir's explicit GO; without it deploy packs the bundle and skips the swap.
+  and then
   bash /Users/sd/.hermes/hermes-agent/scripts/fork-sync.sh probe
-  rc 22 on deploy = bundle-swap script still missing: report the TODO, do not invent.
   ANY FAIL line in probe output: STOP, report the failing checks verbatim, do not
   retry around them. All PASS -> report: commits synced, conflicts + resolutions,
   test pass counts, PR URL, deploy + probe receipts (the FORK-SYNC rc= lines).

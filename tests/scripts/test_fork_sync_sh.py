@@ -16,6 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "fork-sync.sh"
+BUNDLE_SCRIPT = REPO_ROOT / "scripts" / "fork-sync-bundle-swap.sh"
 
 
 def _git(repo: Path, *args: str, check=True):
@@ -263,3 +264,289 @@ def test_probe_fails_on_skills_drift(tmp_path):
     r = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
     assert r.returncode == 30, r.stdout + r.stderr
     assert "FAIL skills preservation" in r.stdout
+
+
+# ── bundle swap: pack / swap / relaunch (scripts/fork-sync-bundle-swap.sh)
+
+FAKE_PLIST = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<plist version="1.0">\n<dict>\n'
+    "\t<key>CFBundleShortVersionString</key>\n"
+    "\t<string>{version}</string>\n"
+    "</dict>\n</plist>\n"
+)
+
+
+def _fake_app(dir_path: Path, version: str, marker: str = "") -> Path:
+    """A minimal Hermes.app lookalike: Contents/Info.plist + a payload file."""
+    app = dir_path / "Hermes.app"
+    (app / "Contents").mkdir(parents=True, exist_ok=True)
+    (app / "Contents" / "Info.plist").write_text(FAKE_PLIST.format(version=version))
+    (app / "Contents" / "payload.txt").write_text(f"payload {marker or version}\n")
+    return app
+
+
+def _write_stub_npm(tmp_path: Path, app_version: str):
+    """PATH-stubbed npm: 'run pack' fabricates release/mac-arm64/Hermes.app
+    (cwd is apps/desktop), 'ci' is a no-op. Every invocation is logged."""
+    stub = tmp_path / "npm"
+    # printf interprets \\n/\\t in its FORMAT argument, so pass the plist as
+    # the format (it contains no % chars) to get real newlines/tabs on disk.
+    plist_printf = (
+        FAKE_PLIST.format(version=app_version)
+        .replace("'", "'\\''")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
+    lines = [
+        "#!/usr/bin/env bash",
+        'printf \'%s\\n\' "$*" >> "$FORK_SYNC_NPM_LOG"',
+        'case "$*" in',
+        '  *"run pack"*)',
+        "    mkdir -p release/mac-arm64/Hermes.app/Contents",
+        f"    printf '{plist_printf}' > release/mac-arm64/Hermes.app/Contents/Info.plist",
+        "    exit 0;;",
+        "  *) exit 0;;",
+        "esac",
+    ]
+    stub.write_text("\n".join(lines) + "\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    return stub
+
+
+def _write_stub_uv(tmp_path: Path):
+    """PATH-stubbed uv: 'sync' fabricates a venv/bin/python that exits 0
+    (cwd is the repo root); every other invocation is a no-op success."""
+    stub = tmp_path / "uv"
+    lines = [
+        "#!/usr/bin/env bash",
+        'case "$*" in',
+        '  *"sync"*)',
+        '    mkdir -p "${UV_PROJECT_ENVIRONMENT:-venv}/bin"',
+        '    printf \'#!/bin/sh\\nexit 0\\n\' > "${UV_PROJECT_ENVIRONMENT:-venv}/bin/python"',
+        '    chmod +x "${UV_PROJECT_ENVIRONMENT:-venv}/bin/python"',
+        "    exit 0;;",
+        "  *) exit 0;;",
+        "esac",
+    ]
+    stub.write_text("\n".join(lines) + "\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    return stub
+
+
+def _make_repo_fixture(tmp_path: Path, pkg_version: str = "0.17.0"):
+    """A minimal repo with apps/desktop/{package.json,package-lock.json}."""
+    repo = tmp_path / "repo"
+    desk = repo / "apps" / "desktop"
+    desk.mkdir(parents=True)
+    (desk / "package.json").write_text(
+        '{\n  "name": "@hermes/desktop",\n  "version": "%s"\n}\n' % pkg_version
+    )
+    (desk / "package-lock.json").write_text(
+        '{"name": "@hermes/desktop", "lockfileVersion": 3, "version": "%s"}\n' % pkg_version
+    )
+    return repo, desk
+
+
+def _run_bundle_swap(tmp_path: Path, *args: str, extra_env: dict[str, str] | None = None):
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env["FORK_SYNC_REPO_ROOT"] = str(tmp_path / "repo")
+    env["FORK_SYNC_APP_TARGET"] = str(tmp_path / "applications" / "Hermes.app")
+    env["FORK_SYNC_BACKUP_DIR"] = str(tmp_path / "backups")
+    env.pop("FORK_SYNC_ALLOW_APP_SWAP", None)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(BUNDLE_SCRIPT), *args],
+        capture_output=True, text=True, timeout=60, env=env,
+        cwd=str(tmp_path),
+    )
+
+
+def test_bundle_pack_ok_with_stubbed_npm(tmp_path):
+    repo, desk = _make_repo_fixture(tmp_path)
+    _write_stub_npm(tmp_path, "0.17.0")
+    npm_log = tmp_path / "npm.log"
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_NPM_LOG": str(npm_log),
+    }
+    r = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "FORK-SYNC bundle pack rc=0" in r.stdout
+    assert "0.17.0" in r.stdout
+    # npm ci ran (no node_modules before), then pack — both logged.
+    assert npm_log.read_text().splitlines() == ["ci", "run pack"]
+    assert (desk / "node_modules" / ".fork-sync-lock-hash").exists()
+    assert (desk / "release" / "mac-arm64" / "Hermes.app" / "Contents" / "Info.plist").exists()
+
+
+def test_bundle_pack_skips_npm_ci_when_lock_unchanged(tmp_path):
+    repo, desk = _make_repo_fixture(tmp_path)
+    _write_stub_npm(tmp_path, "0.17.0")
+    npm_log = tmp_path / "npm.log"
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_NPM_LOG": str(npm_log),
+    }
+    r1 = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    count_after_first = len(npm_log.read_text().splitlines())
+    r2 = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "npm ci skipped" in r2.stdout
+    # Second pack ran npm exactly once more (the pack), no second ci.
+    assert len(npm_log.read_text().splitlines()) == count_after_first + 1
+
+
+def test_bundle_pack_version_mismatch_fails(tmp_path):
+    repo, desk = _make_repo_fixture(tmp_path, pkg_version="9.9.9")
+    _write_stub_npm(tmp_path, "0.17.0")   # packs 0.17.0; package.json says 9.9.9
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_NPM_LOG": str(tmp_path / "npm.log"),
+    }
+    r = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert r.returncode == 24, r.stdout + r.stderr
+    assert "version mismatch" in r.stdout
+    assert "FORK-SYNC bundle pack rc=24" in r.stdout
+
+
+def _make_swap_fixture(tmp_path: Path, backups_pre: "list[str] | tuple[str, ...]" = ()):
+    """release app 9.9.9 + installed app 0.16.0 + optional pre-existing backups."""
+    repo, desk = _make_repo_fixture(tmp_path)
+    release = _fake_app(desk / "release" / "mac-arm64", "9.9.9", marker="release")
+    target_dir = tmp_path / "applications"
+    _fake_app(target_dir, "0.16.0", marker="installed")
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    for stamp in backups_pre:
+        bak = backups / f"Hermes.app.bak-{stamp}"
+        (bak / "Contents").mkdir(parents=True)
+        (bak / "Contents" / "payload.txt").write_text(f"old backup {stamp}\n")
+    return release, target_dir / "Hermes.app", backups
+
+
+def test_bundle_swap_ok_backup_created_and_version_printed(tmp_path):
+    release, target, backups = _make_swap_fixture(tmp_path)
+    r = _run_bundle_swap(tmp_path, "swap", extra_env={"FORK_SYNC_ALLOW_APP_SWAP": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "FORK-SYNC bundle swap rc=0" in r.stdout
+    assert "0.16.0 -> 9.9.9" in r.stdout
+    # The installed app is now the release payload; the old one is backed up.
+    assert (target / "Contents" / "payload.txt").read_text() == "payload release\n"
+    baks = sorted(p.name for p in backups.iterdir() if p.name.startswith("Hermes.app.bak-"))
+    assert len(baks) == 1, baks
+    assert (backups / baks[0] / "Contents" / "payload.txt").read_text() == "payload installed\n"
+
+
+def test_bundle_swap_retention_keeps_two_newest(tmp_path):
+    _, target, backups = _make_swap_fixture(
+        tmp_path,
+        backups_pre=["20260101-000000", "20260102-000000", "20260103-000000"],
+    )
+    r = _run_bundle_swap(tmp_path, "swap", extra_env={"FORK_SYNC_ALLOW_APP_SWAP": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    baks = sorted(p.name for p in backups.iterdir() if p.name.startswith("Hermes.app.bak-"))
+    # 3 pre-existing + 1 new = 4; retention keeps the 2 newest: the new one
+    # (today's stamp) and 20260103. The two oldest fakes are gone.
+    assert len(baks) == 2, baks
+    assert "Hermes.app.bak-20260103-000000" in baks
+    assert not (backups / "Hermes.app.bak-20260101-000000").exists()
+    assert not (backups / "Hermes.app.bak-20260102-000000").exists()
+
+
+def test_bundle_swap_refused_without_gate_nothing_touched(tmp_path):
+    release, target, backups = _make_swap_fixture(tmp_path)
+    r = _run_bundle_swap(tmp_path, "swap")
+    assert r.returncode == 23, r.stdout + r.stderr
+    assert "FORK_SYNC_ALLOW_APP_SWAP" in r.stdout
+    assert "FORK-SYNC bundle swap rc=23" in r.stdout
+    # Nothing touched: installed payload unchanged, no backup created.
+    assert (target / "Contents" / "payload.txt").read_text() == "payload installed\n"
+    assert not [p for p in backups.iterdir() if p.name.startswith("Hermes.app.bak-")]
+
+
+def test_bundle_relaunch_refused_without_gate(tmp_path):
+    r = _run_bundle_swap(tmp_path, "relaunch")
+    assert r.returncode == 23, r.stdout + r.stderr
+    assert "FORK-SYNC bundle relaunch rc=23" in r.stdout
+
+
+# ── deploy: no more exit-22 TODO; pack wired; swap+relaunch gated ────────
+
+def _make_deploy_fixture(tmp_path: Path):
+    """Sync fixture + stub hermes/uv + a recording bundle-swap stub + a no-op
+    restart payload in the fixture main checkout (never the real machine)."""
+    main_checkout, origin, upstream = _make_sync_fixture(tmp_path)
+    _write_stub_hermes(tmp_path, {})
+    _write_stub_uv(tmp_path)
+    skills = tmp_path / "skills.txt"
+    skills.write_text("a\n")
+    (tmp_path / "skills-before.txt").write_text("a\n")
+
+    swap_stub = tmp_path / "swap-stub.sh"
+    swap_stub.write_text('#!/usr/bin/env bash\necho "SWAP-STUB $*"\nexit 0\n')
+    swap_stub.chmod(swap_stub.stat().st_mode | stat.S_IXUSR)
+
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_STUB_SKILLS": str(skills),
+        "FORK_SYNC_BUNDLE_SWAP_SCRIPT": str(swap_stub),
+    }
+    return main_checkout, env
+
+
+def test_deploy_no_longer_exits_22_and_packs_bundle(tmp_path):
+    main_checkout, env = _make_deploy_fixture(tmp_path)
+    r = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "TODO" not in r.stdout
+    # deploy calls the bundle-swap script's pack subcommand …
+    assert "SWAP-STUB pack" in r.stdout
+    # … and skips swap+relaunch without the gate env.
+    assert "bundle swap+relaunch skipped" in r.stdout
+    assert "FORK-SYNC deploy rc=0" in r.stdout
+
+
+def test_deploy_packs_after_the_ff_pull(tmp_path):
+    """pack must run with the checkout already at the new commit: local main
+    is one behind origin/main, deploy's ff-pull does real work, and the pack
+    stub records the HEAD it saw — it must be the post-pull commit."""
+    main_checkout, origin, upstream = _make_sync_fixture(tmp_path)
+    _push_upstream_change(upstream, tmp_path, "upstream_deploy.py", "Z = 3\n")
+    # Simulate the merged PR: origin/main advances, local main stays behind.
+    _git(main_checkout, "fetch", "-q", "upstream")
+    _git(main_checkout, "merge", "-q", "--ff-only", "upstream/main")
+    _git(main_checkout, "push", "-q", "origin", "main")
+    _git(main_checkout, "reset", "-q", "--hard", "HEAD~1")
+    assert not (main_checkout / "upstream_deploy.py").exists()  # really behind
+
+    _write_stub_hermes(tmp_path, {})
+    _write_stub_uv(tmp_path)
+    skills = tmp_path / "skills.txt"
+    skills.write_text("a\n")
+    (tmp_path / "skills-before.txt").write_text("a\n")
+    swap_stub = tmp_path / "swap-stub.sh"
+    swap_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "SWAP-STUB $* (HEAD=$(git -C "$FORK_SYNC_STUB_MAIN" rev-parse --short HEAD))"\n'
+        "exit 0\n"
+    )
+    swap_stub.chmod(swap_stub.stat().st_mode | stat.S_IXUSR)
+
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_STUB_SKILLS": str(skills),
+        "FORK_SYNC_BUNDLE_SWAP_SCRIPT": str(swap_stub),
+        "FORK_SYNC_STUB_MAIN": str(main_checkout),
+    }
+    r = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    new_head = _git(main_checkout, "rev-parse", "--short", "HEAD").stdout.strip()
+    assert f"SWAP-STUB pack (HEAD={new_head})" in r.stdout, (
+        "pack must see the main checkout at the post-pull commit"
+    )
+    # The upstream file only exists after the ff-pull — proof the pull ran.
+    assert (main_checkout / "upstream_deploy.py").read_text() == "Z = 3\n"

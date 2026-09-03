@@ -4,8 +4,8 @@
 # Subcommands: check | merge | verify | deploy | probe | all
 # Exit codes:  0 ok / nothing to do        2 usage or environment error
 #             10 work available           20 merge conflicts need manual resolution
-#             21 main checkout dirty      22 deploy blocked on missing bundle-swap script
-#             23 import guard failed      24 targeted tests failed
+#             21 main checkout dirty      23 import guard failed
+#             24 targeted tests failed
 #             30 probe FAIL
 #
 # Every exit prints one receipt line: FORK-SYNC <sub> rc=<n> <summary>
@@ -184,22 +184,10 @@ cmd_deploy() {
   hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_SNAPSHOT" \
     || { SUMMARY="pre-deploy skills snapshot failed"; return 30; }
 
-  if [ ! -x "$BUNDLE_SWAP_SCRIPT" ]; then
-    cat <<TODO_BUNDLE
-TODO(bundle-swap): $BUNDLE_SWAP_SCRIPT does not exist.
-The current cron job's STEP 8 contains NO npm-pack/bundle-swap procedure (it
-ff-pulls, syncs the runtime venv, runs the MCP guard, and detached-restarts)
-and references no swap script. Per lane instruction this subcommand refuses to
-invent one. Provide the proven swap procedure (pack, backup with max-2
-retention under the backups dir, detached swap) as an executable at the path
-above to unblock deploy; everything after this barrier is already wired.
-TODO_BUNDLE
-    SUMMARY="blocked on missing bundle-swap script: $BUNDLE_SWAP_SCRIPT (see TODO)"
-    return 22
-  fi
-
-  SUMMARY="bundle swap via $BUNDLE_SWAP_SCRIPT"
-  "$BUNDLE_SWAP_SCRIPT"
+  [ -x "$BUNDLE_SWAP_SCRIPT" ] || {
+    SUMMARY="bundle-swap script missing or not executable: $BUNDLE_SWAP_SCRIPT"
+    return 2
+  }
 
   SUMMARY="ff-pull main checkout"
   git -C "$MAIN_CHECKOUT" fetch origin --quiet
@@ -215,12 +203,33 @@ TODO_BUNDLE
       || { SUMMARY="import guard FAILED even after additive restore"; return 23; }
   }
 
+  # Pack the desktop bundle AFTER the checkout is at the new commit and the
+  # runtime venv is synced — the bundle must be built from the code that just
+  # became the runtime. pack only writes into the repo checkout (node_modules
+  # + release/), so it needs no gate.
+  SUMMARY="desktop bundle pack via $BUNDLE_SWAP_SCRIPT pack"
+  "$BUNDLE_SWAP_SCRIPT" pack
+
+  # Gated bundle swap + relaunch: these touch the Owner's running app, so the
+  # bundle-swap script refuses them unless FORK_SYNC_ALLOW_APP_SWAP=1 (set by
+  # the orchestrator after the Owner's GO). Without the gate deploy still
+  # completes the runtime side; the packed bundle stays in release/ for a
+  # later manual swap.
+  if [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ]; then
+    SUMMARY="desktop bundle swap (gated)"
+    "$BUNDLE_SWAP_SCRIPT" swap
+    SUMMARY="desktop bundle relaunch (gated)"
+    "$BUNDLE_SWAP_SCRIPT" relaunch
+  else
+    printf '%s\n' "bundle swap+relaunch skipped: FORK_SYNC_ALLOW_APP_SWAP != 1 (packed bundle waits in $MAIN_CHECKOUT/apps/desktop/release/mac-arm64/Hermes.app)"
+  fi
+
   # Detached restart, from the cron job's STEP 8 — kept in its own file so the
   # gateway-restart guard can scan this script without matching the payload.
   # Scheduled detached; the 90s lead in fork-sync-restart.sh lets the report
   # land before the caller's own host process is restarted.
   nohup /bin/bash "$MAIN_CHECKOUT/scripts/fork-sync-restart.sh" >/tmp/hermes-deploy-restart.log 2>&1 &
-  SUMMARY="deployed; detached restart scheduled (+90s); run 'probe' after it settles"
+  SUMMARY="deployed; bundle packed; swap+relaunch $( [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ] && echo done || echo skipped '(FORK_SYNC_ALLOW_APP_SWAP != 1)') ; detached restart scheduled (+90s); run 'probe' after it settles"
 }
 
 # ---------------------------------------------------------------------------

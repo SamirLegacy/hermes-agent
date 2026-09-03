@@ -20,10 +20,12 @@ cron job only calls the script and resolves real merge conflicts by hand.
   `.py` file under `hermes_cli/`, `agent/`, `tools/`, `gateway/`,
   `tui_gateway/` is mapped to `tests/` by name (the mapping is printed) and
   run with `HERMES_TEST_WORKERS=6 nice -n 15` via `scripts/run_tests.sh`.
-- `deploy` — bundle swap, then the single allowed write in the main checkout
-  (`git pull --ff-only`), then the same canonical sync against the runtime
-  venv, then the detached restart (`scripts/fork-sync-restart.sh`, verbatim
-  from the old cron job's STEP 8). Owner-gated.
+- `deploy` — ff-pull (the single allowed write in the main checkout), the
+  canonical sync against the runtime venv, then `fork-sync-bundle-swap.sh
+  pack` (see "Desktop bundle" below), then — only when
+  `FORK_SYNC_ALLOW_APP_SWAP=1` — `swap` + `relaunch`, then the detached
+  restart (`scripts/fork-sync-restart.sh`, verbatim from the old cron job's
+  STEP 8). Owner-gated.
 - `probe` — mandatory post-deploy checks, each printed `PASS`/`FAIL` with the
   command: `mcp test heygen`, `hooks doctor`, a one-shot chat smoke
   (`chat -q "reply OK" --oneshot`; no `--no-tools` flag exists — `--oneshot`
@@ -52,6 +54,44 @@ in the worktree for pytest and already carries the same pins, so the guard
 holds in both venvs. `deploy` additionally falls back to the additive
 `uv pip install 'mcp==2.0.0' 'httpx2==2.7.0'` restore if the import guard
 still fails in the runtime venv.
+
+## Desktop bundle
+
+`deploy` packs and (when gated in) swaps the Electron UI bundle via
+`scripts/fork-sync-bundle-swap.sh`, subcommands `pack | swap | relaunch | all`
+(standalone-usable for a manual UI-only swap). The gateway runs from the venv
+checkout, so the bundle only matters for the Electron UI.
+
+- **What** — `pack`: `npm ci` in `apps/desktop` only when
+  `package-lock.json` changed (hash state kept in
+  `node_modules/.fork-sync-lock-hash`), then `nice -n 15 npm run pack`
+  (`electron-builder --dir`), then asserts that
+  `release/mac-arm64/Hermes.app/Contents/Info.plist`
+  `CFBundleShortVersionString` equals the `version` in
+  `apps/desktop/package.json` (0.17.0 — cosmetic, intentionally not bumped
+  per fork convention). `swap`: transactional replace of
+  `/Applications/Hermes.app` mirroring upstream
+  `scripts/desktop-update/posix.sh` `mac_swap` (stage a `.new` copy, back the
+  old bundle up, move it aside, move the copy in, roll back on failure) with
+  backup to
+  `/Users/sd/Workspace/backups/hermes-app/Hermes.app.bak-<YYYYmmdd-HHMMSS>`
+  and retention 2 (older backups deleted in the same run — Owner rule: the
+  backups dir never grows unbounded, and /Applications is never a backup
+  target). `relaunch`: quit the running Hermes.app (osascript), then `open` —
+  mirroring `fork-sync-restart.sh`.
+- **Why** — the runtime venv is synced by the canonical `uv sync`, but the
+  UI bundle would drift from the runtime without this step (a packed
+  2026-08-31 build sat unswapped in `release/mac-arm64/` exactly because no
+  script owned the swap).
+- **Gate** — `pack` needs no gate (writes only inside the repo checkout).
+  `swap` and `relaunch` touch the Owner's running app and refuse to run
+  (rc 23) unless `FORK_SYNC_ALLOW_APP_SWAP=1`; the orchestrator sets that
+  only after the Owner's GO. `deploy` therefore always packs, and swaps
+  only under the gate.
+- **Retention** — `FORK_SYNC_BACKUP_KEEP` (default 2) newest backups remain
+  after each swap; paths are overridable via `FORK_SYNC_APP_TARGET` /
+  `FORK_SYNC_BACKUP_DIR` (used by the tests so they never touch the real
+  `/Applications` or backups dir).
 
 ## Conflict rules
 
@@ -103,13 +143,3 @@ Yes — verified, they are unreachable by a dependency sync or bundle swap:
   guard + test mapping in the lane worktree) — identical output, diff empty.
   `probe` enforces this going forward: `deploy` snapshots the skills list
   before mutating anything and `probe` hard-fails on any diff.
-
-## Deploy prerequisite (deliberately gated)
-
-`deploy` requires an executable `scripts/fork-sync-bundle-swap.sh` in the main
-checkout. It does not exist: the old cron job's STEP 8 contains no
-npm-pack/bundle-swap procedure (it only ff-pulls, syncs the runtime venv,
-guards MCP, and restarts), and this lane refuses to invent one. `deploy`
-exits 22 with a TODO until that script is provided; the ff-pull, canonical
-runtime-venv sync, import guard, and detached restart are already wired
-behind the barrier.
