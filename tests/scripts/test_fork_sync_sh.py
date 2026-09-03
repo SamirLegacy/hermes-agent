@@ -635,7 +635,7 @@ def test_deploy_schedules_restart_only_under_app_swap_gate(tmp_path):
     assert "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1" in r.stdout
     assert "fork-sync-restart.sh" not in r.stdout.replace(
         "detached restart skipped: FORK_SYNC_ALLOW_APP_SWAP != 1", ""
-    ) or True  # stdout must not show a restart SCHEDULED line without the gate
+    )  # stdout must not show a restart SCHEDULED line without the gate
     assert "detached restart scheduled" not in r.stdout
     assert "detached restart skipped" in r.stdout
 

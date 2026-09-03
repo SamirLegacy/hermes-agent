@@ -2171,6 +2171,7 @@ class TestServerErrorTextClassification:
             "Error code: 500 - Internal Server Error",
             "Error code: 503 - Service Unavailable",
             "upstream returned HTTP 502 Bad Gateway",
+            "HTTP/1.1 502 Bad Gateway",
             "Internal server error",
         ],
     )

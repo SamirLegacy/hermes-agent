@@ -5615,7 +5615,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             _is_server_error_5xx = (
                 (isinstance(_status, int) and 500 <= _status < 600)
                 or re.search(r"error code:\s*5\d\d", _err_str) is not None
-                or re.search(r"http\s+5\d\d", _err_str) is not None
+                # http\S*\s*5\d\d covers "HTTP 502", "HTTP/1.1 500", and
+                # "http 503" — the status-line form carries the code after
+                # the protocol token, with or without the version.
+                or re.search(r"http\S*\s*5\d\d", _err_str) is not None
                 or "internal server error" in _err_str
             )
             _is_model_not_found = (
