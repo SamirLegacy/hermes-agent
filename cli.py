@@ -5910,7 +5910,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass
         return True
 
-    def _reanchor_active_session_lease(self) -> None:
+    def _reanchor_active_session_lease(self) -> bool:
         """Move the CLI's active-session lease onto the live session id after a compression rekey.
 
         Mid-turn and manual /compress rotate self.session_id onto the continuation
@@ -5920,13 +5920,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         gateway's _transfer_active_session_slot, including reserve-before-release:
         if the in-place transfer fails, reserve the new slot BEFORE releasing the old
         one so this session is never left without any lease.
+
+        FAIL CLOSED: when neither the transfer nor the re-acquire yields a lease
+        on the NEW id, the turn must not continue unprotected — returns False
+        after surfacing the failure (see _lease_reanchor_failed_closed). True
+        means the live id is protected (or no re-anchor was needed).
         """
         lease = getattr(self, "_active_session_lease", None)
         if lease is None:
-            return
+            return True
         new_id = str(self.session_id or "")
         if not new_id or new_id == str(lease.session_id or ""):
-            return
+            return True
         try:
             from hermes_cli.active_sessions import (
                 transfer_active_session,
@@ -5938,7 +5943,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 session_id=new_id,
                 metadata={"live_session_id": new_id},
             ):
-                return
+                return True
             new_lease, limit_message = try_acquire_active_session(
                 session_id=new_id,
                 surface=lease.surface,
@@ -5947,23 +5952,49 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
         except Exception as exc:
             logger.warning(
-                "Compression session lease did not re-anchor (kept old lease): %s",
-                exc,
+                "Compression session lease did not re-anchor (transfer/acquire raised)",
+                exc_info=True,
             )
-            return
+            return self._lease_reanchor_failed_closed(
+                new_id, f"lease transfer raised: {exc}"
+            )
         if new_lease is not None:
             try:
                 lease.release()
             except Exception:
                 logger.debug("Failed to release stale active session slot", exc_info=True)
             self._active_session_lease = new_lease
+            return True
+        logger.warning(
+            "Compression session lease did not re-anchor: new_session_id=%s reason=%s",
+            new_id,
+            limit_message,
+        )
+        return self._lease_reanchor_failed_closed(
+            new_id, str(limit_message or "unknown reason")
+        )
+
+    def _lease_reanchor_failed_closed(self, new_id: str, detail: str) -> bool:
+        """Surface an unprotected continuation session and stop the turn.
+
+        -q gets one stderr line (the sanctioned quiet-mode channel) plus the
+        ``_lease_reanchor_failed`` flag the caller maps to a non-zero exit;
+        interactive gets a red console line and ``_should_exit`` so the input
+        loop stops instead of chatting on without ownership protection.
+        """
+        message = (
+            "Session lease could not be moved to the continuation session "
+            f"{new_id} ({detail}). Turns on it are no longer ownership-protected, "
+            "so this surface stops here rather than risking a second writer. "
+            f"Re-attach with: hermes chat --resume {new_id}"
+        )
+        self._lease_reanchor_failed = True
+        if getattr(self, "_single_query_mode", False):
+            print(f"Error: {message}", file=sys.stderr)
         else:
-            logger.warning(
-                "Compression session lease did not re-anchor (kept old lease): "
-                "new_session_id=%s reason=%s",
-                new_id,
-                limit_message,
-            )
+            self._console_print(f"[bold red]{message}[/]")
+            self._should_exit = True
+        return False
 
     def _release_active_session(self) -> None:
         lease = getattr(self, "_active_session_lease", None)
@@ -22421,6 +22452,12 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                            # The continuation session needs the lease re-anchored
+                            # too — a failed re-anchor leaves it claimable by a
+                            # second surface, so -Q fails non-zero here instead
+                            # of exiting 0 with an unprotected session.
+                            if not cli._reanchor_active_session_lease():
+                                sys.exit(1)
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -22502,6 +22539,10 @@ def main(
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
+                # A mid-turn compression whose lease could not re-anchor must
+                # not exit 0: the continuation session would run unprotected.
+                if getattr(cli, "_lease_reanchor_failed", False):
+                    sys.exit(1)
                 cli._print_exit_summary(clear_screen=False)
         finally:
             _finalize_single_query(cli)

@@ -187,3 +187,111 @@ def test_cli_reanchors_lease_after_compression_rekey(tmp_path, monkeypatch):
     ]
     cli._release_active_session()
     assert active_session_registry_snapshot() == []
+
+
+def _make_reanchor_cli(tmp_path, monkeypatch, *, single_query: bool):
+    """CLI with a live lease on parent-session, session_id rotated to the child."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    cli = object.__new__(HermesCLI)
+    cli.session_id = "parent-session"
+    cli.config = {}
+    cli._active_session_lease = None
+    cli._active_session_takeover = False
+    cli._should_exit = False
+    cli._single_query_mode = single_query
+    cli._lease_reanchor_failed = False
+    printed: list[str] = []
+    cli._console_print = lambda text: printed.append(text)
+    assert cli._claim_active_session("cli") is True
+    cli.session_id = "child-session"
+    return cli, printed
+
+
+def test_reanchor_failure_fails_closed_interactive(tmp_path, monkeypatch, caplog):
+    """Neither transfer nor re-acquire yields a lease on the NEW id: do NOT
+    continue the turn silently — red console line and the interactive loop
+    stops (a second surface could otherwise claim the live continuation
+    mid-write)."""
+    import logging
+
+    cli, printed = _make_reanchor_cli(tmp_path, monkeypatch, single_query=False)
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.transfer_active_session",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.try_acquire_active_session",
+        lambda *a, **k: (None, "simulated capacity refusal"),
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="cli"):
+            ok = cli._reanchor_active_session_lease()
+        assert ok is False
+        assert len(printed) == 1
+        assert "child-session" in printed[0]
+        assert "simulated capacity refusal" in printed[0]
+        assert cli._should_exit is True
+        assert cli._lease_reanchor_failed is True
+        assert any(
+            record.levelno == logging.WARNING
+            and "did not re-anchor" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        cli._release_active_session()
+
+
+def test_reanchor_failure_prints_stderr_in_single_query(tmp_path, monkeypatch, capsys):
+    """-q: the failure goes to stderr (the sanctioned quiet-mode channel) and
+    flags the run for a non-zero exit."""
+    cli, printed = _make_reanchor_cli(tmp_path, monkeypatch, single_query=True)
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.transfer_active_session",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.try_acquire_active_session",
+        lambda *a, **k: (None, "simulated capacity refusal"),
+    )
+    try:
+        ok = cli._reanchor_active_session_lease()
+        assert ok is False
+        err = capsys.readouterr().err
+        assert "child-session" in err
+        assert "simulated capacity refusal" in err
+        assert printed == []  # nothing on the interactive console channel
+        assert cli._should_exit is False  # -q exits via the caller, not the loop
+        assert cli._lease_reanchor_failed is True
+    finally:
+        cli._release_active_session()
+
+
+def test_reanchor_exception_is_logged_with_exc_info_and_fails_closed(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    """No swallowed exceptions: a transfer that raises logs at WARNING with
+    exc_info and still fails the turn closed."""
+    import logging
+
+    cli, printed = _make_reanchor_cli(tmp_path, monkeypatch, single_query=True)
+
+    def _explode(*a, **k):
+        raise RuntimeError("registry lock broke")
+
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.transfer_active_session", _explode
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="cli"):
+            ok = cli._reanchor_active_session_lease()
+        assert ok is False
+        assert "registry lock broke" in capsys.readouterr().err
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "did not re-anchor" in r.getMessage()
+        ]
+        assert warning_records, caplog.records
+        assert warning_records[0].exc_info is not None
+    finally:
+        cli._release_active_session()
