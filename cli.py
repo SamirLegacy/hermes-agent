@@ -5895,8 +5895,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     metadata={"live_session_id": str(self.session_id)},
                 )
         except Exception as exc:
-            logger.warning("Failed to claim active session slot: %s", exc)
-            return True
+            logger.warning("Failed to claim active session slot", exc_info=True)
+            # Fail CLOSED: a claim that errored has NOT proven the session is
+            # unowned — proceeding would risk a silent second writer (the
+            # #94595 class). The caller treats False as "not owned" (run()
+            # returns; the -q entry exits 1).
+            return False
         if message:
             if stderr:
                 print(message, file=sys.stderr)
@@ -14351,7 +14355,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     and self.agent.session_id != self.session_id
                 ):
                     self.session_id = self.agent.session_id
-                    self._reanchor_active_session_lease()
+                    if not self._reanchor_active_session_lease():
+                        # Fail-closed path already surfaced the stop. The
+                        # compression boundary itself committed on the agent
+                        # side, so the deferred notification is emitted
+                        # (exactly-once) — but this surface does NOT own the
+                        # continuation id: no transcript flush, no further
+                        # handler steps on it.
+                        finalize_context_engine_compression_notification(
+                            self.agent,
+                            committed=True,
+                        )
+                        return
                     getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                     self._pending_title = None
                     # Manual /compress replaces conversation_history with a new
@@ -17705,7 +17720,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ):
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
-                self._reanchor_active_session_lease()
+                if not self._reanchor_active_session_lease():
+                    # Fail-closed path already surfaced the stop (interactive
+                    # red line + _should_exit; -q flags _lease_reanchor_failed
+                    # for the entry-point's non-zero exit). This surface does
+                    # not own the continuation id, so nothing further may
+                    # proceed on it this turn.
+                    return None
                 getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                 self._pending_title = None
 
