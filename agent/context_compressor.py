@@ -8261,9 +8261,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # provider-reported prompt tokens, else the caller's estimate) past
         # 90% of the resolved window, commit the deterministic static
         # fallback as a LAST RESORT — loudly — instead of aborting forever.
+        # getattr: this hoisted check also runs for compress() calls that
+        # succeed (summary present), including instances built without
+        # __init__ (see _make_compressor-style fixtures / #38788).
         _server_failure_abort = bool(
-            self._last_summary_server_failure
-            and not self.allow_static_fallback_on_server_error
+            getattr(self, "_last_summary_server_failure", False)
+            and not getattr(self, "allow_static_fallback_on_server_error", False)
         )
         if not summary and not feasibility_skip and _server_failure_abort:
             self._consecutive_server_failure_aborts = (
