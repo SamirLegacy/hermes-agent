@@ -97,6 +97,9 @@ def _push_upstream_change(upstream_bare: Path, tmp_path: Path, fname: str, conte
 def _run_fork_sync(tmp_path: Path, main_checkout: Path, *args: str, extra_env: dict[str, str] | None = None):
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    # Test isolation: a leak from the operator's shell (e.g. a background
+    # deploy run with the gate open) must never flip the swap gate mid-test.
+    env.pop("FORK_SYNC_ALLOW_APP_SWAP", None)
     env["FORK_SYNC_MAIN_CHECKOUT"] = str(main_checkout)
     env["FORK_SYNC_WORKTREE"] = str(tmp_path / "wt")
     env["FORK_SYNC_HERMES_PROFILE"] = "desktop-local"
