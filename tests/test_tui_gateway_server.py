@@ -22334,3 +22334,148 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+# ── Compression re-anchor fail-closed (R3b/RF4 item 1) ─────────────────────
+
+
+def _fake_approval_module(calls: list):
+    return types.SimpleNamespace(
+        disable_session_yolo=lambda *a, **k: calls.append("disable"),
+        enable_session_yolo=lambda *a, **k: calls.append("enable"),
+        is_session_yolo_enabled=lambda *a, **k: True,
+        register_gateway_notify=lambda *a, **k: calls.append("register"),
+        unregister_gateway_notify=lambda *a, **k: calls.append("unregister"),
+    )
+
+
+def test_sync_session_key_after_compress_fails_closed_when_reanchor_fails(monkeypatch):
+    """R3b/RF4: when the lease cannot move to the continuation id, the
+    surface must NOT rekey onto it — no yolo/notify transfer, session stays
+    anchored on the old key, the failure is surfaced to the client, and the
+    session is fenced (the desktop twin of the CLI's
+    _lease_reanchor_failed_closed). Otherwise the desktop keeps writing on an
+    id it does not own while a CLI --resume of it is admitted: the two-writer
+    class, tonight's incident inverted."""
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *a, **k: None)
+    approval_calls: list = []
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_queued_prompt_generation"] = 5
+    session["pending_title"] = "keep me"
+
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload or {}))
+    )
+
+    with patch.dict(sys.modules, {"tools.approval": _fake_approval_module(approval_calls)}):
+        server._sync_session_key_after_compress("sid", session)
+
+    # NOT rekeyed onto the unowned continuation id.
+    assert session["session_key"] == "parent-session"
+    # No yolo/notify state transferred onto the continuation.
+    assert approval_calls == []
+    # Belt still bumps: a raced drain claim must not dispatch on the
+    # unowned continuation (the compute-host drain branch skips the
+    # _run_prompt_submit ownership chokepoint).
+    assert session["_queued_prompt_generation"] == 6
+    # Fence armed with the operator-facing message.
+    fenced = session.get("_lease_reanchor_failed")
+    assert isinstance(fenced, str) and fenced
+    assert "child-session" in fenced
+    assert "hermes chat --resume child-session" in fenced
+    # Failure surfaced through the existing error event channel.
+    assert emitted and emitted[0][0] == "error" and emitted[0][1] == "sid"
+    assert "hermes chat --resume child-session" in emitted[0][2]["message"]
+    # Old-key anchored state untouched.
+    assert session["pending_title"] == "keep me"
+
+
+def test_sync_session_key_after_compress_reanchor_success_keeps_behavior(monkeypatch):
+    """Counterpart: a successful re-anchor keeps the existing behavior —
+    rekey plus yolo/notify transfer onto the continuation — and lifts any
+    stale fence (ownership re-proven)."""
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *a, **k: None)
+    approval_calls: list = []
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = "stale fence from an earlier failure"
+
+    with patch.dict(sys.modules, {"tools.approval": _fake_approval_module(approval_calls)}):
+        server._sync_session_key_after_compress("sid", session)
+
+    assert session["session_key"] == "child-session"
+    assert "_lease_reanchor_failed" not in session
+    # unregister(old) + is_yolo + enable(new)/disable(old) + register(new)
+    assert approval_calls == ["unregister", "enable", "disable", "register"]
+
+
+def test_prompt_submit_refused_after_failed_compress_reanchor(monkeypatch):
+    """The fence must refuse further prompts on the continuation id with the
+    ownership-refusal family (4090 / SESSION_NOT_OWNED) — no model turn, no
+    DB row — instead of running unprotected on an id this surface does not
+    own."""
+    from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
+
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = ActiveSessionRefusal(
+        "Session lease could not be moved to the continuation session "
+        "child-session (registry refused). Turns on it are no longer "
+        "ownership-protected, so this surface stops here rather than risking "
+        "a second writer. Re-attach with: hermes chat --resume child-session",
+        SESSION_NOT_OWNED,
+    )
+    server._sessions["fenced-sid"] = session
+    turn_calls: list = []
+    monkeypatch.setattr(
+        server, "_run_prompt_submit", lambda *a, **k: turn_calls.append(a)
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "r1",
+                "method": "prompt.submit",
+                "params": {"session_id": "fenced-sid", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("fenced-sid", None)
+
+    err = resp["error"]
+    assert err["code"] == 4090
+    assert err["data"]["reason"] == SESSION_NOT_OWNED
+    assert "hermes chat --resume child-session" in err["message"]
+    assert turn_calls == []
+    assert session.get("running") is False
+
+
+def test_drain_queued_prompt_does_not_dispatch_on_fenced_session(monkeypatch):
+    """The queued-prompt drain must respect the fence: the compute-host
+    branch dispatches without the _run_prompt_submit ownership chokepoint, so
+    a fenced session must not drain at all. The queue is left in place — it
+    dies with this dead-ended runtime session instead of being silently
+    destroyed."""
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = (
+        "fenced: hermes chat --resume child-session"
+    )
+    session["queued_prompt"] = {"text": "next", "transport": None}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _s: True)
+    submitted: list = []
+
+    def _fake_submit(*a, **k):
+        submitted.append(a)
+        return {"result": {"status": "streaming"}}
+
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", _fake_submit)
+
+    assert server._drain_queued_prompt("r", "sid", session) is False
+    assert submitted == []
+    assert session.get("running") is False
+    assert session["queued_prompt"] == {"text": "next", "transport": None}

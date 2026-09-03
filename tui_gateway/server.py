@@ -722,6 +722,15 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     contract _ensure_session_db_row already uses for the row itself, and keeps
     the invariant that anything holding a slot is something the user can see.
     """
+    fenced = session.get("_lease_reanchor_failed")
+    if fenced is not None:
+        # A compression rotation could not move this surface's lease onto the
+        # continuation id, so this runtime session is dead-ended by design
+        # (see _sync_session_key_after_compress). Holding the OLD lease is not
+        # permission to keep writing: the old key names an ENDED parent row.
+        # The stored value is an ActiveSessionRefusal, so callers emit it as a
+        # 4090 with machine-readable reason, same as any ownership refusal.
+        return fenced
     if session.get("active_session_lease") is not None:
         return None
     lease, limit_message = _claim_active_session_slot(
@@ -7448,6 +7457,39 @@ def _sync_session_key_after_compress(
             old_key,
             new_session_id,
         )
+        # Fail closed (desktop twin of the CLI's _lease_reanchor_failed_closed,
+        # cli.py): the continuation id is owned elsewhere or the registry
+        # refused, so this surface must not rekey onto it. Leave the session
+        # anchored on the old (ended) key, transfer no yolo/notify state, and
+        # fence further turns — the fence rides _ensure_active_session_slot,
+        # so prompt.submit / _run_prompt_submit / auto-continue all refuse
+        # with the ownership family instead of writing unprotected while a
+        # concurrent CLI --resume of the continuation is admitted.
+        from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
+
+        refusal = ActiveSessionRefusal(
+            "Session lease could not be moved to the continuation session "
+            f"{new_session_id} ({old_key} -> {new_session_id} refused). "
+            "Turns on it are no longer ownership-protected, so this surface "
+            "stops here rather than risking a second writer. Re-attach with: "
+            f"hermes chat --resume {new_session_id}",
+            SESSION_NOT_OWNED,
+        )
+        session["_lease_reanchor_failed"] = refusal
+        # Belt still bumps on the fail-closed path: the compute-host drain
+        # branch dispatches without the _run_prompt_submit ownership
+        # chokepoint, so a raced claim must not survive onto the fenced key.
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
+        _emit(
+            "error",
+            sid,
+            {"message": str(refusal), "reason": SESSION_NOT_OWNED},
+        )
+        return
+
+    session.pop("_lease_reanchor_failed", None)
 
     try:
         from tools.approval import (
@@ -10670,6 +10712,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """
     with session["history_lock"]:
         if session.get("_closing"):
+            return False
+        if session.get("_lease_reanchor_failed") is not None:
+            # Fenced by a failed compression re-anchor: this runtime session is
+            # dead-ended (see _sync_session_key_after_compress) and the
+            # compute-host branch below bypasses the _run_prompt_submit
+            # ownership chokepoint — leave the queue untouched; it dies with
+            # the session instead of dispatching on the fenced key.
             return False
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
