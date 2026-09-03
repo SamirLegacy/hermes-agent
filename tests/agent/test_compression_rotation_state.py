@@ -2208,6 +2208,55 @@ class TestServerErrorTextClassification:
         assert result != msgs  # transient class keeps the static-fallback commit
         assert c._last_summary_server_failure is False
 
+    def test_5xxx_port_urls_do_not_classify_as_5xx(self):
+        """A connection error naming a :5000-:5999 port is a NETWORK failure,
+        not a server 5xx — the status-line pattern must not eat the port. A
+        status line always has whitespace before the code; a port never does.
+        Misclassification shifts the deterministic last-resort streak onto the
+        wrong failure class (R3b review, Table 2 row 1)."""
+        c = self._compressor()
+        msgs = _alternating_msgs()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError(
+                "fetch failed: https://api.internal:5000/v1/models"
+            ),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert result != msgs  # network failure keeps the static-fallback commit
+        assert c._last_summary_server_failure is False
+
+        c2 = self._compressor()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError(
+                "https://example.com:5599/health returned error"
+            ),
+        ):
+            result2 = c2.compress(msgs, current_tokens=999999, force=True)
+        assert result2 != msgs
+        assert c2._last_summary_server_failure is False
+
+    def test_status_line_whitespace_shapes_still_classify_as_5xx(self):
+        """Counterpart: the tightened pattern keeps every intended status-line
+        form — with version ("HTTP/1.1 502"), without ("http 503"), and the
+        HTTP/2 form — so the tightening costs no real classification."""
+        for message in (
+            "HTTP/1.1 502 Bad Gateway",
+            "http 503",
+            "HTTP/2 503",
+        ):
+            c = self._compressor()
+            msgs = _alternating_msgs()
+            with patch(
+                "agent.context_compressor.call_llm",
+                side_effect=RuntimeError(message),  # no .status_code attribute
+            ):
+                result = c.compress(msgs, current_tokens=999999, force=True)
+            assert result == msgs, message
+            assert c._last_summary_server_failure is True, message
+            assert c._last_summary_fallback_used is False, message
+
 
 class TestServerFailureGrowthCapLastResort:
     """D3/R2: a summarizer that stays down must never push the session into
