@@ -1423,6 +1423,106 @@ class TestDeleteSessionOrphansChildren:
         assert grandchild["parent_session_id"] == "child"
 
 
+class TestDeleteCompressionParentLogging:
+    """Owner addendum 2026-09-03 (L2 D3): deleting a compression parent is
+    ALLOWED (the desktop-app session delete is a legitimate operator action)
+    but never silent — one INFO line names the session id, its end_reason,
+    the message count, how many child rows get orphaned, and the caller.
+    Tonight's incident forensics could not attribute the delete precisely
+    because nothing logged at INFO/WARNING."""
+
+    def test_delete_compression_parent_succeeds_and_logs_one_info_line(
+        self, db, caplog
+    ):
+        import logging
+
+        db.create_session(session_id="parent", source="cli")
+        db.append_message("parent", role="user", content="q")
+        db.append_message("parent", role="assistant", content="a")
+        db.end_session("parent", "compression")
+        db.create_session(
+            session_id="child", source="cli", parent_session_id="parent"
+        )
+
+        with caplog.at_level(logging.INFO, logger="hermes_state"):
+            assert db.delete_session("parent", caller="desktop-rpc") is True
+
+        assert db.get_session("parent") is None
+        child = db.get_session("child")
+        assert child is not None
+        assert child["parent_session_id"] is None  # orphaned, not deleted
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "hermes_state" and "delete_session:" in r.getMessage()
+        ]
+        assert len(lines) == 1, lines
+        line = lines[0]
+        assert "session=parent" in line
+        assert "end_reason=compression" in line
+        assert "messages=2" in line
+        assert "orphaned_children=1" in line
+        assert "caller=desktop-rpc" in line
+
+    def test_delete_plain_session_logs_zero_orphans(self, db, caplog):
+        import logging
+
+        db.create_session(session_id="plain", source="cli")
+        db.append_message("plain", role="user", content="hi")
+
+        with caplog.at_level(logging.INFO, logger="hermes_state"):
+            assert db.delete_session("plain", caller="sessions-cmd") is True
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "hermes_state" and "delete_session:" in r.getMessage()
+        ]
+        assert len(lines) == 1, lines
+        assert "session=plain" in lines[0]
+        assert "end_reason=none" in lines[0]
+        assert "messages=1" in lines[0]
+        assert "orphaned_children=0" in lines[0]
+        assert "caller=sessions-cmd" in lines[0]
+
+    def test_prune_compression_parent_proceeds_and_logs_one_info_line(
+        self, db, caplog
+    ):
+        """Bulk prune is not refused either — but a pruned compression
+        parent whose child still references it is named on one INFO line."""
+        import logging
+        import time as _time
+
+        db.create_session(session_id="pparent", source="cli")
+        db.end_session("pparent", "compression")
+        db.create_session(
+            session_id="pchild", source="cli", parent_session_id="pparent"
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (_time.time() - 100 * 86400, "pparent"),
+        )
+        db._conn.commit()
+
+        with caplog.at_level(logging.INFO, logger="hermes_state"):
+            pruned = db.prune_sessions(older_than_days=90)
+
+        assert pruned == 1
+        assert db.get_session("pparent") is None
+        child = db.get_session("pchild")
+        assert child is not None
+        assert child["parent_session_id"] is None
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "hermes_state" and "prune_sessions:" in r.getMessage()
+        ]
+        assert len(lines) == 1, lines
+        assert "compression parent" in lines[0]
+        assert "pparent" in lines[0]
+
+
 class TestBulkDeleteSessions:
     """``delete_sessions(ids)`` — the bulk-delete primitive backing the
     sessions-page "Delete N selected" button. Per-row contract matches

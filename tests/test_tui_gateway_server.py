@@ -14898,7 +14898,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, caller=None):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14913,7 +14913,7 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, caller=None):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14934,9 +14934,10 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, caller=None):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
+            captured["caller"] = caller
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -14948,6 +14949,9 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     assert "result" in resp, resp
     assert resp["result"] == {"deleted": "old-1"}
     assert captured["sid"] == "old-1"
+    # The desktop RPC path labels itself so the delete_session INFO line
+    # attributes the delete to this surface.
+    assert captured["caller"] == "desktop-rpc"
     # sessions_dir must be forwarded so transcript files get cleaned up
     # too — not just the SQLite row.  The autouse _isolate_hermes_home
     # fixture pins HERMES_HOME to a temp dir; the handler should append
@@ -15155,9 +15159,10 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
 
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, caller=None):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
+            captured["caller"] = caller
             return True
 
         def close(self):

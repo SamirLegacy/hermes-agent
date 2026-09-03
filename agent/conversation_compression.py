@@ -58,6 +58,7 @@ import json
 import logging
 import math
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -1890,10 +1891,21 @@ def _emit_compression_attempt_telemetry(
     split_status: str,
     failure_class: str | None = None,
     commit_started_at: float | None = None,
+    telemetry_override: dict | None = None,
 ) -> None:
-    """Emit one content-free JSON log line for a compression attempt."""
+    """Emit one content-free JSON log line for a compression attempt.
+
+    ``telemetry_override`` supplies a pre-commit snapshot for call sites that
+    emit AFTER ``commit_memory_session()`` — that call runs
+    ``context_compressor.on_session_end()``, which resets
+    ``_last_compression_telemetry`` / ``_last_summary_fallback_used``, so
+    reading the live attributes post-commit would under-report (a committed
+    static fallback showed ``fallback_used:false``).
+    """
     try:
-        telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
+        telemetry = telemetry_override
+        if not isinstance(telemetry, dict):
+            telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             telemetry = {}
         payload = dict(telemetry)
@@ -4366,11 +4378,17 @@ def compress_context(
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
-                    agent._emit_warning(
+                    _abort_msg = (
                         f"⚠ Compression aborted: {_err}. "
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
+                    agent._emit_warning(_abort_msg)
+                    if getattr(agent, "suppress_status_output", False):
+                        # -q swallows the status channel; the abort is a
+                        # material turn event and must not be silent (stderr
+                        # is the sanctioned quiet-mode channel).
+                        print(_abort_msg, file=sys.stderr)
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
@@ -4742,6 +4760,38 @@ def compress_context(
         _session_commit_succeeded = False
         _commit_started_at = time.monotonic()
         split_status = "not_applicable"
+        # Snapshot the compressor's attempt telemetry BEFORE
+        # commit_memory_session() -> on_session_end() resets
+        # _last_compression_telemetry / _last_summary_fallback_used — the
+        # post-commit attempt telemetry must still report a committed static
+        # fallback as fallback_used=true.
+        _cc_snap = getattr(agent, "context_compressor", None)
+        _pre_commit_telemetry = getattr(_cc_snap, "_last_compression_telemetry", None)
+        _pre_commit_telemetry = (
+            dict(_pre_commit_telemetry) if isinstance(_pre_commit_telemetry, dict) else None
+        )
+        if getattr(_cc_snap, "_last_summary_fallback_used", False):
+            if _pre_commit_telemetry is None:
+                _pre_commit_telemetry = {}
+            _pre_commit_telemetry["fallback_used"] = True
+        # An operator who opted into
+        # compression.allow_static_fallback_on_server_error gets an
+        # unmissable warning when a server error replaced the middle window
+        # with a deterministic fallback. -q suppresses the status channel,
+        # so there the warning goes to stderr (the sanctioned quiet-mode
+        # channel — resume banner precedent).
+        if getattr(_cc_snap, "_last_summary_fallback_used", False) and getattr(
+            _cc_snap, "_last_summary_server_failure", False
+        ):
+            _fb_warning = (
+                "⚠ Context compressed WITHOUT an LLM summary "
+                "(provider error) — middle turns replaced by a "
+                "deterministic fallback"
+            )
+            if getattr(agent, "suppress_status_output", False):
+                print(_fb_warning, file=sys.stderr)
+            else:
+                agent._emit_warning(_fb_warning)
         if agent._session_db:
             split_status = "pending"
             try:
@@ -5607,6 +5657,7 @@ def compress_context(
                 else None
             ),
             commit_started_at=_commit_started_at,
+            telemetry_override=_pre_commit_telemetry,
         )
         return compressed, new_system_prompt
     finally:

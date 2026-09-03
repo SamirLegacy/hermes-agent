@@ -750,6 +750,30 @@ def _resolve_active_context_length() -> int:
                     "context gate (provider=%s): %s — using config values only",
                     provider, rt_exc,
                 )
+        # providers.<name>.models.<model>.context_length is an explicit
+        # operator-set window — honor it for the gate exactly like the
+        # compressor's startup path does (agent_init), before any cache or
+        # network probe. Without this the tool-search gate probed custom
+        # endpoints (which rarely report context lengths) and sized against
+        # the 256K probe-down default despite a configured 1M entry.
+        custom_providers = None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_providers = None
+        if config_ctx is None and base_url and custom_providers:
+            try:
+                from hermes_cli.config import get_custom_provider_context_length
+                cp_ctx = get_custom_provider_context_length(
+                    model=model_id,
+                    base_url=base_url,
+                    custom_providers=custom_providers,
+                )
+                if cp_ctx:
+                    return int(cp_ctx)
+            except Exception:
+                pass
         # Fast path: a previously discovered on-disk cache entry is plenty
         # for SIZING the tool-search gate — unlike compression budgeting, a
         # slightly stale window can't corrupt anything (should_activate only
@@ -774,6 +798,7 @@ def _resolve_active_context_length() -> int:
             api_key=api_key,
             config_context_length=config_ctx,
             provider=provider,
+            custom_providers=custom_providers,
         ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)

@@ -814,6 +814,7 @@ def cmd_sessions(args, sessions_parser=None):
                     resolved_session_id,
                     sessions_dir=sessions_dir,
                     expected_delete_ids=delete_target_ids,
+                    caller="sessions-cmd",
                 ):
                     delegate_count = len(delete_target_ids) - 1
                     delegate_suffix = (
@@ -888,7 +889,7 @@ def cmd_sessions(args, sessions_parser=None):
         elif _pinned_note:
             print(f"Warning: deleting a pinned session '{resolved_session_id}'.")
         sessions_dir = get_hermes_home() / "sessions"
-        if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+        if db.delete_session(resolved_session_id, sessions_dir=sessions_dir, caller="sessions-cmd"):
             print(f"Deleted session '{resolved_session_id}'.")
         else:
             print(f"Session '{args.session_id}' not found.")

@@ -2300,6 +2300,9 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    compression_allow_static_fallback_on_server_error = str(
+        _compression_cfg.get("allow_static_fallback_on_server_error", False)
+    ).lower() in {"true", "1", "yes"}
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).
@@ -2863,6 +2866,7 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
+            allow_static_fallback_on_server_error=compression_allow_static_fallback_on_server_error,
             max_tokens=_compressor_max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,

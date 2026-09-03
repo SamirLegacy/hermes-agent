@@ -365,3 +365,233 @@ def test_restore_session_model_restores_billing_provider_fallback():
     })
     assert stub.model == "glm-4.7"
     assert stub.provider == "minimax"
+
+
+# ── single-query (-q) resume: the CONSTRUCTED agent runs the stored model ──
+#
+# Incident 2026-09-02 (L2 forensics D1): `hermes chat --resume <id> -q "..."`
+# snapshots self.model/runtime into turn_route BEFORE _init_agent runs the
+# session-model restore, then passes that stale snapshot back as
+# model_override/runtime_override — which outranked the restored self.model,
+# so the resumed session silently ran the ambient config default.
+#
+# These tests drive the real CLIAgentSetupMixin._init_agent on a bare
+# HermesCLI with a fake session DB and a capturing AIAgent, asserting the
+# CONSTRUCTED agent's route — not the CLI attribute.
+
+
+class _FakeResumeSessionDB:
+    """Minimal session-DB double for _init_agent's resume block."""
+
+    def __init__(self, meta, messages):
+        self._meta = meta
+        self._messages = messages
+
+    def get_session(self, session_id):
+        return self._meta
+
+    def resolve_resume_session_id(self, session_id):
+        return session_id
+
+    def get_messages_as_conversation(self, session_id, repair_alternation=True):
+        return list(self._messages)
+
+    def reopen_session(self, session_id):
+        pass
+
+
+class _CapturingAgent:
+    """Stands in for cli.AIAgent: records the constructor kwargs."""
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        type(self).last_kwargs = kwargs
+
+
+def _make_init_stub(session_meta, **overrides):
+    """Bare HermesCLI wired for _init_agent's single-query resume path."""
+    stub = _make_stub(
+        agent=None,
+        _resumed=True,
+        _explicit_model_override=False,
+        conversation_history=[],
+        session_id="RQ1",
+        _session_db=_FakeResumeSessionDB(
+            session_meta,
+            [
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+            ],
+        ),
+        tool_progress_mode="off",  # -q quiet: status lines go to stderr
+        _single_query_mode=True,
+        acp_command=None,
+        acp_args=[],
+        _credential_pool=None,
+        max_tokens=None,
+        max_turns=300,
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        verbose=False,
+        system_prompt=None,
+        prefill_messages=[],
+        reasoning_config=None,
+        service_tier=None,
+        _providers_only=None,
+        _providers_ignore=None,
+        _providers_order=None,
+        _provider_sort=None,
+        _provider_require_params=None,
+        _provider_data_collection=None,
+        _openrouter_min_coding_score=None,
+        _fallback_model=None,
+        checkpoints_enabled=False,
+        checkpoint_max_snapshots=0,
+        checkpoint_max_total_size_mb=0,
+        checkpoint_max_file_size_mb=0,
+        pass_session_id=False,
+        ignore_rules=True,
+        _inline_diffs_enabled=False,
+        streaming_enabled=False,
+        show_reasoning=False,
+        _pending_title=None,
+        # Neutralize side-effecting startup steps — not under test here.
+        finalize_preloaded_skills=lambda: None,
+        _install_tool_callbacks=lambda: None,
+        _ensure_tirith_security=lambda: None,
+        _ensure_runtime_credentials=lambda: True,
+        _restore_session_cwd=lambda *a, **k: None,
+        _restore_session_yolo=lambda *a, **k: None,
+    )
+    for key, value in overrides.items():
+        setattr(stub, key, value)
+    return stub
+
+
+@pytest.fixture
+def _patched_agent_construction(monkeypatch):
+    """Capture AIAgent construction; silence MCP/deferred startup."""
+    _CapturingAgent.last_kwargs = None
+    monkeypatch.setattr(cli_mod, "AIAgent", _CapturingAgent)
+    monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
+    import hermes_cli.mcp_startup as mcp_startup
+
+    monkeypatch.setattr(
+        mcp_startup, "ensure_mcp_discovery_before_agent_build", lambda **k: None
+    )
+    return _CapturingAgent
+
+
+def _stored_kimi_meta():
+    return {
+        "model": "kimi-k3",
+        "model_config": json.dumps({
+            "gateway_runtime": {
+                "provider": "kimi-coding",
+                "base_url": "https://api.moonshot.cn/v1",
+            },
+        }),
+    }
+
+
+def _stale_turn_route():
+    """The pre-restore snapshot the -q branch passes back into _init_agent."""
+    return {
+        "api_key": "ambient-key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "provider": "openrouter",
+        "requested_provider": "openrouter",
+        "api_mode": "",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+
+def test_single_query_resume_constructs_agent_on_stored_model(
+    _patched_agent_construction, monkeypatch
+):
+    """No -m: the restored session model/route must beat the stale snapshot."""
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(
+        rp, "resolve_runtime_provider",
+        lambda requested=None, **k: {"api_key": "kimi-key", "credential_pool": None},
+    )
+    stub = _make_init_stub(_stored_kimi_meta())
+    ok = stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    )
+    assert ok is True
+    kwargs = _CapturingAgent.last_kwargs
+    assert kwargs is not None, "_init_agent never constructed the agent"
+    assert kwargs["model"] == "kimi-k3"
+    assert kwargs["provider"] == "kimi-coding"
+    assert kwargs["base_url"] == "https://api.moonshot.cn/v1"
+    assert kwargs["api_key"] == "kimi-key"
+
+
+def test_single_query_resume_explicit_model_flag_still_wins(
+    _patched_agent_construction,
+):
+    """An explicit -m on the command line outranks the stored session model."""
+    stub = _make_init_stub(
+        _stored_kimi_meta(),
+        model="cli-flag-model",
+        _explicit_model_override=True,
+    )
+    ok = stub._init_agent(
+        model_override="cli-flag-model",
+        runtime_override=_stale_turn_route(),
+    )
+    assert ok is True
+    kwargs = _CapturingAgent.last_kwargs
+    assert kwargs["model"] == "cli-flag-model"
+    assert kwargs["provider"] == "openrouter"
+
+
+def test_single_query_resume_fails_loud_on_unresolvable_stored_route(
+    _patched_agent_construction, monkeypatch, capsys
+):
+    """Stored provider cannot be resolved and no -m was given: refuse to
+    silently run the config default — _init_agent fails (the -q branch exits
+    non-zero on a falsy return) and names the reason on stderr."""
+    import hermes_cli.runtime_provider as rp
+
+    def _no_route(requested=None, **k):
+        raise RuntimeError("no credentials for stored provider")
+
+    monkeypatch.setattr(rp, "resolve_runtime_provider", _no_route)
+    stub = _make_init_stub(_stored_kimi_meta())
+    ok = stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    )
+    assert ok is False
+    err = capsys.readouterr().err
+    assert "Cannot resume session RQ1 on its stored model route" in err
+    assert "kimi-coding" in err
+
+
+def test_single_query_resume_quiet_stderr_names_ignored_config_default(
+    _patched_agent_construction, monkeypatch, capsys
+):
+    """Quiet-mode resume announces the stored route AND the ignored default."""
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(
+        rp, "resolve_runtime_provider",
+        lambda requested=None, **k: {"api_key": "kimi-key", "credential_pool": None},
+    )
+    stub = _make_init_stub(_stored_kimi_meta())
+    assert stub._init_agent(
+        model_override="ambient-model",
+        runtime_override=_stale_turn_route(),
+    ) is True
+    err = capsys.readouterr().err
+    assert (
+        "Resumed session RQ1 on stored model kimi-k3 (kimi-coding) — "
+        "config default ambient-model ignored"
+    ) in err

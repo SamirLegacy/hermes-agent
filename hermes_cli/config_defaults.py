@@ -1006,6 +1006,14 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "allow_static_fallback_on_server_error": False,
+                                      # When False (default), a terminal summarizer 5xx
+                                      # (after all retries, incl. the main-model fallback)
+                                      # aborts the compression unchanged — same class as
+                                      # auth/network failures. When True, the old behavior
+                                      # is allowed: the middle window is replaced by a
+                                      # deterministic static fallback AND a loud warning
+                                      # is emitted at commit time.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
