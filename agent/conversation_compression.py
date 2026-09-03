@@ -4389,6 +4389,12 @@ def compress_context(
                         # material turn event and must not be silent (stderr
                         # is the sanctioned quiet-mode channel).
                         print(_abort_msg, file=sys.stderr)
+                if getattr(
+                    agent.context_compressor, "_last_summary_server_fallback_last_resort", False
+                ):
+                    # The growth cap fired: the static fallback was committed
+                    # over a server failure (see commit-site warning below).
+                    pass
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
@@ -4783,11 +4789,21 @@ def compress_context(
         if getattr(_cc_snap, "_last_summary_fallback_used", False) and getattr(
             _cc_snap, "_last_summary_server_failure", False
         ):
+            _lr = getattr(_cc_snap, "_last_summary_server_fallback_last_resort", False)
             _fb_warning = (
                 "⚠ Context compressed WITHOUT an LLM summary "
                 "(provider error) — middle turns replaced by a "
                 "deterministic fallback"
             )
+            if _lr:
+                _fb_warning = (
+                    "⚠ Context compressed WITHOUT an LLM summary — LAST "
+                    "RESORT growth cap: summarizer server errors persisted "
+                    "while the session neared the context hard limit; middle "
+                    "turns were replaced by a deterministic fallback to keep "
+                    "the session under the limit. Run /compress to retry for "
+                    "a real summary, or /new to start a fresh session."
+                )
             if getattr(agent, "suppress_status_output", False):
                 print(_fb_warning, file=sys.stderr)
             else:

@@ -2641,6 +2641,8 @@ class ContextCompressor(ContextEngine):
         self._cooldown_persist_failed = False
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
+        self._consecutive_server_failure_aborts = 0
+        self._last_summary_server_fallback_last_resort = False
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
@@ -3181,6 +3183,29 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression cancellation check failed", exc_info=True)
             return False
 
+    def _server_failure_last_resort_due(self, current_tokens: Optional[int]) -> bool:
+        """Growth-cap check for server-failure aborts (D3 last resort).
+
+        True when >=3 consecutive server-failure aborts coincide with real
+        usage past 90% of the resolved context window. "Real usage" is the
+        last turn's provider-reported prompt tokens when available, else the
+        caller's current-token estimate. The window is the compressor's
+        resolved context length (probed from the provider or set via
+        update_model), never a token estimate.
+        """
+        if getattr(self, "_consecutive_server_failure_aborts", 0) < 3:
+            return False
+        # Resolve lazily: a forced/manual compress path never touches
+        # context_length, and an unresolved window must not silently veto the
+        # growth cap.
+        window = self._resolved_context_length
+        if window is None:
+            window = self._resolve_context_length()
+        if not window:
+            return False
+        real_usage = self.last_real_prompt_tokens or current_tokens or 0
+        return real_usage > 0.9 * window
+
     def update_model(
         self,
         model: str,
@@ -3679,6 +3704,13 @@ class ContextCompressor(ContextEngine):
         # compression.allow_static_fallback_on_server_error=true opts back
         # into the static-fallback commit (with a loud warning at commit).
         self._last_summary_server_failure: bool = False
+        # Consecutive server-failure aborts feed the growth cap: at >=3 with
+        # real usage past 90% of the resolved window, compress() commits the
+        # static fallback as a LAST RESORT (a down summarizer must never push
+        # the session into the provider's hard limit). Cleared by any
+        # successful summary via _clear_compression_failure_cooldown().
+        self._consecutive_server_failure_aborts: int = 0
+        self._last_summary_server_fallback_last_resort: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -5517,6 +5549,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_empty_content_failure = False
             self._last_summary_truncated_failure = False
             self._last_summary_server_failure = False
+            self._consecutive_server_failure_aborts = 0
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -5548,6 +5581,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             # context growing unbounded.  (#8620 sub-issue 4)
             _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
             _err_str = str(e).lower()
+            # A terminal HTTP 5xx is a server-side provider failure — the
+            # request was fine, the endpoint is broken. The auxiliary client's
+            # RuntimeError wrapping shape carries the status only in the
+            # message text ("Error code: 500 - ..." / "HTTP 503 ..." /
+            # "Internal server error"), with no .status_code attribute, so the
+            # classification must read BOTH shapes or tonight's class slips
+            # through to a silent static-fallback commit.
+            _is_server_error_5xx = (
+                (isinstance(_status, int) and 500 <= _status < 600)
+                or re.search(r"error code:\s*5\d\d", _err_str) is not None
+                or re.search(r"http\s+5\d\d", _err_str) is not None
+                or "internal server error" in _err_str
+            )
             _is_model_not_found = (
                 _status in {404, 503}
                 or "model_not_found" in _err_str
@@ -5723,7 +5769,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # fallback over the dropped middle window — same class as the
             # auth/network aborts. Independent flag (not elif): a 502 also
             # matches the timeout cooldown ladder above.
-            if isinstance(_status, int) and 500 <= _status < 600:
+            if _is_server_error_5xx:
                 self._last_summary_server_failure = True
             logger.warning(
                 "Failed to generate context summary: %s. "
@@ -7819,6 +7865,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_summary_server_fallback_last_resort = False
         self._last_feasibility_skip = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
@@ -8181,16 +8228,40 @@ This compaction should PRIORITISE preserving all information related to the focu
         # rotating into a child session with a placeholder summary degrades the
         # conversation for zero benefit. Preserve it unchanged until access or
         # provider health is restored (#29559, #25585, #94448).
+        # D3 growth cap: a summarizer that stays down must never push the
+        # session into the provider's hard limit. Server-failure aborts are
+        # counted consecutively; at >=3 with real usage (last turn's
+        # provider-reported prompt tokens, else the caller's estimate) past
+        # 90% of the resolved window, commit the deterministic static
+        # fallback as a LAST RESORT — loudly — instead of aborting forever.
+        _server_failure_abort = bool(
+            self._last_summary_server_failure
+            and not self.allow_static_fallback_on_server_error
+        )
+        if not summary and not feasibility_skip and _server_failure_abort:
+            self._consecutive_server_failure_aborts = (
+                getattr(self, "_consecutive_server_failure_aborts", 0) + 1
+            )
+            if self._server_failure_last_resort_due(current_tokens):
+                _server_failure_abort = False
+                self._last_summary_server_fallback_last_resort = True
+                logger.warning(
+                    "Summarizer server errors aborted compression %d times in "
+                    "a row while real usage (%d tokens) exceeds 90%% of the "
+                    "resolved context window (%d) — committing the "
+                    "deterministic static fallback as a LAST RESORT so the "
+                    "session stays under the provider hard limit.",
+                    self._consecutive_server_failure_aborts,
+                    self.last_real_prompt_tokens or current_tokens or 0,
+                    getattr(self, "_resolved_context_length", 0) or 0,
+                )
         if not summary and not feasibility_skip and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
             or self._last_summary_empty_content_failure
             or self._last_summary_truncated_failure
-            or (
-                self._last_summary_server_failure
-                and not self.allow_static_fallback_on_server_error
-            )
+            or _server_failure_abort
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped

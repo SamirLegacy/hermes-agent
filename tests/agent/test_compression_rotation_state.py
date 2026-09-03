@@ -2146,6 +2146,161 @@ class TestServerErrorAbortsByDefault:
         assert c._last_summary_fallback_used is True
 
 
+class TestServerErrorTextClassification:
+    """D3/R2: the aux client's RuntimeError wrapping shape carries the 5xx
+    status only in the message text — no .status_code attribute. The
+    classification must read the text too, or tonight's class slips through
+    to a silent static-fallback commit."""
+
+    @staticmethod
+    def _compressor():
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            return ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Error code: 500 - Internal Server Error",
+            "Error code: 503 - Service Unavailable",
+            "upstream returned HTTP 502 Bad Gateway",
+            "Internal server error",
+        ],
+    )
+    def test_text_only_5xx_shapes_abort(self, message):
+        c = self._compressor()
+        msgs = _alternating_msgs()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError(message),  # no .status_code attribute
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert result == msgs
+        assert c._last_summary_server_failure is True
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+
+    def test_status_code_attribute_still_classifies(self):
+        c = self._compressor()
+        msgs = _alternating_msgs()
+        err = _StubProviderError("boom", status_code=502)
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert result == msgs
+        assert c._last_summary_server_failure is True
+
+    def test_4xx_text_does_not_abort(self):
+        c = self._compressor()
+        msgs = _alternating_msgs()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("Error code: 429 - rate limited"),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert result != msgs  # transient class keeps the static-fallback commit
+        assert c._last_summary_server_failure is False
+
+
+class TestServerFailureGrowthCapLastResort:
+    """D3/R2: a summarizer that stays down must never push the session into
+    the provider's hard limit. At >=3 consecutive server-failure aborts with
+    real usage past 90% of the resolved window, compress() commits the static
+    fallback as a LAST RESORT (loudly) instead of aborting forever."""
+
+    @staticmethod
+    def _compressor():
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        # The growth cap reads the RESOLVED window; pin it explicitly so the
+        # test does not depend on which import path resolved it.
+        c.context_length = 100000
+        return c
+
+    @staticmethod
+    def _big_msgs(n=80):
+        return [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"turn {i} " + "lorem ipsum dolor sit amet " * 12,
+            }
+            for i in range(n)
+        ]
+
+    def test_two_aborts_then_last_resort_commits(self):
+        c = self._compressor()
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            # Abort 1 and 2: below the cap, nothing dropped.
+            r1 = c.compress(self._big_msgs(), current_tokens=95_000, force=True)
+            r2 = c.compress(self._big_msgs(), current_tokens=95_000, force=True)
+        assert r1 == r2  # both aborted: input returned unchanged
+        assert c._consecutive_server_failure_aborts == 2
+        assert c._last_summary_server_fallback_last_resort is False
+
+    def test_three_aborts_past_90pct_commits_last_resort(self):
+        c = self._compressor()
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        msgs = self._big_msgs()
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            for _ in range(2):
+                c.compress(msgs, current_tokens=95_000, force=True)
+            # Third abort at >90% real usage: the growth cap fires.
+            result = c.compress(msgs, current_tokens=95_000, force=True)
+        assert c._consecutive_server_failure_aborts == 3
+        assert c._last_summary_server_fallback_last_resort is True
+        assert result != msgs  # static fallback committed, not an abort
+        assert c._last_summary_fallback_used is True
+
+    def test_below_90pct_keeps_aborting(self):
+        c = self._compressor()
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        msgs = self._big_msgs()
+        result = None
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            for _ in range(3):
+                result = c.compress(msgs, current_tokens=50_000, force=True)
+        assert c._consecutive_server_failure_aborts == 3
+        assert result == msgs  # still aborting — usage nowhere near the limit
+        assert c._last_summary_server_fallback_last_resort is False
+
+    def test_success_resets_streak(self):
+        c = self._compressor()
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        msgs = self._big_msgs()
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            for _ in range(2):
+                c.compress(msgs, current_tokens=95_000, force=True)
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value="Recovered summary of the middle window.",
+        ):
+            c.compress(msgs, current_tokens=95_000, force=True)
+        assert c._consecutive_server_failure_aborts == 0
+
+
 class TestStaticFallbackOptInCommit:
     def test_opt_in_commits_with_stderr_warning_and_true_fallback_telemetry(
         self, tmp_path: Path, capsys, caplog
@@ -2223,5 +2378,53 @@ class TestStaticFallbackOptInCommit:
             assert telemetry_lines, "no compression attempt telemetry emitted"
             payload = json.loads(telemetry_lines[-1].split("telemetry: ", 1)[1])
             assert payload["fallback_used"] is True
+        finally:
+            db.close()
+
+
+class TestServerFailureAbortReachesStderrInQuiet:
+    """R2: the server-failure abort warning must reach stderr in -q even on
+    the FIRST compression — the status channel is swallowed there, and the
+    abort is a material turn event (silent aborts were the incident)."""
+
+    def test_first_abort_prints_to_stderr_in_quiet_mode(self, tmp_path: Path, capsys):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_SERVER_ABORT_QUIET"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        compressor.bind_session_state(db, parent)
+        agent.context_compressor = compressor
+        agent.suppress_status_output = True  # -q: status channel swallowed
+
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"turn {i} " + "lorem ipsum dolor sit amet " * 12,
+            }
+            for i in range(80)
+        ]
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            agent._compress_context(msgs, "sys", approx_tokens=999_999)
+
+        try:
+            err_out = capsys.readouterr().err
+            assert "Compression aborted" in err_out
+            assert "No messages were dropped" in err_out
+            assert agent.session_id == parent  # no rotation on abort
         finally:
             db.close()
