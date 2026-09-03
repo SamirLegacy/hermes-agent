@@ -204,12 +204,19 @@ def _lease_holder_payload(session_id: str, entry: dict[str, Any]) -> dict[str, A
     refusal carries the same facts the message names, machine-readable.
     """
     started = _optional_float(entry.get("started_at"))
+    # Same liveness verdict the refusal message uses (dead pid or process
+    # start-time mismatch → reclaimable): clients render takeover advice from
+    # this field instead of re-deriving it from prose.
+    holder_live = (
+        _pid_liveness(entry.get("pid"), entry.get("process_start_time")) is not False
+    )
     return {
         "session_id": str(session_id),
         "surface": str(entry.get("surface") or "another surface"),
         "pid": entry.get("pid"),
         "started_at": started,
         "age_s": round(time.time() - started, 1) if started else None,
+        "holder_live": holder_live,
     }
 
 

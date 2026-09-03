@@ -661,6 +661,51 @@ def test_refusal_carries_machine_readable_holder_payload(tmp_path, monkeypatch):
     assert payload["started_at"] is not None
     assert payload["age_s"] is not None
     assert payload["age_s"] >= 0
+    # Liveness verdict travels with the holder facts (same predicate the
+    # refusal message uses) so clients render takeover advice without
+    # parsing prose: the live holder process makes this True here.
+    assert payload["holder_live"] is True
+
+
+def test_refusal_holder_payload_marks_dead_holder_reclaimable(
+    tmp_path, monkeypatch
+):
+    """holder_live False only for a provably dead/stale holder (dead pid or
+    process start-time mismatch) — the exact condition under which the CLI
+    message and the desktop hint may advertise --takeover."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="held-session",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "holder-live"},
+    )
+    assert holder is not None
+
+    lease, refusal = active_sessions.try_acquire_active_session(
+        session_id="held-session",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "blocked"},
+    )
+    assert lease is None
+    live_payload = refusal.holder
+    assert live_payload["holder_live"] is True
+
+    holder.release()
+
+    # After release the registry entry is gone; simulate the stale-holder
+    # shape directly: a pid that no longer exists is provably dead.
+    stale_entry = {
+        "surface": "desktop",
+        "pid": 999999999,
+        "started_at": time.time() - 120,
+        "process_start_time": None,
+    }
+    stale_payload = active_sessions._lease_holder_payload(
+        "held-session", stale_entry
+    )
+    assert stale_payload["holder_live"] is False
 
 
 def test_takeover_refused_while_holder_is_alive(tmp_path, monkeypatch, caplog):

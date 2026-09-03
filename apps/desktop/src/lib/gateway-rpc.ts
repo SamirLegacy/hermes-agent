@@ -41,28 +41,43 @@ export function isBusySessionModelSwitch(error: unknown): boolean {
 /** Holder facts the gateway ships on a SESSION_NOT_OWNED refusal (4090). */
 export interface SessionOwnerRefusal {
   age_s?: null | number
+  holder_live?: boolean
   pid?: null | number | string
   session_id?: string
   started_at?: null | number
   surface?: string
 }
 
+/** Walk every transport shape a 4090 refusal may arrive in and return the
+ *  unwrapped candidate, or null when none carries the refusal payload.
+ *  Shared by the boolean classifier and the holder-facts extractor so the
+ *  two can never disagree about what counts as the refusal. */
+function refusalCandidateOf(error: unknown): unknown | null {
+  const candidates = [
+    error,
+    (error as { error?: unknown })?.error,
+  ]
+  for (const candidate of candidates) {
+    const code = (candidate as { code?: unknown })?.code
+    const codeMatches = code === 4090 || code === '4090'
+    if (!codeMatches) continue
+    const data = (candidate as { data?: unknown })?.data
+    if (typeof data !== 'object' || data === null) continue
+    if ((data as { reason?: unknown }).reason !== 'SESSION_NOT_OWNED') continue
+    return candidate
+  }
+  return null
+}
+
 /** The machine-readable holder payload attached to a 4090 refusal's `data`. */
 export function sessionOwnerRefusalOf(error: unknown): SessionOwnerRefusal | null {
-  const code = (error as { code?: unknown })?.code
-  const data = (error as { data?: unknown })?.data
+  const candidate = refusalCandidateOf(error)
+  if (candidate === null) return null
 
-  // The code may arrive as number OR string after JSON round-trips.
-  const codeMatches = code === 4090 || code === '4090'
-  if (!codeMatches || typeof data !== 'object' || data === null) {
-    return null
+  const data = (candidate as { data?: unknown }).data as {
+    holder?: unknown
   }
-
-  if ((data as { reason?: unknown }).reason !== 'SESSION_NOT_OWNED') {
-    return null
-  }
-
-  const holder = (data as { holder?: unknown }).holder
+  const holder = data.holder
 
   return typeof holder === 'object' && holder !== null ? (holder as SessionOwnerRefusal) : {}
 }
@@ -74,19 +89,7 @@ export function sessionOwnerRefusalOf(error: unknown): SessionOwnerRefusal | nul
  *  attempt-0 cadence because ws-open resets the backoff attempt — the measured 200ms
  *  storm). The reason travels as typed data, not prose; never match the message text. */
 export function isSessionNotOwnedError(error: unknown): boolean {
-  // The transport wraps RPC errors inconsistently: the code rides the top
-  // level or a nested `.error`, and may arrive as number OR string after
-  // JSON round-trips through logs/bridges. Read every shape before giving up.
-  const candidates = [
-    error,
-    (error as { error?: unknown })?.error,
-  ]
-  for (const candidate of candidates) {
-    if (sessionOwnerRefusalOf(candidate) !== null) {
-      return true
-    }
-  }
-  return false
+  return refusalCandidateOf(error) !== null
 }
 
 /** One-line human summary of a SESSION_NOT_OWNED refusal, from its holder facts. */
@@ -108,9 +111,17 @@ export function describeSessionOwner(error: unknown): string {
       ? ` since ${new Date(holder.started_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
       : ''
   const sessionId = holder.session_id ? ` ${holder.session_id}` : ''
-
+  // --takeover only reclaims dead/stale leases (the CLI refuses live
+  // holders), so advertising it for a live holder is a dead remedy. Match
+  // the CLI refusal message: live (or unverifiable) → quit that surface.
+  if (holder.holder_live !== false) {
+    return (
+      `Session${sessionId} is live-owned by ${surface} (pid ${pid})${age}${since}. ` +
+      `Quit that surface first (or wait for it to exit), then resume again.`
+    )
+  }
   return (
-    `Session${sessionId} is live-owned by ${surface} (pid ${pid})${age}${since}.` +
-    (sessionId ? ` Take over from that holder with: hermes chat --resume${sessionId} --takeover` : '')
+    `Session${sessionId} is held by a dead/stale ${surface} (pid ${pid})${age}${since}.` +
+    (sessionId ? ` Reclaim it with: hermes chat --resume${sessionId} --takeover` : '')
   )
 }
