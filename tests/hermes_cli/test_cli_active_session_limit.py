@@ -41,8 +41,10 @@ def test_cli_claim_active_session_respects_global_limit(tmp_path, monkeypatch):
         cli._release_active_session()
 
 
-def test_cli_claim_refusal_names_holder_and_takeover_hint(tmp_path, monkeypatch):
-    """A refusal without --takeover exits 1-equivalent (claim returns False) and names the holder + next steps."""
+def test_cli_claim_refusal_names_live_holder_and_quit_hint(tmp_path, monkeypatch):
+    """A refusal without --takeover exits 1-equivalent (claim returns False) and,
+    for a LIVE holder, names the holder + quit-first/`hermes status` next steps —
+    --takeover is only advertised for dead/stale holders."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     held, _ = try_acquire_active_session(
         session_id="owned-session",
@@ -63,18 +65,18 @@ def test_cli_claim_refusal_names_holder_and_takeover_hint(tmp_path, monkeypatch)
     try:
         assert cli._claim_active_session("cli") is False
         assert len(printed) == 1
-        # Names the holder and the next step: the takeover command and the live-owner inspection.
-        assert "--takeover" in printed[0]
-        assert "hermes chat --resume owned-session --takeover" in printed[0]
+        # Names the holder and the live-holder next steps: quit the holding
+        # surface first, inspect owners with hermes status.
         assert "hermes status" in printed[0]
+        assert "--takeover" not in printed[0]
     finally:
         held.release()
 
 
-def test_cli_takeover_claim_steals_and_warns(tmp_path, monkeypatch, caplog):
-    """--takeover steals the live owner's lease and warns about the
-    in-memory-lease limitation of the old owner's process."""
-    import logging
+def test_cli_takeover_refused_while_holder_is_alive(tmp_path, monkeypatch):
+    """--takeover against a LIVE holder refuses: the old owner keeps writing
+    from its in-memory lease no matter what the registry says, so the steal
+    would create two writers on one session."""
     import os
 
     from hermes_cli.active_sessions import active_session_registry_snapshot
@@ -97,18 +99,62 @@ def test_cli_takeover_claim_steals_and_warns(tmp_path, monkeypatch, caplog):
     cli._console_print = lambda text: printed.append(text)
 
     try:
-        assert cli._claim_active_session("cli") is True
-        # Stole the lease: the registry now names our process as the owner.
+        assert cli._claim_active_session("cli") is False
+        assert len(printed) == 1
+        assert (
+            f"holder pid {os.getpid()} (desktop) is alive — quit it first (or wait); "
+            "--takeover only reclaims stale/dead leases" in printed[0]
+        )
+        # The holder's registry entry is untouched.
         entries = active_session_registry_snapshot()
         assert [entry["session_id"] for entry in entries] == ["owned-session"]
-        # One-line warning names the limitation (old owner's in-memory lease
-        # keeps writing until its process exits).
-        assert len(printed) == 1
-        assert "Warning: --takeover" in printed[0]
-        assert "never re-reads it" in printed[0]
-        assert f"pid {os.getpid()}" in printed[0]
+        assert entries[0]["pid"] == os.getpid()
+        assert cli._active_session_lease is None
     finally:
         held.release()
+
+
+def test_cli_takeover_succeeds_when_holder_is_dead(tmp_path, monkeypatch):
+    """--takeover reclaims a dead holder's lease: pruning already removed the
+    corpse, so the claim succeeds as a plain acquire."""
+    import os
+
+    from hermes_cli import active_sessions
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    held, _ = try_acquire_active_session(
+        session_id="owned-session",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "desktop-owner"},
+    )
+    assert held is not None
+    # Kill the holder: rewrite its entry to a dead pid, then drop the
+    # in-memory lease object (its release must not fire later).
+    state_path = active_sessions._state_path()
+    entries = active_sessions._read_entries(state_path)
+    entries[0]["pid"] = 0x7FFFFFFE
+    entries[0]["process_start_time"] = 1.0
+    active_sessions._write_entries(state_path, entries)
+    held.released = True
+
+    cli = object.__new__(HermesCLI)
+    cli.session_id = "owned-session"
+    cli.config = {}
+    cli._active_session_lease = None
+    cli._active_session_takeover = True
+    printed: list[str] = []
+    cli._console_print = lambda text: printed.append(text)
+
+    try:
+        assert cli._claim_active_session("cli") is True
+        entries = active_session_registry_snapshot()
+        assert [entry["session_id"] for entry in entries] == ["owned-session"]
+        assert entries[0]["pid"] == os.getpid()
+        # No takeover warning: a dead holder cannot keep writing.
+        assert not any("Warning: --takeover" in text for text in printed)
+    finally:
         cli._release_active_session()
 
 

@@ -570,7 +570,9 @@ def test_release_wins_against_transfer_waiting_on_same_lease_lock(
 def test_refusal_message_names_holder_age_clock_and_next_steps(tmp_path, monkeypatch):
     """The refusal is the ONLY operator-facing surface when a session is locked —
     it must say who holds it (surface, pid), for how long (age), since when
-    (wall clock), and what to do next (--takeover / hermes status)."""
+    (wall clock), and what to do next. For a LIVE holder the next step is
+    quitting that surface + `hermes status` — never --takeover, which only
+    reclaims stale/dead leases."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     holder, _ = active_sessions.try_acquire_active_session(
         session_id="20260902_183916_bdcd79",
@@ -598,10 +600,38 @@ def test_refusal_message_names_holder_age_clock_and_next_steps(tmp_path, monkeyp
     # For how long, and since when on the wall clock.
     assert "running" in message
     assert ", since " in message
-    # What to do next: the takeover command for THIS session, and the
-    # inspection command that actually shows live owners.
-    assert "hermes chat --resume 20260902_183916_bdcd79 --takeover" in message
+    # What to do next for a LIVE holder: quit the holder surface first, and
+    # the inspection command that actually shows live owners. --takeover must
+    # NOT be advertised here — taking over from a live process creates two
+    # writers on one session.
+    assert "uit" in message  # "Quit that surface first (or wait)..."
     assert "hermes status" in message
+    assert "--takeover" not in message
+    holder.release()
+
+
+def test_refusal_message_advertises_takeover_only_for_dead_holder():
+    """session_already_owned_message advertises --takeover ONLY when the holder
+    pid is dead/stale; a live holder gets the quit-first + `hermes status` advice."""
+    live_entry = {
+        "surface": "desktop",
+        "pid": os.getpid(),
+        "process_start_time": None,
+        "started_at": time.time(),
+    }
+    live_message = active_sessions.session_already_owned_message("s1", live_entry)
+    assert "--takeover" not in live_message
+    assert "hermes status" in live_message
+
+    dead_entry = {
+        "surface": "desktop",
+        "pid": 0x7FFFFFFE,  # provably dead pid
+        "process_start_time": None,
+        "started_at": time.time(),
+    }
+    dead_message = active_sessions.session_already_owned_message("s1", dead_entry)
+    assert "hermes chat --resume s1 --takeover" in dead_message
+    assert "hermes status" in dead_message
 
 
 def test_refusal_carries_machine_readable_holder_payload(tmp_path, monkeypatch):
@@ -633,8 +663,11 @@ def test_refusal_carries_machine_readable_holder_payload(tmp_path, monkeypatch):
     assert payload["age_s"] >= 0
 
 
-def test_takeover_steals_lease_from_live_holder_and_logs(tmp_path, monkeypatch, caplog):
-    """--takeover: verify holder (live pid, same session), drop its entry, write ours, log the steal."""
+def test_takeover_refused_while_holder_is_alive(tmp_path, monkeypatch, caplog):
+    """--takeover must NOT steal from a live holder: the old owner never
+    re-reads the registry, so moving the entry would leave TWO processes
+    writing the same session (the 2026-09-02 interleaved-turn class).
+    Takeover only reclaims stale/dead leases."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     holder, _ = active_sessions.try_acquire_active_session(
         session_id="owned-session",
@@ -652,6 +685,59 @@ def test_takeover_steals_lease_from_live_holder_and_logs(tmp_path, monkeypatch, 
     )
     assert blocked is None
     assert refusal.reason == active_sessions.SESSION_NOT_OWNED
+
+    with caplog.at_level(logging.INFO, logger="hermes_cli.active_sessions"):
+        lease, message = active_sessions.takeover_active_session(
+            session_id="owned-session",
+            surface="cli",
+            config={},
+            metadata={"live_session_id": "cli-taker"},
+        )
+
+    assert lease is None
+    assert message is not None
+    assert getattr(message, "reason", None) == active_sessions.SESSION_NOT_OWNED
+    text = str(message)
+    assert (
+        f"holder pid {os.getpid()} (desktop) is alive — quit it first (or wait); "
+        "--takeover only reclaims stale/dead leases" in text
+    )
+    # The holder's lease is untouched — no steal, no log line.
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [(entry["lease_id"], entry["session_id"]) for entry in entries] == [
+        (holder.lease_id, "owned-session")
+    ]
+    assert not any(
+        "took over session" in record.getMessage() for record in caplog.records
+    )
+    holder.release()
+
+
+def test_takeover_dead_holder_via_liveness_recheck_steals(tmp_path, monkeypatch, caplog):
+    """The one legitimate steal: the holder entry survived pruning (alive at
+    prune time) but is provably dead at the takeover decision — a stale pid /
+    process start-time mismatch is reclaimed instead of refused."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="owned-session",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "desktop-owner"},
+    )
+    assert holder is not None
+
+    real_liveness = active_sessions._pid_liveness
+
+    def _holder_died_between_prune_and_steal(pid, process_start_time=None):
+        try:
+            target = int(pid)
+        except (TypeError, ValueError):
+            target = -1
+        if target == os.getpid():
+            return False  # holder's pid: dead at decision time
+        return real_liveness(pid, process_start_time)
+
+    monkeypatch.setattr(active_sessions, "_pid_liveness", _holder_died_between_prune_and_steal)
 
     with caplog.at_level(logging.INFO, logger="hermes_cli.active_sessions"):
         lease, message = active_sessions.takeover_active_session(

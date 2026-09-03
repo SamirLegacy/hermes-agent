@@ -5883,18 +5883,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 and getattr(self, "_active_session_takeover", False)
                 and getattr(message, "reason", None) == SESSION_NOT_OWNED
             ):
-                holder = getattr(message, "holder", None)
+                # --takeover only reclaims a stale/dead holder's lease: a live
+                # holder keeps writing from its in-memory lease regardless of
+                # the registry, so stealing the entry would leave two writers
+                # on one session. takeover_active_session refuses live holders;
+                # its refusal message then lands in the shared print below.
                 lease, message = takeover_active_session(
                     session_id=self.session_id,
                     surface=surface,
                     config=self.config,
                     metadata={"live_session_id": str(self.session_id)},
                 )
-                if lease is not None and isinstance(holder, dict):
-                    # One-line warning naming the limitation: the registry entry
-                    # moved, but the old owner's process never re-reads it, so it
-                    # keeps writing from its in-memory lease until it exits.
-                    self._print_takeover_warning(holder, stderr=stderr)
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
             return True
@@ -5910,19 +5909,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
         return True
-
-    def _print_takeover_warning(self, holder: dict, *, stderr: bool = False) -> None:
-        surface = holder.get("surface") or "another surface"
-        pid = holder.get("pid")
-        warning = (
-            f"Warning: --takeover moved the registry lease, but the old owner "
-            f"({surface}, pid {pid}) never re-reads it — it can keep writing to this "
-            f"session until its process exits; close that surface to avoid interleaved turns."
-        )
-        if stderr:
-            print(warning, file=sys.stderr)
-        else:
-            self._console_print(f"[bold yellow]{warning}[/]")
 
     def _reanchor_active_session_lease(self) -> None:
         """Move the CLI's active-session lease onto the live session id after a compression rekey.

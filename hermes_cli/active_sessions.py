@@ -219,12 +219,28 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
     started = _optional_float(entry.get("started_at"))
     age = f", running {format_age(time.time() - started)}" if started else ""
     since = f", since {_wall_clock(started)}" if started else ""
+    # --takeover only reclaims stale/dead leases: a live holder keeps writing
+    # from its in-memory lease no matter what the registry says, so stealing
+    # the entry would leave two writers on one session. Advertise it only
+    # when the holder is provably dead/stale (dead pid or a process
+    # start-time mismatch); a live (or unverifiable) holder gets quit-first.
+    holder_alive = _pid_liveness(pid, entry.get("process_start_time")) is not False
+    if holder_alive:
+        next_steps = (
+            "Quit that surface first (or wait for it to exit), then resume again — "
+            "a takeover only reclaims stale/dead leases.\n"
+            "To see all live session owners: hermes status"
+        )
+    else:
+        next_steps = (
+            f"To take over from that dead/stale holder: hermes chat --resume {session_id} --takeover\n"
+            "To see all live session owners: hermes status"
+        )
     return (
         f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}{since}). "
         "Only one surface at a time may run a session, because a second one would "
         "reason from a transcript that does not include the first one's work.\n"
-        f"To take over from that holder: hermes chat --resume {session_id} --takeover\n"
-        "To see all live session owners: hermes status"
+        f"{next_steps}"
     )
 
 
@@ -703,18 +719,22 @@ def takeover_active_session(
     metadata: Optional[dict[str, Any]] = None,
     registry_home: str | Path | None = None,
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
-    """Force-claim a session from its live owner (``--takeover``).
+    """Reclaim a session whose owner is dead or stale (``--takeover``).
 
-    A normal claim refuses a session with a live owner; this is the explicit operator override. Under the
-    same file lock that prunes dead owners, it drops the holder's entry and writes ours, so the steal is one
-    atomic decision: verify the holder (liveness pruning already ran, same-session match), drop its
-    entry, write ours. A dead holder never reaches the steal — pruning already reclaimed it, and the normal
-    claim path would have succeeded without the flag.
+    A normal claim refuses a session with a live owner; this is the explicit
+    operator override for the case where that owner is GONE — dead pid or a
+    recycled one (process start-time mismatch) — but its entry survived.
+    Under the same file lock that prunes dead owners, the holder's liveness
+    is re-checked at decision time: only a provably dead/stale holder
+    (``_pid_liveness`` returns False) is reclaimed; anything else is refused.
 
-    What a takeover does NOT do: fence the old owner out of its own process. A live surface never re-reads the
-    registry on its per-turn fast path (cli.py's ``if lease is not None: return True`` / the gateway's
-    equivalent), so the old owner keeps its in-memory lease and can keep driving turns until its process
-    exits — the claim site warns about that; closing the old surface is what actually ends its writes.
+    A takeover must NEVER steal from a live holder: a live surface never
+    re-reads the registry on its per-turn fast path (cli.py's
+    ``if lease is not None: return True`` / the gateway's equivalent), so the
+    old owner would keep driving turns from its in-memory lease until its
+    process exits — two writers on one session, the 2026-09-02 interleaved
+    turn class. The operator remedy for a live holder is quitting that
+    surface, not taking it over.
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
@@ -769,6 +789,31 @@ def takeover_active_session(
                 # replaces our own entry rather than logging a steal against
                 # ourselves (try_acquire re-entrancy parity).
                 continue
+            # Fail closed on a LIVE (or unverifiable) holder: --takeover only
+            # reclaims stale/dead leases. Liveness is re-checked here even
+            # though pruning just ran, because the holder can die or be
+            # recycled between the two — the decision must use fresh truth.
+            if _pid_liveness(
+                existing.get("pid"), existing.get("process_start_time")
+            ) is not False:
+                _write_entries(state_path, entries)
+                logger.info(
+                    "Refused takeover of session %s: holder pid=%s surface=%s is alive",
+                    key,
+                    existing.get("pid"),
+                    existing.get("surface"),
+                )
+                refusal = ActiveSessionRefusal(
+                    (
+                        f"holder pid {existing.get('pid')} "
+                        f"({existing.get('surface') or 'another surface'}) is alive — "
+                        "quit it first (or wait); --takeover only reclaims "
+                        "stale/dead leases"
+                    ),
+                    SESSION_NOT_OWNED,
+                )
+                refusal.holder = _lease_holder_payload(key, existing)
+                return None, refusal
             stolen = existing
         # Capacity second, mirroring try_acquire: a steal swaps one entry for one
         # entry (count unchanged); an empty-holder takeover is a plain acquire.
