@@ -3409,6 +3409,7 @@ def _sync_with_upstream_if_needed(
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_no_prompt_git_kwargs(),
     )
     if fetch_result.returncode != 0:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
