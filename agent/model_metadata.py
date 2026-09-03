@@ -3367,13 +3367,6 @@ def get_model_context_length(
                 if not _skip_persistent_context_cache(base_url, provider):
                     save_context_length(model, base_url, ctx)
                 return ctx
-            # 3. Probe-down fallback after endpoint-specific detection failed
-            logger.info(
-                "Could not detect context length for model %r at %s — "
-                "defaulting to %s tokens (probe-down). Set model.context_length "
-                "in config.yaml to override.",
-                model, base_url, f"{DEFAULT_FALLBACK_CONTEXT:,}",
-            )
             # 3b. Before falling back to the hard 256K default, consult the
             # hardcoded catalog as a last resort.  A proxied/custom Anthropic
             # gateway (e.g. corporate proxy) fails the Ollama/local probes
@@ -3381,6 +3374,9 @@ def get_model_context_length(
             # DEFAULT_CONTEXT_LENGTHS (e.g. "claude-opus-4-8" → 1M).
             # Without this, the early return here short-circuits the catalog
             # lookup at step 8 and silently caps context at 256K.
+            # The probe-down log lives AFTER this rescue: announcing a
+            # 256K default before the catalog runs would state a value the
+            # caller never gets back (the catalog hit is what returns).
             model_lower = model.lower()
             for default_model, length in sorted(
                 DEFAULT_CONTEXT_LENGTHS.items(),
@@ -3389,11 +3385,23 @@ def get_model_context_length(
             ):
                 if default_model in model_lower:
                     logger.info(
-                        "Using hardcoded context length %s for model %r "
-                        "(custom endpoint, catalog match on %r)",
-                        f"{length:,}", model, default_model,
+                        "Endpoint probes failed for model %r at %s — using "
+                        "hardcoded context length %s (custom endpoint, catalog "
+                        "match on %r). Set model.context_length or "
+                        "providers.<name>.models.<model>.context_length in "
+                        "config.yaml to override.",
+                        model, base_url, f"{length:,}", default_model,
                     )
                     return length
+            # 3c. Genuine probe-down with no catalog match — NOW the 256K
+            # default is the value actually returned, so say so.
+            logger.info(
+                "Could not detect context length for model %r at %s — "
+                "defaulting to %s tokens (probe-down). Set model.context_length "
+                "or providers.<name>.models.<model>.context_length in "
+                "config.yaml to override.",
+                model, base_url, f"{DEFAULT_FALLBACK_CONTEXT:,}",
+            )
             # Same silent-256K bug class as the step-9 fallback below —
             # warn here too so custom/local endpoints aren't left invisible.
             _warn_context_length_fallback(model, base_url)

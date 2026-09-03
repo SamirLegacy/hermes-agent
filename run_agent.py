@@ -1303,6 +1303,12 @@ class AIAgent:
                 notices = notice if isinstance(notice, list) else [notice]
                 for item in notices:
                     try:
+                        if getattr(self, "suppress_status_output", False):
+                            # -q keeps stdout machine-readable; a mid-turn
+                            # model/provider switch must still surface —
+                            # stderr is the sanctioned quiet-mode channel
+                            # (resume banner precedent).
+                            print(str(item), file=sys.stderr)
                         self._emit_status(str(item))
                     except Exception:
                         # A single surface callback failure must not hide later

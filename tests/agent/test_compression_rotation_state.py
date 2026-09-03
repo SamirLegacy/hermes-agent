@@ -2069,3 +2069,159 @@ class TestAbortedRotationDoesNotGrowParent:
 
         assert calls["n"] == 1, "the pre-flush guard never read the parent row"
         assert agent.session_id != parent  # rotation still happened
+
+
+# ── Terminal summarizer 5xx: abort by default, opt-in loud fallback ────────
+#
+# Incident 2026-09-02 (L2 forensics D3): an aux-summarizer HTTP 500 (after
+# all retries) set NONE of the abort-class flags, so compress() committed a
+# deterministic static fallback over the dropped middle window and rotated
+# the session — silently. Now a terminal 5xx sets _last_summary_server_failure
+# and aborts unchanged by default; compression.allow_static_fallback_on_server_error=true
+# opts back into the old commit, but with an unmissable warning and truthful
+# fallback_used telemetry.
+
+
+class _StubProviderError(Exception):
+    def __init__(self, message, *, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _alternating_msgs(n=12):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+        for i in range(n)
+    ]
+
+
+class TestServerErrorAbortsByDefault:
+    def test_terminal_5xx_aborts_without_dropping_messages(self):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        msgs = _alternating_msgs()
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs  # nothing dropped, no static fallback committed
+        assert c._last_summary_server_failure is True
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+
+    def test_non_5xx_transient_still_commits_fallback(self):
+        """A plain transient error (no HTTP status) keeps the historical
+        static-fallback behavior — only a terminal server error aborts."""
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        msgs = _alternating_msgs()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("backend exploded without a status"),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result != msgs  # middle window replaced by static fallback
+        assert c._last_summary_server_failure is False
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+
+
+class TestStaticFallbackOptInCommit:
+    def test_opt_in_commits_with_stderr_warning_and_true_fallback_telemetry(
+        self, tmp_path: Path, capsys, caplog
+    ):
+        """compression.allow_static_fallback_on_server_error=true: the old
+        behavior is allowed, but the commit warns on stderr in quiet mode and
+        the attempt telemetry reports fallback_used=true even though
+        commit_memory_session -> on_session_end resets the live flags first."""
+        import json
+        import logging
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_SERVER_ERROR_OPT_IN"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        # Swap the harness's mock compressor for a REAL one opted into the
+        # legacy static-fallback commit.
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+                allow_static_fallback_on_server_error=True,
+            )
+        compressor.bind_session_state(db, parent)
+        agent.context_compressor = compressor
+        agent.suppress_status_output = True  # -q: status channel is swallowed
+
+        err = _StubProviderError(
+            "Error code: 500 - Internal Server Error", status_code=500
+        )
+        # Large enough that the compressed transcript genuinely shrinks —
+        # otherwise the outer path refuses the commit as "would_grow".
+        big_msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"turn {i} " + "lorem ipsum dolor sit amet " * 12,
+            }
+            for i in range(80)
+        ]
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            with caplog.at_level(logging.INFO):
+                agent._compress_context(big_msgs, "sys", approx_tokens=999_999)
+
+        try:
+            # The opt-in committed the static fallback and rotated.
+            assert agent.session_id != parent
+            child_rows = db.get_messages(agent.session_id)
+            assert any(
+                "deterministic fallback" in (row.get("content") or "")
+                for row in child_rows
+            ), "child session carries no static-fallback handoff row"
+            # The live flag is reset by commit_memory_session ->
+            # on_session_end (that reset is exactly why the telemetry must be
+            # snapshotted pre-commit).
+            assert compressor._last_summary_fallback_used is False
+
+            # Unmissable on the quiet-mode channel.
+            err_out = capsys.readouterr().err
+            assert "Context compressed WITHOUT an LLM summary" in err_out
+            assert "provider error" in err_out
+
+            # Telemetry tells the truth about the committed fallback.
+            telemetry_lines = [
+                r.getMessage()
+                for r in caplog.records
+                if "context compression attempt telemetry" in r.getMessage()
+            ]
+            assert telemetry_lines, "no compression attempt telemetry emitted"
+            payload = json.loads(telemetry_lines[-1].split("telemetry: ", 1)[1])
+            assert payload["fallback_used"] is True
+        finally:
+            db.close()

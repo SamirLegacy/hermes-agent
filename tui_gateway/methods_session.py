@@ -1416,7 +1416,7 @@ def _(rid, params: dict) -> dict:
         else:
             sessions_dir = get_hermes_home() / "sessions"
         try:
-            deleted = db.delete_session(target, sessions_dir=sessions_dir)
+            deleted = db.delete_session(target, sessions_dir=sessions_dir, caller="desktop-rpc")
         except Exception as e:
             return _err(rid, 5036, f"delete failed: {e}")
         if not deleted:

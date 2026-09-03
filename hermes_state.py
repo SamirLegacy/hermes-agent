@@ -327,6 +327,25 @@ def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
     )
 
 
+def _session_mutation_caller_identity() -> str:
+    """Best-effort identity of the code path requesting a session mutation.
+
+    Used in WARNING logs when a guarded delete/prune refuses or skips a
+    compression-parent row so operators can trace who asked. Walks the stack
+    past hermes_state-internal frames; never raises.
+    """
+    try:
+        import inspect
+
+        for frame_info in inspect.stack()[2:10]:
+            filename = frame_info.filename or ""
+            if "hermes_state" not in filename:
+                return f"{filename}:{frame_info.lineno} ({frame_info.function})"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -8513,7 +8532,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Clone the parent's concurrent tail (rows landed after the
                 # watermark, at or below the ceiling — see docstring) into the
                 # child, after the handoff. Column-exact except id/session_id;
-                # originals stay in the (closed) parent for lineage recovery.
+                # originals stay in the (closed) parent for lineage recovery,
+                # unless the parent is explicitly deleted.
                 _ceiling_clause = ""
                 _params: list = [parent_session_id, int(watermark)]
                 if watermark_ceiling is not None:
@@ -15227,6 +15247,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
+        caller: Optional[str] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -15243,18 +15264,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inside the write transaction on purpose (TOCTOU guard); the cost is
         accepted for correctness. Returns True if the session was found and
         deleted.
+
+        Every successful delete logs ONE INFO line naming the session id, its
+        ``end_reason``, message count, how many child rows were orphaned
+        (``parent_session_id → NULL``), and *caller* — a delete used to be
+        invisible at INFO/WARNING, which made a compression parent's lineage
+        loss unattributable. Callers pass a stable label (``desktop-rpc``,
+        ``sessions-cmd``, ``cli-exit``, ...); unlabeled callers are identified
+        by a best-effort stack walk.
         """
         removed_delegate_ids: List[str] = []
         expected_ids = (
             set(expected_delete_ids) if expected_delete_ids is not None else None
         )
+        delete_stats: Dict[str, Any] = {}
 
         def _do(conn):
             cursor = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+                "SELECT end_reason FROM sessions WHERE id = ? LIMIT 1",
+                (session_id,),
             )
-            if cursor.fetchone() is None:
+            row = cursor.fetchone()
+            if row is None:
                 return False
+            delete_stats["end_reason"] = (row[0] if row[0] else "") or ""
+            delete_stats["messages"] = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            delete_stats["orphaned_children"] = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -15276,6 +15317,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         deleted = self._execute_write(_do)
         if deleted:
+            logger.info(
+                "delete_session: session=%s end_reason=%s messages=%d "
+                "orphaned_children=%d caller=%s",
+                session_id,
+                delete_stats.get("end_reason") or "none",
+                delete_stats.get("messages", 0),
+                delete_stats.get("orphaned_children", 0),
+                caller or _session_mutation_caller_identity(),
+            )
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
             self._remove_session_files(sessions_dir, session_id)
@@ -15880,7 +15930,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Only prunes ended sessions (not active ones).  Child sessions outside
         the prune window are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted.  When *sessions_dir* is provided, also removes
+        than cascade-deleted.  Pruned sessions ended by compression
+        (``end_reason='compression'``) whose child rows still reference them
+        are logged at INFO (one line, with caller identity): their rows were
+        the lineage-recovery record for the rotated child.  When
+        *sessions_dir* is provided, also removes
         on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
@@ -15922,6 +15976,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             if not session_ids:
                 return 0
+
+            # Compression parents in the prune set orphan their rotated
+            # children (parent_session_id → NULL below) — the lineage-recovery
+            # record goes with them. Not refused (an explicit prune is the
+            # operator's call), but never silent: one INFO line names them.
+            _ph_guard = ",".join("?" * len(session_ids))
+            _guarded_rows = conn.execute(
+                f"SELECT s.id FROM sessions s WHERE s.id IN ({_ph_guard}) "
+                "AND COALESCE(s.end_reason, '') = 'compression' "
+                "AND EXISTS (SELECT 1 FROM sessions c "
+                "WHERE c.parent_session_id = s.id)",
+                list(session_ids),
+            ).fetchall()
+            _guarded_ids = {row["id"] for row in _guarded_rows}
+            if _guarded_ids:
+                logger.info(
+                    "prune_sessions: deleting %d compression parent(s) with "
+                    "live children — their rows were the lineage-recovery "
+                    "record (caller: %s): %s",
+                    len(_guarded_ids),
+                    _session_mutation_caller_identity(),
+                    sorted(_guarded_ids),
+                )
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))

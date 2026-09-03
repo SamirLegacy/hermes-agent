@@ -2668,6 +2668,82 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+def _record_fallback_in_session(
+    agent,
+    old_model: str,
+    old_provider: str,
+    new_model: str,
+    new_provider: str,
+    reason,
+) -> None:
+    """Persist a mid-turn provider fallback so resumes and audits see it.
+
+    Two best-effort writes, both swallowed on error (persistence must never
+    break the retry loop):
+
+    1. A durable ``session_meta`` transcript row (same family as the
+       compaction handoff rows — filtered out of the model context on
+       resume) recording old→new model, the failover reason, and a
+       timestamp.
+    2. The session row's model_config route (``gateway_runtime`` +
+       ``fallback_from``/``fallback_reason``) so a later ``--resume``
+       restores the model that actually answered last instead of
+       re-resolving the ambient config default.
+    """
+    try:
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None) or ""
+        if session_db is None or not session_id:
+            return
+        reason_value = getattr(reason, "value", None) or (
+            str(reason) if reason else "unknown"
+        )
+        timestamp = time.time()
+        try:
+            session_db.append_message(
+                session_id,
+                "session_meta",
+                f"Model fallback: {old_model} via {old_provider} → "
+                f"{new_model} via {new_provider} (reason: {reason_value})",
+                display_metadata={
+                    "kind": "model_fallback",
+                    "old_model": str(old_model or ""),
+                    "old_provider": str(old_provider or ""),
+                    "new_model": str(new_model or ""),
+                    "new_provider": str(new_provider or ""),
+                    "reason": reason_value,
+                    "timestamp": timestamp,
+                },
+            )
+        except Exception:
+            logger.debug("Fallback transcript marker write failed", exc_info=True)
+        # Same write discipline as the CLI /model persist: explicit None
+        # deletes stale keys in BOTH the nested gateway_runtime dict and the
+        # top-level keys.
+        route = {
+            "provider": new_provider or None,
+            "base_url": getattr(agent, "base_url", None) or None,
+            "api_mode": getattr(agent, "api_mode", None) or None,
+        }
+        try:
+            session_db.update_session_model(
+                session_id, new_model, provider=new_provider or None
+            )
+            session_db.patch_session_model_config(
+                session_id,
+                {
+                    "gateway_runtime": route,
+                    **route,
+                    "fallback_from": str(old_model or ""),
+                    "fallback_reason": reason_value,
+                },
+            )
+        except Exception:
+            logger.debug("Fallback route persistence failed", exc_info=True)
+    except Exception:
+        logger.debug("Fallback session persistence skipped", exc_info=True)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -3121,9 +3197,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # a fallback-recovery notice after an actual provider fallback.
         agent._provider_fallback_active = True
         agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+        # The classifier's reason is otherwise DEBUG-only
+        # (conversation_loop.py), so a mid-turn provider switch must announce
+        # its trigger at INFO — a silent switch is undiagnosable after the
+        # fact.
+        logger.info(
+            "Fallback trigger: %s (%s)",
+            getattr(reason, "value", None) or (str(reason) if reason else "unknown"),
+            _fallback_reason_text(reason),
+        )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
+        )
+        # Durable record: transcript marker row + persisted fallback route so
+        # a later resume restores the model that actually answered.
+        _record_fallback_in_session(
+            agent, old_model, old_provider, fb_model, fb_provider, reason
         )
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would

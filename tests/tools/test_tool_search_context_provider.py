@@ -30,7 +30,7 @@ class TestResolveActiveContextLengthProviderAware:
 
         captured = {}
 
-        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider=""):
+        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
             captured.update(
                 model=model_id, base_url=base_url, api_key=api_key,
                 config_ctx=config_context_length, provider=provider,
@@ -60,7 +60,7 @@ class TestResolveActiveContextLengthProviderAware:
 
         captured = {}
 
-        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider=""):
+        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
             captured.update(base_url=base_url, api_key=api_key, provider=provider)
             return 272_000
 
@@ -83,7 +83,7 @@ class TestResolveActiveContextLengthProviderAware:
 
         captured = {}
 
-        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider=""):
+        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
             captured.update(base_url=base_url, provider=provider)
             return 200_000
 
@@ -103,7 +103,7 @@ class TestResolveActiveContextLengthProviderAware:
 
         captured = {}
 
-        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider=""):
+        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
             captured["config_ctx"] = config_context_length
             return config_context_length or 0
 
@@ -117,3 +117,93 @@ class TestResolveActiveContextLengthProviderAware:
 
         assert ctx == 150_000
         assert captured["config_ctx"] == 150_000
+
+    def test_provider_catalog_context_length_honored_without_probe(self):
+        """providers.<name>.models.<model>.context_length sizes the gate.
+
+        A proxied custom endpoint (e.g. VibeProxy) rarely reports context
+        lengths, so the gate used to probe, fail, and size against the 256K
+        probe-down default despite an explicit operator-set 1M entry. The
+        provider-catalog entry must be honored BEFORE any cache or network
+        probe — exactly like the compressor's startup path.
+        """
+        import model_tools
+
+        cfg = {
+            "model": {
+                "model": "claude-fable-5",
+                "provider": "vibeproxy-claude",
+                "base_url": "http://127.0.0.1:8317/v1",
+            },
+            "providers": {
+                "vibeproxy-claude": {
+                    "base_url": "http://127.0.0.1:8317/v1",
+                    "api": "chat_completions",
+                    "models": {
+                        "claude-fable-5": {"context_length": 1_000_000},
+                    },
+                },
+            },
+        }
+
+        def _explode_if_called(*args, **kwargs):
+            raise AssertionError(
+                "get_model_context_length must not run — the provider-catalog "
+                "entry resolves the gate without a probe"
+            )
+
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=RuntimeError("no credentials in test")), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.get_model_context_length",
+                   side_effect=_explode_if_called) as mock_get:
+            ctx = model_tools._resolve_active_context_length()
+
+        assert ctx == 1_000_000
+        mock_get.assert_not_called()
+
+    def test_provider_catalog_threaded_into_full_resolver(self):
+        """When the catalog entry does NOT cover the model, the full resolver
+        still runs — with custom_providers threaded so its step-0c lookup can
+        honor provider-catalog entries for other models on the same route."""
+        import model_tools
+
+        captured = {}
+
+        def fake_get_ctx(model_id, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
+            captured["custom_providers"] = custom_providers
+            return 256_000
+
+        cfg = {
+            "model": {
+                "model": "some-other-model",
+                "provider": "vibeproxy-claude",
+                "base_url": "http://127.0.0.1:8317/v1",
+            },
+            "providers": {
+                "vibeproxy-claude": {
+                    "base_url": "http://127.0.0.1:8317/v1",
+                    "api": "chat_completions",
+                    "models": {
+                        "claude-fable-5": {"context_length": 1_000_000},
+                    },
+                },
+            },
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=RuntimeError("no credentials in test")), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.get_model_context_length", side_effect=fake_get_ctx):
+            ctx = model_tools._resolve_active_context_length()
+
+        assert ctx == 256_000
+        cps = captured["custom_providers"]
+        assert isinstance(cps, list) and cps, "custom_providers must be threaded"
+        assert any(
+            (cp.get("models") or {}).get("claude-fable-5", {}).get("context_length")
+            == 1_000_000
+            for cp in cps
+        )

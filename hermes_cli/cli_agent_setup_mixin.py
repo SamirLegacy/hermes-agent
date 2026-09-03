@@ -492,6 +492,21 @@ class CLIAgentSetupMixin:
                 self._restore_session_cwd(session_meta, quiet=_quiet_mode)
                 self._restore_session_yolo(session_meta, quiet=_quiet_mode)
                 self._restore_session_model(session_meta, quiet=_quiet_mode)
+                # Fail loud on an unresolvable stored route: WITHOUT this the
+                # -q path built the agent on the ambient config default and
+                # silently ran a different model than the session's stored
+                # one (D1). The interactive path keeps its soft behavior —
+                # a live TTY can surface the auth error on the first turn.
+                _route_err = getattr(self, "_resume_route_error", None)
+                if _route_err and getattr(self, "_single_query_mode", False):
+                    print(
+                        f"Cannot resume session {self.session_id} on its stored "
+                        f"model route: {_route_err}. No explicit -m override "
+                        "given — refusing to silently fall back to the config "
+                        "default model.",
+                        file=sys.stderr,
+                    )
+                    return False
             else:
                 if _quiet_mode:
                     print(
@@ -509,6 +524,16 @@ class CLIAgentSetupMixin:
                 pass
         
         try:
+            # A single-query resume (`chat --resume <id> -q`) snapshots
+            # self.model/self.provider into turn_route BEFORE this restore
+            # ran and passes them back as model_override/runtime_override —
+            # values that outrank the freshly restored self.model below and
+            # silently ran the resumed session on the ambient config default.
+            # When this session was resumed without an explicit -m, the
+            # restored model/route MUST win over any override snapshot.
+            _restored_route_wins = bool(getattr(self, "_resumed", False)) and not getattr(
+                self, "_explicit_model_override", False
+            )
             runtime = runtime_override or {
                 "api_key": self.api_key,
                 "base_url": self.base_url,
@@ -521,7 +546,22 @@ class CLIAgentSetupMixin:
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
-            effective_model = model_override or self.model
+            if _restored_route_wins:
+                effective_model = self.model
+                runtime = {
+                    **runtime,
+                    "api_key": self.api_key or runtime.get("api_key"),
+                    "base_url": self.base_url or runtime.get("base_url"),
+                    "provider": self.provider,
+                    "requested_provider": getattr(
+                        self, "requested_provider", self.provider
+                    ),
+                    "api_mode": self.api_mode,
+                    "credential_pool": getattr(self, "_credential_pool", None)
+                    or runtime.get("credential_pool"),
+                }
+            else:
+                effective_model = model_override or self.model
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),

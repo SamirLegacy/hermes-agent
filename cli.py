@@ -9354,6 +9354,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         launched with an explicit ``-m`` override (user intent wins).
         """
         stored_model = (session_meta or {}).get("model")
+        # Fresh attempt — a stale route error from an earlier resume must
+        # never fail an unrelated later restore.
+        self._resume_route_error = None
         if not stored_model:
             return
         # An explicit -m / --model on the command line overrides resume.
@@ -9386,6 +9389,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         provider_changed = bool(stored_provider) and stored_provider != self.provider
         if not model_changed and not provider_changed:
             return
+        # The pre-restore self.model is the ambient config default — capture
+        # it for the quiet-mode line that names what was ignored.
+        ambient_default_model = self.model
         self.model = stored_model
         if stored_provider:
             self.provider = stored_provider
@@ -9415,11 +9421,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.base_url = resolved["base_url"]
                 if not stored_api_mode and resolved.get("api_mode"):
                     self.api_mode = resolved["api_mode"]
-            except Exception:
+            except Exception as _route_exc:
                 logger.debug(
                     "Credential re-resolution for resumed session provider "
                     "%s failed; keeping ambient credentials",
                     stored_provider, exc_info=True,
+                )
+                # Single-query resume fails loud on this (see _init_agent):
+                # silently starting on the ambient config default would run
+                # the resumed session on the wrong route.
+                self._resume_route_error = (
+                    f"stored provider {stored_provider!r} could not be "
+                    f"resolved: {_route_exc}"
                 )
         # If the agent is already running (mid-chat /resume), swap it
         # in-place so the next turn uses the restored model. On startup
@@ -9442,7 +9455,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if stored_provider:
             msg += f" ({stored_provider})"
         if quiet:
-            print(msg, file=sys.stderr)
+            if model_changed:
+                # Name the ignored config default — a resumed quiet-mode run
+                # must never look like it silently kept the ambient route.
+                print(
+                    f"Resumed session {getattr(self, 'session_id', '')} on "
+                    f"stored model {stored_model}"
+                    + (f" ({stored_provider})" if stored_provider else "")
+                    + f" — config default {ambient_default_model} ignored",
+                    file=sys.stderr,
+                )
+            else:
+                print(msg, file=sys.stderr)
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
@@ -21609,7 +21633,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         from hermes_constants import get_hermes_home as _ghh
                         _sessions_dir = _ghh() / "sessions"
                         _sid = self.agent.session_id
-                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
+                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir, caller="cli-exit"):
                             _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
                         else:
                             _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")

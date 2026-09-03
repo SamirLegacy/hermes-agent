@@ -2481,12 +2481,26 @@ class ContextCompressor(ContextEngine):
     def _resolve_context_length(self) -> int:
         """Resolve and cache the model's context length on first access."""
         if self._resolved_context_length is None:
+            # Thread the provider catalog so an explicit
+            # providers.<name>.models.<model>.context_length entry is honored
+            # (step 0c) instead of paying a doomed endpoint probe — defense in
+            # depth for the day agent_init's pre-lookup changes.
+            _custom_providers = None
+            try:
+                from hermes_cli.config import (
+                    get_compatible_custom_providers,
+                    load_config,
+                )
+                _custom_providers = get_compatible_custom_providers(load_config() or {})
+            except Exception:
+                _custom_providers = None
             self._resolved_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 config_context_length=self._config_context_length,
                 provider=self.provider,
+                custom_providers=_custom_providers,
             )
             # Small-context threshold floor: models under 512K trigger at
             # >=75% so compaction doesn't fire with half the window still
@@ -3424,6 +3438,7 @@ class ContextCompressor(ContextEngine):
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
+        allow_static_fallback_on_server_error: bool = False,
         summary_model_override: str = None,
         base_url: str = "",
         api_key: str = "",
@@ -3515,6 +3530,7 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        self.allow_static_fallback_on_server_error = allow_static_fallback_on_server_error
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -3657,6 +3673,12 @@ class ContextCompressor(ContextEngine):
         # silently destroys the compacted middle and compounds across
         # iterative updates. (Ported from earendil-works/pi#7048.)
         self._last_summary_truncated_failure: bool = False
+        # Set when the summarizer ultimately failed with a terminal HTTP 5xx
+        # after all retries (incl. any main-model fallback) — the provider is
+        # broken, the request is fine. compress() aborts unchanged by default;
+        # compression.allow_static_fallback_on_server_error=true opts back
+        # into the static-fallback commit (with a loud warning at commit).
+        self._last_summary_server_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -5494,6 +5516,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_network_failure = False
             self._last_summary_empty_content_failure = False
             self._last_summary_truncated_failure = False
+            self._last_summary_server_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -5693,6 +5716,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._last_summary_truncated_failure = True
             elif _is_empty_content:
                 self._last_summary_empty_content_failure = True
+            # A terminal HTTP 5xx (after all retries, incl. any main-model
+            # fallback) is a server-side provider failure: the request was
+            # fine, the endpoint is broken. Flag it so compress() aborts
+            # unchanged by default instead of committing a deterministic
+            # fallback over the dropped middle window — same class as the
+            # auth/network aborts. Independent flag (not elif): a 502 also
+            # matches the timeout cooldown ladder above.
+            if isinstance(_status, int) and 500 <= _status < 600:
+                self._last_summary_server_failure = True
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
@@ -8155,6 +8187,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             or self._last_summary_network_failure
             or self._last_summary_empty_content_failure
             or self._last_summary_truncated_failure
+            or (
+                self._last_summary_server_failure
+                and not self.allow_static_fallback_on_server_error
+            )
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -8168,6 +8204,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 telemetry["failure_class"] = "summary_truncated_failure"
             elif self._last_summary_empty_content_failure:
                 telemetry["failure_class"] = "summary_empty_content_failure"
+            elif self._last_summary_server_failure:
+                telemetry["failure_class"] = "summary_server_failure"
             else:
                 telemetry["failure_class"] = "summary_generation_aborted"
             # Roll back the self-heal rehydration so this aborted attempt is a
@@ -8212,6 +8250,17 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "the session was NOT rotated. This indicates upstream provider "
                         "degradation: retry with /compress once the provider recovers, "
                         "or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif self._last_summary_server_failure:
+                    logger.warning(
+                        "Summary generation failed with a terminal provider "
+                        "server error (HTTP 5xx after all retries) — aborting "
+                        "compression. %d message(s) preserved unchanged; the "
+                        "session was NOT rotated. This is provider-side: retry "
+                        "with /compress once the provider recovers, or set "
+                        "compression.allow_static_fallback_on_server_error=true "
+                        "to permit a deterministic fallback commit.",
                         n_skipped,
                     )
                 else:

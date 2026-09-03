@@ -354,3 +354,192 @@ class TestPeelReferenceGuidanceRoundTrip:
         ]
         peeled = peel_reference_guidance(messages, self._GUIDANCE)
         assert peeled == messages[:-1]
+
+
+# ── Mid-turn provider fallback: durable record + loud surfaces ─────────────
+#
+# Incident 2026-09-02 (L2 forensics D4): try_activate_fallback swapped
+# fable-5 → kimi-k3 mid-turn and wrote NOTHING to the session row or
+# transcript — a later resume re-resolved the ambient default instead of the
+# model that actually answered; the classifier's reason was DEBUG-only; and
+# the user-facing notice died with the suppressed -q status channel.
+
+
+class _MockFallbackClient:
+    base_url = "https://api.moonshot.cn/v1"
+    api_key = "fb-key"
+
+
+def _fallback_agent_with_db(db, session_id):
+    """Real AIAgent on a fallback chain, bound to a real session row."""
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=[{"provider": "kimi-coding", "model": "kimi-k3"}],
+            session_db=db,
+            session_id=session_id,
+        )
+    agent.client = MagicMock()
+    # The pre-fallback identity, mirroring the incident's VibeProxy lane.
+    agent.model = "claude-fable-5"
+    agent.provider = "vibeproxy-claude"
+    agent.base_url = "http://127.0.0.1:8317/v1"
+    return agent
+
+
+class TestFallbackPersistsRoute:
+    def test_marker_row_and_session_route_recorded(self, tmp_path):
+        import json
+        from unittest.mock import patch
+
+        from agent.error_classifier import FailoverReason
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(
+                session_id="FB1", source="cli", model="claude-fable-5"
+            )
+            agent = _fallback_agent_with_db(db, "FB1")
+            with patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_MockFallbackClient(), "kimi-k3"),
+            ):
+                assert agent._try_activate_fallback(
+                    FailoverReason.server_error
+                ) is True
+
+            assert agent.model == "kimi-k3"
+
+            # (a) Durable transcript marker, same family as the compaction
+            # handoff rows: a session_meta row recording old→new + reason.
+            meta_rows = [
+                row
+                for row in db.get_messages("FB1")
+                if row.get("role") == "session_meta"
+            ]
+            assert len(meta_rows) == 1, db.get_messages("FB1")
+            row = meta_rows[0]
+            assert "claude-fable-5" in (row.get("content") or "")
+            assert "kimi-k3" in (row.get("content") or "")
+            dm = row.get("display_metadata") or {}
+            assert dm.get("kind") == "model_fallback"
+            assert dm.get("old_model") == "claude-fable-5"
+            assert dm.get("new_model") == "kimi-k3"
+            assert dm.get("new_provider") == "kimi-coding"
+            assert dm.get("reason") == "server_error"
+            assert dm.get("timestamp")
+
+            # (b) The session row carries the fallback route so a later
+            # resume (with the D1 restore) runs the model that actually
+            # answered — plus provenance of the switch.
+            meta = db.get_session("FB1")
+            assert meta["model"] == "kimi-k3"
+            config = json.loads(meta["model_config"])
+            assert config["gateway_runtime"]["provider"] == "kimi-coding"
+            assert config["gateway_runtime"]["base_url"] == (
+                "https://api.moonshot.cn/v1"
+            )
+            assert config["fallback_from"] == "claude-fable-5"
+            assert config["fallback_reason"] == "server_error"
+        finally:
+            db.close()
+
+    def test_fallback_trigger_reason_is_info_level_and_precedes_activation(
+        self, tmp_path, caplog
+    ):
+        """The classifier result was DEBUG-only — an undiagnosable switch.
+        The trigger must log at INFO right before 'Fallback activated'."""
+        import logging
+        from unittest.mock import patch
+
+        from agent.error_classifier import FailoverReason
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(
+                session_id="FB2", source="cli", model="claude-fable-5"
+            )
+            agent = _fallback_agent_with_db(db, "FB2")
+            with caplog.at_level(
+                logging.INFO, logger="agent.chat_completion_helpers"
+            ):
+                with patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_MockFallbackClient(), "kimi-k3"),
+                ):
+                    assert agent._try_activate_fallback(
+                        FailoverReason.server_error
+                    ) is True
+
+            messages = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "agent.chat_completion_helpers"
+            ]
+            trigger = next(
+                (m for m in messages if m.startswith("Fallback trigger:")), None
+            )
+            activated = next(
+                (m for m in messages if m.startswith("Fallback activated:")),
+                None,
+            )
+            assert trigger is not None, messages
+            assert activated is not None, messages
+            assert "server_error" in trigger
+            assert messages.index(trigger) < messages.index(activated)
+        finally:
+            db.close()
+
+
+class TestPendingFallbackNoticeChannel:
+    """-q keeps stdout machine-readable: the mid-turn switch notice must go
+    to stderr when the status channel is suppressed, not die with the
+    process."""
+
+    def _stub(self, suppress):
+        from types import SimpleNamespace
+
+        emitted = []
+        return SimpleNamespace(
+            _pending_fallback_notice=(
+                "Model fallback: claude-fable-5 via vibeproxy-claude "
+                "unavailable; using kimi-k3 via kimi-coding."
+            ),
+            suppress_status_output=suppress,
+            _emit_status=lambda s: emitted.append(s),
+            _retry_status_buffer=None,
+        ), emitted
+
+    def test_notice_goes_to_stderr_when_status_suppressed(self, capsys):
+        from run_agent import AIAgent
+
+        stub, emitted = self._stub(suppress=True)
+        AIAgent._emit_pending_fallback_notice(stub)
+        out = capsys.readouterr()
+        assert "Model fallback" in out.err
+        assert "Model fallback" not in out.out  # stdout stays clean
+        assert emitted, "status channel must still be notified"
+        assert stub._pending_fallback_notice is None
+
+    def test_notice_not_duplicated_to_stderr_in_normal_mode(self, capsys):
+        from run_agent import AIAgent
+
+        stub, emitted = self._stub(suppress=False)
+        AIAgent._emit_pending_fallback_notice(stub)
+        out = capsys.readouterr()
+        assert "Model fallback" not in out.err
+        assert emitted
