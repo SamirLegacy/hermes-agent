@@ -211,7 +211,7 @@ def test_single_canonical_sync_line():
         "the canonical dependency-sync line must be defined exactly once "
         "(CANONICAL_SYNC=...); any other occurrence re-opens the MCP-prune hole"
     )
-    assert "CANONICAL_SYNC=(uv sync --extra dev --extra mcp)" in text
+    assert "CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)" in text
     assert 'command -v uv' in text, "script must refuse to run without uv"
 
 
@@ -219,6 +219,44 @@ def test_verify_and_deploy_use_the_canonical_line():
     text = SCRIPT.read_text()
     assert text.count('"${CANONICAL_SYNC[@]}"') >= 2, (
         "verify and deploy must both expand CANONICAL_SYNC"
+    )
+
+
+def test_canonical_sync_is_inexact():
+    """The canonical sync must never prune extraneous packages: the runtime
+    venv legitimately carries lazy_deps-installed provider deps and aiohttp
+    outside the dev+mcp lock set (incident 2026-09-03: 20 packages
+    uninstalled, aiohttp among them — the next gateway restart would have
+    killed every Hermes dispatch)."""
+    text = SCRIPT.read_text()
+    assert "--inexact" in text, (
+        "uv sync without --inexact removes extraneous packages from the "
+        "runtime venv — lazy_deps deps and aiohttp live outside the dev+mcp set"
+    )
+    assert "CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)" in text
+
+
+def test_deploy_guard_and_restore_cover_aiohttp():
+    """Deploy runs against the live runtime venv: its import guard must also
+    assert aiohttp (gateway/platforms/api_server.py refuses to start the API
+    server without it) and the additive restore must pin it. The verify guard
+    (worktree .venv, a test venv) stays mcp/httpx2 only."""
+    text = SCRIPT.read_text()
+    assert '"$MAIN_CHECKOUT/venv/bin/python" -c \'import mcp, httpx2, aiohttp\'' in text, (
+        "deploy guard must import aiohttp in the runtime venv"
+    )
+    assert "'mcp==2.0.0' 'httpx2==2.7.0' 'aiohttp==3.14.3'" in text, (
+        "additive restore must pin aiohttp==3.14.3 (the pin every pyproject "
+        "extra uses) next to mcp/httpx2"
+    )
+    assert '"$MAIN_CHECKOUT/venv/bin/python" -c \'import mcp, httpx2\'' not in text, (
+        "the old aiohttp-blind deploy guard must not survive anywhere"
+    )
+    assert '"$WORKTREE/.venv/bin/python" -c \'import mcp, httpx2\'' in text, (
+        "verify guard (worktree test venv) keeps the mcp/httpx2 check"
+    )
+    assert '"$WORKTREE/.venv/bin/python" -c \'import mcp, httpx2, aiohttp\'' not in text, (
+        "the worktree test venv must not be required to carry aiohttp"
     )
 
 

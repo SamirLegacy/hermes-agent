@@ -19,12 +19,13 @@ BUNDLE_SWAP_SCRIPT="${FORK_SYNC_BUNDLE_SWAP_SCRIPT:-$MAIN_CHECKOUT/scripts/fork-
 SKILLS_SNAPSHOT="${FORK_SYNC_SKILLS_SNAPSHOT:-${TMPDIR:-/tmp}/fork-sync-skills-before.txt}"
 SKILLS_AFTER="$SKILLS_SNAPSHOT.after"
 
-# STRUCTURAL MCP GUARD — the single canonical dependency-sync invocation.
-# verify and deploy both expand this exact array; tests/scripts/test_fork_sync_sh.py
-# enforces that this is the script's only such line. `--extra mcp` is load-bearing:
-# a sync without it prunes mcp/httpx2 and kills every MCP server profile-wide
-# (incident 2026-09-02, "streamable_http not available").
-CANONICAL_SYNC=(uv sync --extra dev --extra mcp)
+# STRUCTURAL GUARD — the single canonical dependency-sync invocation; verify and
+# deploy both expand this exact array and tests/scripts/test_fork_sync_sh.py
+# enforces it is the script's only such line. --inexact is load-bearing: install
+# and pin the declared set (mcp stays a mandatory extra) but NEVER remove
+# extraneous packages — the runtime venv carries lazy_deps provider deps and
+# aiohttp (API server) outside the dev+mcp lock set (2026-09-03: 20 pruned).
+CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)
 
 SUB=""
 SUMMARY="ok"
@@ -212,10 +213,14 @@ cmd_deploy() {
   SUMMARY="canonical sync of the runtime venv ($MAIN_CHECKOUT/venv)"
   ( cd "$MAIN_CHECKOUT" && env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=venv nice -n 15 "${CANONICAL_SYNC[@]}" )
 
-  "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2' || {
-    SUMMARY="mcp/httpx2 missing after runtime sync — restoring locked pins additively"
-    env -u PYTHONPATH uv pip install --python "$MAIN_CHECKOUT/venv/bin/python" 'mcp==2.0.0' 'httpx2==2.7.0'
-    "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2' \
+  # Runtime-venv guard only (the worktree .venv is a test venv — mcp/httpx2):
+  # aiohttp is API-server-load-bearing (gateway/platforms/api_server.py refuses
+  # to start without it) yet lives only in optional extras, so the sync never
+  # installs it — --inexact preserves it, and the restore re-pins it if missing.
+  "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2, aiohttp' || {
+    SUMMARY="mcp/httpx2/aiohttp missing after runtime sync — restoring locked pins additively"
+    env -u PYTHONPATH uv pip install --python "$MAIN_CHECKOUT/venv/bin/python" 'mcp==2.0.0' 'httpx2==2.7.0' 'aiohttp==3.14.3'
+    "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2, aiohttp' \
       || { SUMMARY="import guard FAILED even after additive restore"; return 23; }
   }
 

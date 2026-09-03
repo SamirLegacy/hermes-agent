@@ -42,7 +42,7 @@ Every subcommand is idempotent and prints a one-line receipt
 
 ## The canonical sync line (structural MCP guard)
 
-Exactly one place defines it: `CANONICAL_SYNC=(uv sync --extra dev --extra mcp)`
+Exactly one place defines it: `CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)`
 at the top of the script. `verify` and `deploy` both expand it; no other
 `uv sync` exists in the script (enforced by
 `tests/scripts/test_fork_sync_sh.py::test_single_canonical_sync_line`), and the
@@ -52,8 +52,24 @@ default sync set) and killed every MCP server profile-wide. `--extra mcp`
 pins `mcp==2.0.0`, `httpx2==2.7.0`, `starlette==1.3.1`; `--extra dev` is needed
 in the worktree for pytest and already carries the same pins, so the guard
 holds in both venvs. `deploy` additionally falls back to the additive
-`uv pip install 'mcp==2.0.0' 'httpx2==2.7.0'` restore if the import guard
-still fails in the runtime venv.
+`uv pip install 'mcp==2.0.0' 'httpx2==2.7.0' 'aiohttp==3.14.3'` restore if
+the import guard still fails in the runtime venv.
+
+### Why --inexact
+
+`--inexact` (uv 0.11.14: "Do not remove extraneous packages present in the
+environment") is the difference between installing the declared set and
+imposing it. On 2026-09-03 a deploy ran the exact sync against the live
+runtime venv and uninstalled 20 packages that were present but not in the
+dev+mcp lock set — among them `aiohttp`, which `gateway/platforms/api_server.py`
+hard-requires to start the API server. The running gateway survived only
+because aiohttp was already imported; the next restart would have killed
+every Hermes dispatch. The runtime venv legitimately carries packages the
+lock does not know (`tools/lazy_deps.py` installs provider deps on demand),
+so the sync installs and pins but never prunes. `deploy`'s runtime-venv guard
+additionally asserts `import mcp, httpx2, aiohttp` and restores
+`aiohttp==3.14.3` (the pin every pyproject extra uses) additively; the
+verify guard on the worktree `.venv` stays mcp/httpx2 only.
 
 ## Desktop bundle
 
