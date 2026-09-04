@@ -1295,7 +1295,7 @@ class TestStripProviderPrefix:
 
     def test_registered_profile_name_and_alias_are_stripped(self, monkeypatch):
         import providers
-        from providers import ProviderProfile
+        from providers.base import ProviderProfile
 
         monkeypatch.setattr(providers, "_REGISTRY", {})
         monkeypatch.setattr(providers, "_ALIASES", {})

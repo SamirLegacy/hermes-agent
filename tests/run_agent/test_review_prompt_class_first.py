@@ -2,6 +2,14 @@
 
 Background review must not directly write memory or skills. It may only emit
 structured candidate signals for the score-gated ledger/promotion lane.
+
+Sync note (2026-09-04): upstream's old-doctrine tests (active-update bias,
+memory section, unresolved-failures, read-before-write, lesson-layer on
+_MEMORY/_SKILL/_COMBINED review prompts) were dropped — they assert the
+direct-write review doctrine the fork deliberately replaced with the
+candidate-only lane. Upstream's lesson-layer doctrine survives in
+``agent/curator.py`` (``CURATOR_REVIEW_PROMPT``), covered by the curator
+test below.
 """
 
 from run_agent import AIAgent
@@ -58,3 +66,15 @@ def test_background_review_prompts_do_not_bias_toward_most_sessions_writing():
         assert "most sessions produce" not in lower
         assert "missed learning opportunity" not in lower
         assert "be active" not in lower
+
+
+# ---------------------------------------------------------------------------
+# Upstream's curator prompt (agent/curator.py) — the consolidation lane where
+# lesson-layer doctrine lives in the merged tree. Kept from upstream.
+# ---------------------------------------------------------------------------
+
+def test_curator_prompt_consolidates_by_distilling():
+    from agent.curator import CURATOR_REVIEW_PROMPT
+    lower = CURATOR_REVIEW_PROMPT.lower()
+    assert "distill" in lower, "curator must distill absorbed content, not file it"
+    assert "verbatim" in lower and "per-incident" in lower, "curator must not copy siblings verbatim into references/"
