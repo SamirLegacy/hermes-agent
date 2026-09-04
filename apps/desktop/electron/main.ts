@@ -6771,6 +6771,7 @@ async function showPluginCompatNoticeOnce() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
   }
+
   let notice
 
   try {
@@ -6784,6 +6785,7 @@ async function showPluginCompatNoticeOnce() {
   if (!notice) {
     return
   }
+
   pluginCompatNoticeShown = true
   rememberLog(`[plugins] compat notice shown (${notice.key})`)
 
