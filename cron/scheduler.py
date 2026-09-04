@@ -2240,7 +2240,11 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     if raw_service_tier in {"fast", "priority", "on"}:
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        request_overrides = resolve_fast_mode_overrides(setup.model) or {}
+        request_overrides = resolve_fast_mode_overrides(
+            setup.model,
+            provider=setup.runtime.get("provider"),
+            base_url=setup.runtime.get("base_url"),
+        ) or {}
         if request_overrides and request_overrides.get("service_tier") == "priority":
             service_tier = "priority"
     elif raw_service_tier not in {

@@ -79,7 +79,7 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
+def _patch_gateway_restart():
     """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
 
     The restart phase used to swallow every exception at debug level, so these
@@ -87,12 +87,27 @@ def _patch_gateway_discovery():
     the phase is surfaced (#78574: an aborted restart now fails the update),
     an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    Patch the protected ``update_cmd`` call-site binding rather than
+    ``hermes_cli.gateway``: the updater intentionally purges that latter module
+    after a pull, which discards attribute patches mid-test. No test in this
+    module asserts on gateway restarts.
     """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
-         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+    from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
+
+    outcome = _GatewayRestartOutcome(
+        incomplete=False,
+        phase_errors=[],
+        pre_restart_gateway_pids=[],
+        restarted_services=[],
+        failed_or_stale_units=[],
+        relaunched_profiles=[],
+        externally_supervised_profiles=[],
+        killed_pids=set(),
+    )
+    with patch(
+        "hermes_cli.update_cmd._restart_gateway_fleet_after_update",
+        return_value=outcome,
+    ):
         yield
 
 

@@ -132,14 +132,14 @@ _DESKTOP_MCP_DISCOVERY_DELAY_S = 1.0
 def _shutdown_mcp_servers_best_effort() -> None:
     """Shut down MCP server connections during server teardown.
 
-    Delegates to ``tools.mcp_tool.shutdown_mcp_servers`` (sync, thread-safe,
+    Delegates to ``tools.mcp_tool_lifecycle.shutdown_mcp_servers`` (sync, thread-safe,
     internally timeout-bounded). Without this, stdio MCP children spawned for
     dashboard/serve sessions outlive the backend and linger as orphans until
     the next reboot or manual cleanup. Best-effort by contract: teardown must
     never fail because an MCP child refused to close.
     """
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
 
         shutdown_mcp_servers()
     except Exception:

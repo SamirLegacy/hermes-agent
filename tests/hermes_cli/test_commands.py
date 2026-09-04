@@ -1157,7 +1157,7 @@ class TestTelegramMenuSkillPriority:
         """A priority-listed skill must win the last slot over alphabetically
         earlier non-priority skills."""
         from unittest.mock import patch
-        from hermes_cli.commands import (
+        from hermes_cli.commands_platforms import (
             _collect_gateway_skill_entries,
             _sanitize_telegram_name,
         )
@@ -1188,7 +1188,7 @@ class TestTelegramMenuSkillPriority:
         """Multiple priority skills appear in configured order, then the rest
         alphabetically."""
         from unittest.mock import patch
-        from hermes_cli.commands import (
+        from hermes_cli.commands_platforms import (
             _collect_gateway_skill_entries,
             _sanitize_telegram_name,
         )
@@ -1221,7 +1221,7 @@ class TestTelegramMenuSkillPriority:
         """Default (no priority configured) must keep strict alphabetical order —
         the pre-change behaviour other platforms rely on."""
         from unittest.mock import patch
-        from hermes_cli.commands import (
+        from hermes_cli.commands_platforms import (
             _collect_gateway_skill_entries,
             _sanitize_telegram_name,
         )

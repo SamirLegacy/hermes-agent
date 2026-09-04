@@ -588,7 +588,38 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
-    def test_run_job_uses_cron_reasoning_and_fast_overrides(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("runtime", "expected_service_tier", "expected_request_overrides"),
+        [
+            (
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "provider": "openai-codex",
+                    "api_mode": "responses",
+                },
+                "priority",
+                {"service_tier": "priority"},
+            ),
+            (
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+                None,
+                {},
+            ),
+        ],
+    )
+    def test_run_job_uses_cron_reasoning_and_fast_overrides(
+        self,
+        tmp_path,
+        runtime,
+        expected_service_tier,
+        expected_request_overrides,
+    ):
         """Cron-specific inference settings must override the daily chat defaults."""
         (tmp_path / "config.yaml").write_text(
             """
@@ -615,18 +646,13 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
-                 return_value={
-                     "api_key": "test-key",
-                     "base_url": "https://chatgpt.com/backend-api/codex",
-                     "provider": "openai-codex",
-                     "api_mode": "responses",
-                 },
+                 return_value=runtime,
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
@@ -641,8 +667,8 @@ cron:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["model"] == "gpt-5.6-terra"
         assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
-        assert kwargs["service_tier"] == "priority"
-        assert kwargs["request_overrides"] == {"service_tier": "priority"}
+        assert kwargs["service_tier"] == expected_service_tier
+        assert kwargs["request_overrides"] == expected_request_overrides
 
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
@@ -655,10 +681,10 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -699,10 +725,10 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -740,10 +766,10 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -778,10 +804,10 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -816,10 +842,10 @@ cron:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -1115,6 +1141,9 @@ cron:
         class FakeFuture:
             def result(self):
                 return {"final_response": "ok"}
+
+            def done(self):
+                return True
 
         fake_future = FakeFuture()
         fake_pool = MagicMock()

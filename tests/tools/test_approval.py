@@ -1811,7 +1811,7 @@ class TestApprovalNotifyFailureIsHonestNotADenial:
         from tools import approval as mod
 
         monkeypatch.setattr(
-            mod, "_get_approval_config",
+            approval_context, "_get_approval_config",
             lambda: {"mode": "manual", "timeout": 5},
         )
 

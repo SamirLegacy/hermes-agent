@@ -168,7 +168,6 @@ to the public equivalent or the new module. Test monkeypatch seams are likewise 
 
 | name | kind | new location |
 |---|---|---|
-| `Path` | import | `pathlib` |
 | `is_background_review_enabled` | restored-def | `(deleted; BASE body restored)` |
 
 ### `agent.bedrock_adapter`

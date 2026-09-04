@@ -106,9 +106,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     """Enqueue *approval_data*, notify the user, and block until resolved or timed
     out. Shared by the terminal command guard, the execute_code guard, the plugin
     escalation gate, and MCP elicitation. Returns ``{"resolved", "choice",
-    "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True}``
-    when the notify callback raised. Persisting the choice and building the
-    tool-facing result stay with the caller.
+    "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True,
+    "notify_error": str}`` when the notify callback raised. Persisting the choice
+    and building the tool-facing result stay with the caller.
 
     Identical concurrent approvals (same command text + pattern-key set) are
     coalesced: parallel tool calls would otherwise fire N identical prompts
@@ -156,7 +156,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
         _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
-        return {"resolved": False, "choice": None, "notify_failed": True}
+        return {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+            "notify_error": f"{type(exc).__name__}: {exc}",
+        }
 
     state = _poll_event(entry.event, session_key,
                         interrupt_log="Approval wait interrupted by user signal — returning deny for session %s")

@@ -218,6 +218,7 @@ def _iter_gateway_skills(platform: str):
 def _collect_gateway_skill_entries(
     platform: str, max_slots: int | None, reserved_names: set[str], desc_limit: int = 100,
     sanitize_name: "Callable[[str], str] | None" = None,
+    priority_names: tuple[str, ...] = (),
 ) -> tuple[list[tuple[str, str, str, str]], int]:
     """Collect plugin + skill entries for a gateway platform.
 
@@ -226,7 +227,9 @@ def _collect_gateway_skill_entries(
     mutated in place as names are claimed; *sanitize_name* runs before clamping and may return
     "" to skip. Returns ``(entries, hidden_count)``, entries ``(name, description, cmd_key,
     raw_name)`` — ``cmd_key`` "" for plugins; ``raw_name`` is the sanitized pre-clamp name used
-    for configured-priority matching (both survive a clamp-induced rename).
+    for configured-priority matching (both survive a clamp-induced rename). *priority_names*
+    optionally promotes sanitized skill names within their tier before *max_slots* is applied;
+    an empty tuple preserves alphabetical order.
     """
     sanitize = sanitize_name or (lambda n: n)
 
@@ -259,6 +262,24 @@ def _collect_gateway_skill_entries(
 
     if max_slots is None:
         return plugin_entries + skill_entries, 0
+
+    if priority_names:
+        priority = {name: index for index, name in enumerate(priority_names)}
+
+        def _entry_priority(entry: tuple[str, str, str, str]) -> int | None:
+            final_name, _description, _command_key, raw_name = entry
+            return priority.get(raw_name, priority.get(final_name))
+
+        skill_entries = [
+            entry
+            for original_index, entry in sorted(
+                enumerate(skill_entries),
+                key=lambda item: (0, _entry_priority(item[1]))
+                if _entry_priority(item[1]) is not None
+                else (1, item[0]),
+            )
+        ]
+
     remaining = max(0, max_slots - len(plugin_entries))
     hidden_count = max(0, len(skill_entries) - remaining)
     return (plugin_entries + skill_entries[:remaining])[:max_slots], hidden_count

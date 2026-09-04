@@ -334,12 +334,6 @@
   },
   {
    "facade": "agent.background_review",
-   "name": "Path",
-   "kind": "import",
-   "target": "pathlib"
-  },
-  {
-   "facade": "agent.background_review",
    "name": "is_background_review_enabled",
    "kind": "restored-def",
    "target": "(deleted; BASE body restored)"

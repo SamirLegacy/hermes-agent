@@ -978,8 +978,6 @@ __all__ = [
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
-from pathlib import Path  # noqa: F401,E402
-
 def is_background_review_enabled(
     task_cfg: Optional[Dict[str, Any]] = None,
 ) -> bool:
@@ -1007,6 +1005,8 @@ def is_background_review_enabled(
             return True
     enabled, _ = load_background_review_settings()
     return enabled
+
+# ---- END PLUGIN-COMPAT ----
 
 
 def _background_review_default_ledger_path() -> Path:
@@ -1367,5 +1367,3 @@ def record_session_end_learning_hook_failure(session_id: str, error: Exception |
     with receipt_path.open("a", encoding="utf-8") as fh:
         fh.write(_stable_json(payload) + "\n")
     return {"written": True, "path": str(receipt_path), "blocker": payload["blocker"]}
-
-# ---- END PLUGIN-COMPAT ----
