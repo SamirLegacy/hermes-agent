@@ -14,6 +14,7 @@ def _make_cli_stub():
         config={},
         _manual_compress=lambda cmd: calls.append(cmd),
     )
+    self_._slash_handler = HermesCLI._slash_handler
     self_.process_command = HermesCLI.process_command.__get__(self_, type(self_))
     return self_, calls
 

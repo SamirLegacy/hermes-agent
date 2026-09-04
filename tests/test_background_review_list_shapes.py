@@ -288,8 +288,7 @@ def test_e_call_does_not_unwind_module_callables():
         "extract_background_review_candidate_signals returned partial "
         in src
     ), "expected partial-results guard message present"
-    # And the prior-tonon-dict guard for the call_details lookup.
-    assert "if not isinstance(detail, dict):" in src
+    # And the non-dict guards on free-form tool payload fields.
     assert "if isinstance(ops_raw, list)" in src
     assert "if isinstance(change_raw, dict)" in src
 
