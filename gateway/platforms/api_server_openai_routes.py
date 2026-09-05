@@ -536,7 +536,7 @@ class OpenAICompatRoutesMixin:
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key)
+                gateway_session_key=gateway_session_key, requested_model=requested_pin)
 
         async def _compute_completion():
             return await self._run_agent(**run_kwargs)
@@ -579,8 +579,8 @@ class OpenAICompatRoutesMixin:
             "choices": [{"index": 0, "message": {"role": "assistant", "content": final_response},
                          "finish_reason": finish_reason}],
             "usage": _chat_usage_payload(usage)}
-        if isinstance(served_model, str) and model_name and served_model != model_name:
-            response_data["hermes_requested_model"] = model_name
+        if requested_pin and isinstance(served_model, str) and served_model != requested_pin:
+            response_data["hermes_requested_model"] = requested_pin
         if is_partial or is_failed or not completed:
             response_data["hermes"] = _hermes_extras(
                 completed, is_partial, is_failed, err_msg, finish_reason)
@@ -630,19 +630,18 @@ class OpenAICompatRoutesMixin:
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None) -> "web.StreamResponse":
+        gateway_session_key: str = None, requested_model: Optional[str] = None) -> "web.StreamResponse":
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
-        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
+        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled.
+        ``requested_model`` is the pin the caller actually placed (None for no-pin / virtual
+        alias requests); it travels as ``hermes_requested_model`` when the served id diverges."""
         from gateway.platforms.api_server import (
             _abandon_agent_task, _chat_usage_payload, _sse_frame)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
 
         # Served-model echo: ``model`` on every chunk reflects the model that is ACTUALLY
-        # serving the turn (the fallback chain swaps agent.model in place). The role chunk is
-        # the first chat.completion.chunk on the wire and carries ``hermes_requested_model``
-        # when the served id differs from the request pin — emitted lazily at the first
-        # stream item (or EOS) because a mid-run fallback can only be known then; it still
-        # precedes every content chunk.
+        # serving the turn — the fallback chain swaps agent.model in place, so each chunk
+        # re-resolves the live id (cheap getattr) instead of freezing the first-chunk value.
         served_model = [model]
 
         def _resolve_served_model() -> None:
@@ -651,7 +650,15 @@ class OpenAICompatRoutesMixin:
             if isinstance(live, str) and live:
                 served_model[0] = live
 
+        def _pin_extra() -> Dict[str, Any]:
+            # The pin stays visible only for a REAL pin (no virtual alias / empty / omitted)
+            # whose served id actually diverged at the moment the chunk is built.
+            if requested_model and served_model[0] != requested_model:
+                return {"hermes_requested_model": requested_model}
+            return {}
+
         def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+            _resolve_served_model()
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": served_model[0],
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
@@ -664,10 +671,7 @@ class OpenAICompatRoutesMixin:
                 return
             first_chunk_pending = False
             _resolve_served_model()
-            extra: Dict[str, Any] = {}
-            if served_model[0] != model:
-                extra["hermes_requested_model"] = model
-            await response.write(_sse_frame(_chunk({"role": "assistant"}, **extra)))
+            await response.write(_sse_frame(_chunk({"role": "assistant"}, **_pin_extra())))
 
         try:
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -697,7 +701,7 @@ class OpenAICompatRoutesMixin:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
-            finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
+            finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage), **_pin_extra())
             if finish_reason != "stop":
                 if err_msg:
                     finish_chunk["error"] = {
