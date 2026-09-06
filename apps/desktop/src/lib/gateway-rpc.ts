@@ -62,11 +62,15 @@ export function isSessionNotOwnedError(error: unknown): boolean {
 
 export function describeSessionOwner(error: unknown): string {
   const owner = sessionOwnerOf(error)
-  if (!owner) return error instanceof Error ? error.message : String(error)
+  if (!owner) {
+    return error instanceof Error ? error.message : String(error)
+  }
   if (!owner.surface || owner.pid == null) {
     const rpc = (error as { error?: { message?: unknown }; message?: unknown } | null)
     const message = rpc?.error?.message ?? rpc?.message
-    if (typeof message === 'string' && message) return message
+    if (typeof message === 'string' && message) {
+      return message
+    }
   }
   const age = typeof owner.age_s === 'number' ? `, ${Math.max(0, Math.round(owner.age_s / 60))}m` : ''
   const facts = `${owner.surface || 'another surface'} (pid ${owner.pid ?? '?'}${age})`
