@@ -289,26 +289,33 @@ def _render_sessions(ctx):
         except Exception:
             _kv("Active:", "(error reading sessions file)")
 
-    # Slot usage, only when max_concurrent_sessions is set. The cap is shared across CLI,
-    # desktop/TUI and the messaging gateway, so the surface that gets rejected is rarely the one
-    # holding the slots — without this the only way to find out is reading
-    # runtime/active_sessions.json by hand.
+    # Live session owners — printed whenever any exist, cap or no cap. Per-session exclusivity
+    # engages unconditionally (exclusivity is correctness, the cap is policy), so the holder table
+    # must not hide behind an optional max_concurrent_sessions: without it the only way to see a
+    # lock holder is reading runtime/active_sessions.json by hand — exactly the anti-pattern this
+    # section exists to prevent. The cap is shared across CLI, desktop/TUI and the messaging
+    # gateway, so the surface that gets rejected is rarely the one holding the slots.
     try:
         from hermes_cli.active_sessions import (
             active_session_registry_snapshot, format_age, resolve_max_concurrent_sessions)
         cap = resolve_max_concurrent_sessions(ctx.config)
     except Exception:
         cap = None
+    try:
+        held = active_session_registry_snapshot()
+    except Exception:
+        held = []
     if cap:
-        try:
-            held = active_session_registry_snapshot()
-        except Exception:
-            held = []
         _kv("Slots:", color(f"{len(held)}/{cap} in use", Colors.YELLOW if len(held) >= cap else Colors.GREEN))
+    elif held:
+        _kv("Live owners:", f"{len(held)} session(s) live-owned")
+    if held:
         now = time.time()
         for entry in sorted(held, key=lambda e: e.get("started_at") or 0):
-            age = format_age(now - float(entry.get("started_at") or now))
-            print(f"                {entry.get('surface') or 'unknown':<17} {entry.get('session_id') or '?':<24} {age}")
+            started = entry.get("started_at")
+            age = format_age(now - float(started or now))
+            clock = time.strftime(" at %H:%M", time.localtime(float(started))) if started else ""
+            print(f"                {entry.get('surface') or 'unknown':<17} {entry.get('session_id') or '?':<24} {age} (pid {entry.get('pid') or '?'}){clock}")
 
 
 def _render_deep(ctx):

@@ -2548,11 +2548,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        takeover: bool = False,
     ):
-        """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
+        """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite.
+
+        ``takeover`` (``--takeover``) lets a resume reclaim the session from a
+        provably dead/stale registry holder; a live owner is always refused.
+        """
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                  checkpoints, pass_session_id, ignore_rules)
+        self.takeover = takeover
         self._init_runtime_state(resume)
 
     def _init_display_options(self, verbose, compact):
@@ -2951,13 +2957,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._cache_hit_baseline_model: Optional[str] = None
 
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
-        """Claim a global active-session slot for this CLI process."""
+        """Claim a global active-session slot for this CLI process.
+
+        With ``self.takeover`` (--takeover), a dead/stale holder's entry is
+        reclaimed; a LIVE holder is still refused (it would keep writing from
+        its in-memory lease). A claim that itself errors fails CLOSED:
+        proceeding unproven would risk a silent second writer.
+        """
         if self._active_session_lease is not None:
             return True
         try:
-            from hermes_cli.active_sessions import try_acquire_active_session
+            from hermes_cli.active_sessions import (
+                takeover_active_session,
+                try_acquire_active_session,
+            )
 
-            lease, message = try_acquire_active_session(
+            claim = (
+                takeover_active_session
+                if getattr(self, "takeover", False)
+                else try_acquire_active_session
+            )
+            lease, message = claim(
                 session_id=self.session_id,
                 surface=surface,
                 config=self.config,
@@ -2965,9 +2985,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
                 # See #94595.
                 metadata={"live_session_id": str(self.session_id)},
             )
-        except Exception as exc:
-            logger.warning("Failed to claim active session slot: %s", exc)
-            return True
+        except Exception:
+            logger.warning("Failed to claim active session slot", exc_info=True)
+            # Fail CLOSED: a claim that errored has NOT proven the session is
+            # unowned — proceeding would risk a silent second writer (the
+            # #94595 class). The caller treats False as "not owned" (run()
+            # returns; the -q entry exits 1).
+            return False
         if message:
             print(message, file=sys.stderr) if stderr else self._console_print(f"[bold red]{message}[/]")
             return False
@@ -2986,6 +3010,56 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             logger.debug("Failed to release active session slot", exc_info=True)
         finally:
             self._active_session_lease = None
+
+    def _lease_reanchor_failed_closed(self, attempted: str, target: str, exc: Exception) -> None:
+        """Fail-closed stop for a failed lease re-anchor: we no longer hold a
+        provable claim on EITHER id, so nothing further may be written from
+        this surface. Interactive: red line + exit. Non-interactive (-q / -Q
+        one-shot): flag for the entry-point's non-zero exit; the turn itself
+        already committed on the agent side and must not be retried from here.
+        """
+        logger.error(
+            "Lease re-anchor to %s failed; this surface no longer holds a provable "
+            "claim on the session and stops writing",
+            target,
+            exc_info=exc,
+        )
+        if os.environ.get("HERMES_INTERACTIVE"):
+            self._console_print(
+                "[bold red]Could not prove ownership of the continued session "
+                f"({attempted} → {target}); another surface may hold it. "
+                "This surface is stopping now to avoid two writers on one session.[/]"
+            )
+            self._should_exit = True
+        else:
+            self._lease_reanchor_failed = True
+
+    def _reanchor_active_session_lease(self) -> bool:
+        """Re-anchor the session lease onto the CURRENT session id (post-compression).
+
+        Compression rotates the session id; the lease was claimed under the OLD
+        one. Drop the in-memory lease and claim the new id NOW (not at some
+        later turn boundary) so a second surface resuming the old id mid-turn
+        cannot become a concurrent writer. Returns False when the re-claim
+        failed closed: the caller must NOT proceed with transcript writes on
+        this surface (interactive: exit; -q: non-zero exit). True also covers
+        the no-claim-needed cases (no session id / empty claim).
+        """
+        self._active_session_lease = None
+        attempted = None
+        try:
+            attempted = str(self.session_id or "")
+            target = str(getattr(self.agent, "session_id", "") or attempted)
+            if not self._claim_active_session("cli"):
+                raise RuntimeError("active-session claim refused")
+            return True
+        except Exception as exc:
+            self._lease_reanchor_failed_closed(
+                attempted or "",
+                str(getattr(self.agent, "session_id", "") or ""),
+                exc,
+            )
+            return False
 
     _PET_FRAME_INTERVAL = 0.16
     _PET_CFG_INTERVAL = 2.5
@@ -4064,7 +4138,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
-        _sync_cli_session_id_from_agent(cli)
+        if not _sync_cli_session_id_from_agent(cli):
+            # Lease re-anchor failed closed: this surface no longer owns the
+            # continued session, so the goal loop must not drive further turns.
+            raise RuntimeError("lease re-anchor failed; surface no longer owns the session")
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
@@ -4085,10 +4162,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
-def _sync_cli_session_id_from_agent(cli) -> None:
-    """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session."""
+def _sync_cli_session_id_from_agent(cli) -> bool:
+    """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session.
+
+    When the id actually changed, the active-session lease is re-anchored onto
+    the new id; a failed re-anchor fails closed (False) and the caller must not
+    proceed on the unclaimed continuation id.
+    """
     if getattr(cli.agent, "session_id", None) and cli.agent.session_id != cli.session_id:
         cli.session_id = cli.agent.session_id
+        return cli._reanchor_active_session_lease()
+    return True
 
 
 def _run_quiet_single_query(cli, effective_query):
@@ -4102,6 +4186,17 @@ def _run_quiet_single_query(cli, effective_query):
     # The exit line below reports session_id to stderr for automation wrappers;
     # without this sync it would point at the ended parent after compression.
     _sync_cli_session_id_from_agent(cli)
+    # A failed post-compression lease re-anchor means this surface cannot prove
+    # ownership of the continued session: report the failure with a non-zero
+    # exit instead of printing a session_id we do not own.
+    if getattr(cli, "_lease_reanchor_failed", False):
+        print(
+            "Error: could not prove ownership of the continued session after "
+            "compression; another surface may hold it. Refusing to report a "
+            "session id this process no longer owns.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -4452,6 +4547,16 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
+        # A failed post-compression lease re-anchor (surfaced by chat's turn
+        # sync) means this surface lost the session: exit non-zero instead of
+        # reporting a clean one-shot run on a session we no longer own.
+        if getattr(cli, "_lease_reanchor_failed", False):
+            print(
+                "Error: could not prove ownership of the continued session after "
+                "compression; another surface may hold it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         cli._print_exit_summary(clear_screen=False)
     finally:
         _finalize_single_query(cli)
