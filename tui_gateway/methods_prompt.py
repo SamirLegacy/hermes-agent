@@ -561,7 +561,14 @@ def _(rid, params: dict) -> dict:
         # Refused HERE — before the busy queue, db row and agent build — so a refusal
         # leaves the session untouched.  The reason travels as machine-readable data.
         reason = getattr(limit_message, "reason", None)
-        return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
+        data = {"reason": reason} if reason else None
+        holder = getattr(limit_message, "holder", None)
+        if data is not None and isinstance(holder, dict):
+            # SESSION_NOT_OWNED refusals also carry the machine-readable holder
+            # facts the refusal message names, so a client renders "who owns this"
+            # without ever parsing prose.
+            data["holder"] = holder
+        return _err(rid, 4090, str(limit_message), data)
     # Rewritten every submit: a session alternates app window / HUD; stale "hud" misinforms.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)

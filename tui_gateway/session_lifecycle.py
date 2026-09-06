@@ -47,6 +47,14 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible."""
+    reanchor_refusal = session.get("_lease_reanchor_failed")
+    if reanchor_refusal:
+        # Fail CLOSED: a post-compression lease re-anchor failed on this surface, so we hold NO
+        # provable claim on either session id. Every turn source funnels through this chokepoint
+        # (prompt.submit admission, _run_prompt_submit, auto-continue), so refusing here fences
+        # the whole surface without touching each call site. The stored ActiveSessionRefusal
+        # carries reason=SESSION_NOT_OWNED so prompt.submit maps it to the 4090 family.
+        return reanchor_refusal
     if session.get("active_session_lease") is not None:
         return None
     lease, limit_message = _claim_active_session_slot(
