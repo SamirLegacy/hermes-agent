@@ -186,6 +186,14 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
         if _primary_exc is not None:
+            if (getattr(self, "_resumed", False)
+                    and getattr(self, "_single_query_mode", False)
+                    and not getattr(self, "_explicit_model_override", False)):
+                ChatConsole().print(
+                    "[bold red]Cannot resume on the stored model route: "
+                    + format_runtime_provider_error(_primary_exc)
+                    + ". No model turn was started.[/]")
+                return False
             runtime = self._resolve_fallback_runtime(_primary_exc)
             if runtime is not None:
                 _primary_exc = None

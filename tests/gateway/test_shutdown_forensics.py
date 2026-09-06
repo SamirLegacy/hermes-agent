@@ -89,7 +89,8 @@ class TestFormatters:
 # ---------------------------------------------------------------------------
 
 class TestSpawnAsyncDiagnostic:
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
+    # The real script reads /proc and uses GNU timeout/ps plus systemd journal tools.
+    @pytest.mark.linux_only
     def test_spawns_subprocess_and_writes_output(self, tmp_path):
         log_path = tmp_path / "diag.log"
         pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)

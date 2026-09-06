@@ -1719,12 +1719,6 @@ def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: 
     if ctx is not None:
         _save_unless_skipped(model, base_url, ctx, provider)
         return ctx
-    # 3. Probe-down fallback after endpoint-specific detection failed
-    logger.info(
-        "Could not detect context length for model %r at %s — defaulting to %s tokens (probe-down). "
-        "Set model.context_length in config.yaml to override.",
-        model, base_url, f"{DEFAULT_FALLBACK_CONTEXT:,}",
-    )
     # 3b. Hardcoded catalog as a last resort: a proxied Anthropic gateway fails the probes above
     # but its model name still matches DEFAULT_CONTEXT_LENGTHS.
     hit = _longest_key_match(DEFAULT_CONTEXT_LENGTHS, model.lower())
@@ -1775,7 +1769,7 @@ def _config_override_context_length(model: str, base_url: str, provider: str, cu
     # 0c. custom_providers per-model override — check before any probe. This closes the gap where /model
     # switch and display paths used to fall back to 128K despite the user having a per-model context_length
     # set. See #15779.
-    if custom_providers and base_url and model:
+    if base_url and model:
         with contextlib.suppress(Exception):  # fall through to probing
             from hermes_cli.config import get_custom_provider_context_length
             cp_ctx = get_custom_provider_context_length(model=model, base_url=base_url, custom_providers=custom_providers)

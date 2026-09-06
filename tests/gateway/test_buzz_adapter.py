@@ -3063,12 +3063,15 @@ class TestInboundMediaAuthorizationGate:
     async def test_live_media_redacts_long_path_before_bounding(self, tmp_path):
         parent = tmp_path
         private_parts = []
+        # Keep the path beyond the error bound but below macOS PATH_MAX.
+        padding = (950 - len(str(tmp_path)) - len("/handoff.txt")) // 6 - 11
         for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
+            part = f"private-{index}-" + ("x" * padding)
             private_parts.append(part)
             parent = parent / part
             parent.mkdir()
         media = parent / "handoff.txt"
+        assert 900 < len(str(media)) < 1024
         media.write_text("safe handoff", encoding="utf-8")
         adapter = _make_adapter()
         adapter._run_cli = AsyncMock(

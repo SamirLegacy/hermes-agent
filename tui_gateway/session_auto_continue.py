@@ -280,7 +280,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle. True when dispatched: the caller
     skips lower-priority follow-ups this cycle (the user's message wins)."""
     with session["history_lock"]:
-        if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+        if session.get("_closing"):
+            return False
+        if session.get("_lease_reanchor_failed") is not None:
+            # Fenced by a failed compression re-anchor: this runtime session is
+            # dead-ended (see _sync_session_key_after_compress) and the
+            # compute-host branch below bypasses the _run_prompt_submit
+            # ownership chokepoint — leave the queue untouched; it dies with
+            # the session instead of dispatching on the fenced key.
+            return False
+        if not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])

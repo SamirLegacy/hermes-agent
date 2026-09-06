@@ -283,10 +283,33 @@ def _sync_session_key_after_compress(
     if not new_session_id or new_session_id == old_key:
         return
     if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
-        logger.warning(
-            "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
+        # FAIL CLOSED: the lease could not be re-anchored onto the continuation id,
+        # so this backend holds NO provable claim on either id. Keep session_key on
+        # the old id (the caller's "did the key change?" branch keys follow-up
+        # rekeys on inequality), fence every later turn source via the chokepoint,
+        # and invalidate any in-flight drain claim taken under the pre-rotation key.
+        from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
+        refusal = ActiveSessionRefusal(
+            "Session lease could not be moved to the continuation session "
+            f"{new_session_id} (registry refused). Turns on it are no longer "
+            "ownership-protected, so this surface stops here rather than risking "
+            f"a second writer. Re-attach with: hermes chat --resume {new_session_id}",
+            SESSION_NOT_OWNED,
+        )
+        refusal.holder = {"surface": _resolve_session_platform(), "pid": os.getpid(),
+                          "age_s": max(0, time.time() - session.get("created_at", time.time())),
+                          "session_id": new_session_id, "holder_live": True}
+        logger.error(
+            "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s; fencing this surface",
             sid, old_key, new_session_id,
         )
+        session["_lease_reanchor_failed"] = refusal
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        _emit("error", sid, {"message": str(refusal)})
+        return
+    # Ownership re-proven on the continuation id: lift any stale fence from an
+    # earlier failed rotation.
+    session.pop("_lease_reanchor_failed", None)
     # Even if the approval module fails to import, anchor session_key on the continuation id.
     session["session_key"] = new_session_id
     with contextlib.suppress(Exception):

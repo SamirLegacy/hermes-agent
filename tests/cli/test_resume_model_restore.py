@@ -7,6 +7,7 @@ used instead of the ambient config default (#57588-class, #79536).
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,62 @@ def _row(model="glm-4.7", model_config=None):
         "model": model,
         "model_config": json.dumps(model_config) if model_config else None,
     }
+
+
+def test_single_query_restores_session_before_credentials_and_route_snapshot(monkeypatch):
+    events = []
+    resumed = SimpleNamespace(
+        _resumed=True, _session_db=object(), conversation_history=[],
+        model="ambient-model", provider="ambient-provider", agent=None,
+        _active_agent_route_signature=None,
+    )
+
+    def restore():
+        events.append("restore")
+        resumed.model = "stored-model"
+        resumed.provider = "stored-provider"
+        resumed.conversation_history = [{"role": "user", "content": "prior turn"}]
+        return True
+
+    def credentials():
+        events.append(("credentials", resumed.provider))
+        return True
+
+    def route(_query):
+        events.append(("route", resumed.model))
+        return {"model": resumed.model, "runtime": {"provider": resumed.provider},
+                "signature": "stored-route"}
+
+    resumed._load_resumed_history_late = restore
+    resumed._claim_active_session = lambda *_args, **_kwargs: True
+    resumed._ensure_runtime_credentials = credentials
+    resumed._resolve_turn_agent_config = route
+    resumed._init_agent = lambda **kwargs: events.append(("init", kwargs["model_override"])) or False
+    monkeypatch.setattr(cli_mod, "_should_seed_interactive", lambda *_args: False)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+    with pytest.raises(SystemExit):
+        cli_mod._run_single_query_mode(resumed, "new turn", None, True, True)
+    assert events == [
+        "restore", ("credentials", "stored-provider"),
+        ("route", "stored-model"), ("init", "stored-model"),
+    ]
+
+
+def test_headless_resume_does_not_resolve_an_ambient_fallback_on_auth_failure(monkeypatch):
+    calls = []
+    stub = _make_stub(
+        _resumed=True, _single_query_mode=True, _explicit_model_override=False,
+        _explicit_api_key=None, _explicit_base_url=None,
+        _resolve_fallback_runtime=lambda exc: calls.append(exc),
+    )
+
+    def unavailable(**_kwargs):
+        raise RuntimeError("stored route unavailable")
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", unavailable)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", str)
+    assert stub._ensure_runtime_credentials() is False
+    assert calls == []
 
 
 # ── SessionDB.session_gateway_runtime ───────────────────────────────

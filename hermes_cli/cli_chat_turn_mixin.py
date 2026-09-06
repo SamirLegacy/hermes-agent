@@ -450,6 +450,12 @@ class CLIChatTurnMixin:
                 and self.agent.session_id != self.session_id):
             self._transfer_session_yolo(self.session_id, self.agent.session_id)
             self.session_id = self.agent.session_id
+            if not self._reanchor_active_session_lease():
+                # Fail-closed path already surfaced the stop (interactive red
+                # line + _should_exit; -q flags _lease_reanchor_failed for the
+                # entry-point's non-zero exit). This surface does not own the
+                # continuation id, so nothing further may proceed on it.
+                return
             self._write_terminal_breadcrumb()
             self._pending_title = None
 

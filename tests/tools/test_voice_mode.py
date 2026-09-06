@@ -121,9 +121,10 @@ def fake_clock(monkeypatch):
 # ============================================================================
 
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
+    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path_factory):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
+        tmp_path = tmp_path_factory.mktemp("pulse")
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
@@ -136,9 +137,10 @@ class TestPulseSocketReachable:
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
+    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path_factory):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
+        tmp_path = tmp_path_factory.mktemp("pulse")
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -1383,6 +1385,12 @@ class TestWSL2PowerShellFallback:
     play_audio_file() should insert a PowerShell-based player at the front
     of the player list when powershell.exe and ffmpeg are available.
     """
+
+    @pytest.fixture(autouse=True)
+    def _linux_player_platform(self, monkeypatch):
+        """Player construction is mocked; no WSL kernel or audio device is used."""
+        monkeypatch.setattr("tools.voice_mode.platform.system", lambda: "Linux")
+        monkeypatch.setattr("tools.voice_mode._import_audio", MagicMock(side_effect=ImportError))
 
     def _fake_check_output(self, responses):
         """Build a subprocess.check_output side_effect from a list of responses."""

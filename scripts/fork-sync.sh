@@ -18,29 +18,73 @@ HERMES_PROFILE_NAME="${FORK_SYNC_HERMES_PROFILE:-desktop-local}"
 BUNDLE_SWAP_SCRIPT="${FORK_SYNC_BUNDLE_SWAP_SCRIPT:-$MAIN_CHECKOUT/scripts/fork-sync-bundle-swap.sh}"
 SKILLS_SNAPSHOT="${FORK_SYNC_SKILLS_SNAPSHOT:-${TMPDIR:-/tmp}/fork-sync-skills-before.txt}"
 SKILLS_AFTER="$SKILLS_SNAPSHOT.after"
+CAPABILITIES_SNAPSHOT="$SKILLS_SNAPSHOT.capabilities"
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+START_SECONDS=$SECONDS
 
 # STRUCTURAL MCP GUARD — the single canonical dependency-sync invocation.
 # verify and deploy both expand this exact array; tests/scripts/test_fork_sync_sh.py
 # enforces that this is the script's only such line. `--extra mcp` is load-bearing:
 # a sync without it prunes mcp/httpx2 and kills every MCP server profile-wide
 # (incident 2026-09-02, "streamable_http not available").
-CANONICAL_SYNC=(uv sync --extra dev --extra mcp)
+CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)
 
 SUB=""
 SUMMARY="ok"
-receipt() { printf 'FORK-SYNC %s rc=%s %s\n' "$1" "$2" "$3"; }
+receipt() { printf 'FORK-SYNC %s rc=%s %s elapsed_s=%s\n' "$1" "$2" "$3" "$((SECONDS - START_SECONDS))"; }
 trap 'rc=$?; [ -n "$SUB" ] || SUB="usage"; receipt "$SUB" "$rc" "$SUMMARY"' EXIT
 
-# Deterministic git identity for every mutation this script performs —
-# including the auto-commit inside a CLEAN `git merge --no-edit`, which needs
-# an identity before MERGE_HEAD even exists. `:=` (not `:-`) also overrides
-# empty values: CI runners inject user.name="" (fatal: empty ident name) and
-# have no ~/.gitconfig at all (Committer identity unknown). Fork automation
-# convention: contributors/emails/samir@local.
-export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:=Samir}"
-export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:=samir@local}"
-export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:=Samir}"
-export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:=samir@local}"
+# Git uses the operator's configured identity; a missing identity is an
+# environment error, never permission to invent one.
+
+timed() {
+  local name="$1" start=$SECONDS rc=0
+  shift
+  "$@" || rc=$?
+  printf 'STEP %s rc=%s elapsed_s=%s\n' "$name" "$rc" "$((SECONDS - start))"
+  return "$rc"
+}
+
+profile_inventory() {
+  "$MAIN_CHECKOUT/venv/bin/python" - "$SCRIPT_ROOT" "$HERMES_PROFILE_NAME" "$1" <<'PY'
+import hashlib, json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from hermes_cli.profiles import get_profile_dir
+import yaml
+home = get_profile_dir(sys.argv[2])
+config_file = home / "config.yaml"
+config = yaml.safe_load(config_file.read_text()) if config_file.exists() else {}
+config = config or {}
+servers = config.get("mcp_servers") or {}
+if sys.argv[3] == "mcp":
+    for name in sorted(servers):
+        print(name)
+else:
+    # Preserve custom command definitions and user plugin source bytes, not secrets.
+    os.environ["HERMES_HOME"] = str(home)
+    from agent.skill_commands import scan_skill_commands
+    from hermes_cli.plugins import get_plugin_manager, get_plugin_commands
+    manager = get_plugin_manager()
+    manager.discover_and_load()
+    loaded = manager.list_plugins()
+    broken = [p["name"] for p in loaded if p["enabled"] and p.get("error")]
+    if broken:
+        raise SystemExit("Enabled plugins failed to load: " + ", ".join(broken))
+    quick = config.get("quick_commands") or {}
+    plugins = {}
+    for p in sorted((home / "plugins").rglob("*")):
+        if p.is_file() and (p.suffix == ".py" or p.name in ("plugin.yaml", "plugin.json")):
+            plugins[str(p.relative_to(home))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    print(json.dumps({"quick_commands": hashlib.sha256(json.dumps(quick, sort_keys=True).encode()).hexdigest(),
+                      "plugins_config": hashlib.sha256(json.dumps(config.get("plugins") or {}, sort_keys=True).encode()).hexdigest(),
+                      "user_plugin_sources": plugins,
+                      "loaded_user_plugins": sorted(p["key"] for p in loaded if p["enabled"] and p["source"] != "bundled"),
+                      "commands": sorted(set(scan_skill_commands()) | {"/" + str(k).lstrip("/") for k in quick} |
+                                         {"/" + str(k).lstrip("/") for k in get_plugin_commands()}),
+                      "mcp_names": sorted(servers)}, sort_keys=True))
+PY
+}
 
 usage() {
   sed -n '2,13p' "$0"
@@ -55,6 +99,7 @@ cmd_check() {
   AHEAD=$(git -C "$MAIN_CHECKOUT" rev-list --count upstream/main..origin/main) \
     || { SUMMARY="rev-list ahead failed"; return 128; }
   printf 'BEHIND=%s AHEAD=%s\n' "$BEHIND" "$AHEAD"
+  git -C "$MAIN_CHECKOUT" diff --stat upstream/main...origin/main | tail -n 1
   if [ "$BEHIND" -eq 0 ]; then
     SUMMARY="nothing to do (behind=$BEHIND ahead=$AHEAD)"
     return 0
@@ -76,7 +121,14 @@ cmd_merge() {
   fi
 
   BRANCH="samir/post-update-sync-$(date +%Y%m%d)"
-  git -C "$WORKTREE" merge --abort >/dev/null 2>&1 || true
+  if git -C "$WORKTREE" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+      || [ -n "$(git -C "$WORKTREE" status --porcelain)" ] \
+      || [ "$(git -C "$WORKTREE" rev-list --count origin/main..HEAD)" -gt 0 ]; then
+    SUMMARY="sync worktree has unfinished work; preserved without abort/reset"
+    return 21
+  fi
+  git -C "$WORKTREE" var GIT_AUTHOR_IDENT >/dev/null \
+    || { SUMMARY="configured Git author identity unavailable"; return 2; }
   git -C "$WORKTREE" checkout -B "$BRANCH" origin/main \
     || { SUMMARY="checkout -B $BRANCH failed"; return 2; }
 
@@ -90,6 +142,7 @@ cmd_merge() {
 resolve_conflicts() {
   local conflicted f remaining auto=0
   conflicted=$(git -C "$WORKTREE" diff --name-only --diff-filter=U)
+  printf 'CONFLICT_FILES=%s\n' "$(printf '%s\n' "$conflicted" | sed '/^$/d' | wc -l | tr -d ' ')"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
@@ -121,7 +174,14 @@ add_missing_contributors() {
   mkdir -p "$WORKTREE/contributors/emails"
   while IFS='|' read -r ae an; do
     [ -n "$ae" ] || continue
-    if [ ! -f "$WORKTREE/contributors/emails/$ae" ]; then
+    if ! [[ "$ae" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+      SUMMARY="unsafe contributor email cannot be used as a filename"
+      return 20
+    fi
+    # GitHub noreply IDs resolve automatically; case variants must not make
+    # every macOS checkout permanently dirty.
+    [[ "$ae" =~ ^[0-9]+\+[^@]+@users.noreply.github.com$ ]] && continue
+    if [ -z "$(find "$WORKTREE/contributors/emails" -maxdepth 1 -type f -iname "$ae" -print -quit)" ]; then
       printf '%s\n' "$an" > "$WORKTREE/contributors/emails/$ae"
       git -C "$WORKTREE" add -- "contributors/emails/$ae"
       printf 'new contributor mapping: %s -> %s\n' "$ae" "$an"
@@ -133,16 +193,11 @@ add_missing_contributors() {
 }
 
 finalize_merge_commit() {
-  # Deterministic committer identity — fork convention for automation
-  # (contributors/emails/samir@local: "fork-local git identity for Hermes
-  # self-improvement commits"). CI runners have no ambient git identity,
-  # without this both commits below die with "Committer identity unknown".
-  local idargs=(-c "user.name=Samir" -c "user.email=samir@local")
   if git -C "$WORKTREE" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-    git -C "$WORKTREE" "${idargs[@]}" commit --no-edit
+    git -C "$WORKTREE" commit --no-edit
     SUMMARY="merge committed on $BRANCH (auto-resolved emails + $NEW_CONTRIB new mapping(s) included)"
   elif [ "${NEW_CONTRIB:-0}" -gt 0 ]; then
-    git -C "$WORKTREE" "${idargs[@]}" commit -m "chore(contributors): map new upstream author emails"
+    git -C "$WORKTREE" commit -m "chore(contributors): map new upstream author emails"
     SUMMARY="branch $BRANCH ready ($NEW_CONTRIB new contributor mapping(s))"
   else
     SUMMARY="branch $BRANCH ready (clean merge, no new mappings)"
@@ -199,23 +254,33 @@ cmd_deploy() {
   # Before-snapshot for probe's skills-preservation diff (written before any mutation).
   hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_SNAPSHOT" \
     || { SUMMARY="pre-deploy skills snapshot failed"; return 30; }
+  profile_inventory capabilities > "$CAPABILITIES_SNAPSHOT" \
+    || { SUMMARY="pre-deploy custom command/plugin snapshot failed"; return 30; }
 
   [ -x "$BUNDLE_SWAP_SCRIPT" ] || {
     SUMMARY="bundle-swap script missing or not executable: $BUNDLE_SWAP_SCRIPT"
     return 2
   }
 
+  local before after
+  before=$(git -C "$MAIN_CHECKOUT" rev-parse HEAD)
   SUMMARY="ff-pull main checkout"
-  git -C "$MAIN_CHECKOUT" fetch origin --quiet
-  git -C "$MAIN_CHECKOUT" pull --ff-only origin main
+  timed fetch git -C "$MAIN_CHECKOUT" fetch origin --quiet
+  timed pull git -C "$MAIN_CHECKOUT" pull --ff-only origin main
+  after=$(git -C "$MAIN_CHECKOUT" rev-parse HEAD)
 
   SUMMARY="canonical sync of the runtime venv ($MAIN_CHECKOUT/venv)"
-  ( cd "$MAIN_CHECKOUT" && env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=venv nice -n 15 "${CANONICAL_SYNC[@]}" )
+  if [ ! -x "$MAIN_CHECKOUT/venv/bin/python" ] \
+      || git -C "$MAIN_CHECKOUT" diff --name-only "$before" "$after" | grep -qE '^(pyproject.toml|uv.lock)$'; then
+    ( cd "$MAIN_CHECKOUT" && timed dependency-sync env -u PYTHONPATH UV_PROJECT_ENVIRONMENT=venv nice -n 15 "${CANONICAL_SYNC[@]}" )
+  else
+    printf '%s\n' 'dependency sync skipped (lock and project unchanged)'
+  fi
 
-  "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2' || {
-    SUMMARY="mcp/httpx2 missing after runtime sync — restoring locked pins additively"
-    env -u PYTHONPATH uv pip install --python "$MAIN_CHECKOUT/venv/bin/python" 'mcp==2.0.0' 'httpx2==2.7.0'
-    "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2' \
+  "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2, aiohttp' || {
+    SUMMARY="mcp/httpx2/aiohttp missing — restoring locked pins additively"
+    env -u PYTHONPATH uv pip install --python "$MAIN_CHECKOUT/venv/bin/python" 'mcp==2.0.0' 'httpx2==2.7.0' 'aiohttp==3.14.3'
+    "$MAIN_CHECKOUT/venv/bin/python" -c 'import mcp, httpx2, aiohttp' \
       || { SUMMARY="import guard FAILED even after additive restore"; return 23; }
   }
 
@@ -224,7 +289,7 @@ cmd_deploy() {
   # became the runtime. pack only writes into the repo checkout (node_modules
   # + release/), so it needs no gate.
   SUMMARY="desktop bundle pack via $BUNDLE_SWAP_SCRIPT pack"
-  "$BUNDLE_SWAP_SCRIPT" pack
+  timed desktop-pack "$BUNDLE_SWAP_SCRIPT" pack
 
   # Gated bundle swap + relaunch: these touch the Owner's running app, so the
   # bundle-swap script refuses them unless FORK_SYNC_ALLOW_APP_SWAP=1 (set by
@@ -233,9 +298,7 @@ cmd_deploy() {
   # later manual swap.
   if [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ]; then
     SUMMARY="desktop bundle swap (gated)"
-    "$BUNDLE_SWAP_SCRIPT" swap
-    SUMMARY="desktop bundle relaunch (gated)"
-    "$BUNDLE_SWAP_SCRIPT" relaunch
+    timed desktop-swap "$BUNDLE_SWAP_SCRIPT" swap
   else
     printf '%s\n' "bundle swap+relaunch skipped: FORK_SYNC_ALLOW_APP_SWAP != 1 (packed bundle waits in $MAIN_CHECKOUT/apps/desktop/release/mac-arm64/Hermes.app)"
   fi
@@ -244,13 +307,17 @@ cmd_deploy() {
   # gateway-restart guard can scan this script without matching the payload.
   # Scheduled detached; the 90s lead in fork-sync-restart.sh lets the report
   # land before the caller's own host process is restarted.
-  nohup /bin/bash "$MAIN_CHECKOUT/scripts/fork-sync-restart.sh" >/tmp/hermes-deploy-restart.log 2>&1 &
-  SUMMARY="deployed; bundle packed; swap+relaunch $( [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ] && echo done || echo skipped '(FORK_SYNC_ALLOW_APP_SWAP != 1)') ; detached restart scheduled (+90s); run 'probe' after it settles"
+  if [ "${FORK_SYNC_ALLOW_APP_SWAP:-0}" = "1" ]; then
+    nohup /bin/bash "$MAIN_CHECKOUT/scripts/fork-sync-restart.sh" >/tmp/hermes-deploy-restart.log 2>&1 &
+    SUMMARY="deployed; bundle swapped; single detached restart scheduled (+90s); probe remains required"
+  else
+    SUMMARY="runtime updated; bundle packed; swap/restart skipped (Owner gate); not verified live"
+  fi
 }
 
 # ---------------------------------------------------------------------------
 cmd_probe() {
-  local fails=0 label sid out rout
+  local fails=0 label sid out rout servers
   pass() { printf 'PASS %s\n' "$1"; }
   failp() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
   run_check() {
@@ -259,16 +326,22 @@ cmd_probe() {
     if "$@" >/dev/null 2>&1; then pass "$label"; else failp "$label"; fi
   }
 
-  run_check "mcp heygen" hermes -p "$HERMES_PROFILE_NAME" mcp test heygen
+  if servers=$(profile_inventory mcp); then
+    while IFS= read -r name; do
+      [ -z "$name" ] || run_check "mcp $name" hermes -p "$HERMES_PROFILE_NAME" mcp test "$name"
+    done <<<"$servers"
+  else
+    failp "MCP configuration inventory"
+  fi
   run_check "hooks doctor" hermes -p "$HERMES_PROFILE_NAME" hooks doctor
   # No --no-tools flag exists; --oneshot is the closest: answer the query, exit.
   run_check "chat smoke" hermes -p "$HERMES_PROFILE_NAME" chat -q "reply OK" --oneshot
 
   printf 'CHECK resume smoke :: hermes chat -q (create) + chat --resume <id> -q\n'
-  if out=$(hermes -p "$HERMES_PROFILE_NAME" chat -q "fork-sync probe seed" --oneshot 2>&1) \
-     && sid=$(hermes -p "$HERMES_PROFILE_NAME" sessions list --limit 1 2>/dev/null | tail -n 1 | awk '{print $NF}') \
+  if out=$(hermes -p "$HERMES_PROFILE_NAME" chat -q "Reply OK. This is an update smoke test; use no tools." --oneshot -Q 2>&1) \
+     && sid=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*session_id:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | tail -n 1) \
      && [ -n "$sid" ]; then
-    if rout=$(hermes -p "$HERMES_PROFILE_NAME" chat --resume "$sid" -q "reply OK2" --oneshot 2>&1) \
+    if rout=$(hermes -p "$HERMES_PROFILE_NAME" chat --resume "$sid" -q "Reply OK2. Use no tools." --oneshot -Q 2>&1) \
        && printf '%s' "$rout" | grep -q "$sid"; then
       pass "resume smoke (id $sid named in resume output)"
     else
@@ -286,6 +359,19 @@ cmd_probe() {
     pass "skills preservation (list identical pre/post deploy)"
   else
     failp "skills preservation (post-deploy list differs or capture failed)"
+  fi
+  if [ -f "$CAPABILITIES_SNAPSHOT" ] \
+      && profile_inventory capabilities > "$CAPABILITIES_SNAPSHOT.after" \
+      && "$MAIN_CHECKOUT/venv/bin/python" - "$CAPABILITIES_SNAPSHOT" "$CAPABILITIES_SNAPSHOT.after" <<'PY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:])
+old_commands, new_commands = set(before.pop("commands")), set(after.pop("commands"))
+raise SystemExit(0 if old_commands <= new_commands and before == after else 1)
+PY
+  then
+    pass "custom commands/plugins/MCP preservation"
+  else
+    failp "custom commands/plugins/MCP preservation"
   fi
 
   if [ "$fails" -gt 0 ]; then

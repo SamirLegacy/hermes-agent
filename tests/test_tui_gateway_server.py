@@ -3878,6 +3878,72 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert server._sessions[runtime_sid]["model_override"] == captured["model_override"]
 
 
+@pytest.mark.parametrize("turn_start_restored", [False, True])
+def test_session_resume_auth_fallback_preserves_stored_primary_after_turn(monkeypatch, tmp_path, turn_start_restored):
+    from hermes_cli.auth import AuthError
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "resume.db")
+    db.create_session("stored-primary", source="desktop", model="primary-model",
+                      model_config={"provider": "openai-codex"})
+    db.append_message("stored-primary", "user", "hello")
+
+    def resolve(**kwargs):
+        if kwargs.get("requested") == "openai-codex":
+            raise AuthError("Stored provider unavailable")
+        assert kwargs["requested"] == "openrouter"
+        return {"provider": "openrouter", "api_mode": "chat_completions"}
+
+    def fake_agent(**kwargs):
+        return types.SimpleNamespace(**kwargs, _session_db=db, _fallback_activated=False)
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a: [])
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [
+        {"provider": "openrouter", "model": "fallback-model"}])
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_kw: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda *_a: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_a: {"model": agent.model})
+    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, **_kw:
+                        server._sessions.update({sid: _session(agent=agent, session_key=key, history=history)}))
+    sid = None
+    try:
+        response = server.handle_request({"id": "resume-fallback", "method": "session.resume",
+                                          "params": {"session_id": "stored-primary", "eager_build": True}})
+        assert "result" in response, response
+        sid = response["result"]["session_id"]
+        session = server._sessions[sid]
+        assert session["agent"].model == "fallback-model"
+        if turn_start_restored:
+            # turn_context.prepare_turn calls restore_primary_runtime, whose successful
+            # init-time snapshot restore clears this transient flag (both routes are fallback).
+            session["agent"]._fallback_activated = False
+        # Exercise the same durable write used after the fallback turn completes.
+        db.append_message("stored-primary", "assistant", "fallback reply")
+        server._persist_live_session_runtime(session)
+        assert db.get_session("stored-primary")["model"] == "primary-model"
+        assert json.loads(db.get_session("stored-primary")["model_config"])["provider"] == "openai-codex"
+        # A later deliberate /model switch replaces the stored primary normally.
+        agent = session["agent"]
+        agent.switch_model = lambda **kw: vars(agent).update(
+            model=kw["new_model"], provider=kw["new_provider"], _fallback_activated=False)
+        for name in ("_restart_slash_worker", "_persist_live_session_system_prompt",
+                     "_append_model_switch_marker", "_emit_session_info"):
+            monkeypatch.setattr(server, name, lambda *_a, **_kw: None)
+        result = types.SimpleNamespace(new_model="chosen-model", target_provider="openrouter",
+                                       api_key="", base_url="", api_mode="chat_completions")
+        server._commit_agent_switch(sid, session, agent, result, agent.model, None)
+        assert db.get_session("stored-primary")["model"] == "chosen-model"
+    finally:
+        if sid:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     target = "stored-profile-session"
     launch_cwd = tmp_path / "launch"
@@ -4099,7 +4165,8 @@ def test_openrouter_session_resume_restores_provider():
     assert ov["provider_override"] == "openrouter"
 
 
-def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
+@pytest.mark.parametrize("fallback_active", [False, True])
+def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch, fallback_active):
     updates = {}
 
     class FakeDB:
@@ -4118,10 +4185,14 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
         reasoning_config={"enabled": True, "effort": "high"},
         service_tier="priority",
         _session_db=FakeDB(),
+        _fallback_activated=fallback_active,
     )
 
     server._persist_live_session_runtime({"agent": agent, "session_key": "stored-session"})
 
+    if fallback_active:
+        assert updates == {}
+        return
     assert "model" not in updates
     assert updates["meta"] == (
         "stored-session",
@@ -10230,6 +10301,54 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         server._sessions.clear()
 
 
+@pytest.mark.parametrize("once", [True, False])
+def test_model_switch_persists_only_durable_identity(monkeypatch, tmp_path, once):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "model-switch.db")
+    db.create_session("session-key", source="desktop", model="primary-model")
+
+    class Agent:
+        model = "primary-model"
+        provider = "openrouter"
+        api_key = ""
+        base_url = ""
+        api_mode = "chat_completions"
+        _fallback_activated = False
+        _session_db = db
+
+        def switch_model(self, **kwargs):
+            for field in ("model", "provider"):
+                setattr(self, field, kwargs["new_" + field])
+            self._fallback_activated = False
+
+    agent = Agent()
+    session = _session(agent=agent)
+    result = types.SimpleNamespace(new_model="other-model", target_provider="openrouter",
+                                   api_key="", base_url="", api_mode="chat_completions")
+    snapshot = server._snapshot_agent_model_runtime(agent) if once else None
+    for name in ("_restart_slash_worker", "_persist_live_session_system_prompt",
+                 "_append_model_switch_marker", "_emit_session_info", "_clear_session_context"):
+        monkeypatch.setattr(server, name, lambda *_a, **_kw: None)
+    persist = Mock(wraps=db.update_session_meta)
+    monkeypatch.setattr(db, "update_session_meta", persist)
+    try:
+        server._commit_agent_switch("sid", session, agent, result, "primary-model", snapshot)
+        assert agent.model == "other-model"
+        assert db.get_session("session-key")["model"] == ("primary-model" if once else "other-model")
+        if once:
+            persist.assert_not_called()
+            # The real finally path restores before its durable write.
+            state = server._TurnRun(agent, session.pop("one_turn_model_restore"), None, receipt_committed=True)
+            server._finish_turn("sid", session, state)
+            assert agent.model == "primary-model"
+            assert agent._fallback_activated is False
+            assert db.get_session("session-key")["model"] == "primary-model"
+        persist.assert_called_once()
+    finally:
+        db.close()
+
+
 def test_config_set_model_once_requires_live_session(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model",
@@ -16257,6 +16376,11 @@ def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
 def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch):
     from hermes_cli.inventory import ConfigContext
 
+    # This fixture has no external sign-ins; do not discover the developer's
+    # Claude Code/OAuth credentials while testing canonical custom identity.
+    monkeypatch.setattr("hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: False)
+    monkeypatch.setattr("hermes_cli.inventory._external_process_signed_in", lambda _slug: False)
+
     class _Agent:
         provider = "custom"
         model = "qwen3.6:35b-65k"
@@ -22268,3 +22392,190 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+# ── Compression re-anchor fail-closed (RF4 port) ────────────────────────────
+
+
+def _patch_approval_module(monkeypatch, calls: list):
+    """Patch the approval hooks by ATTRIBUTE (not sys.modules): the rekey path
+    does ``from tools import approval``, which reads the cached attribute on the
+    already-imported package and ignores a sys.modules substitute."""
+    import tools.approval as approval_mod
+
+    monkeypatch.setattr(approval_mod, "disable_session_yolo", lambda *a, **k: calls.append("disable"))
+    monkeypatch.setattr(approval_mod, "enable_session_yolo", lambda *a, **k: calls.append("enable"))
+    monkeypatch.setattr(approval_mod, "is_session_yolo_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(approval_mod, "register_gateway_notify", lambda *a, **k: calls.append("register"))
+    monkeypatch.setattr(approval_mod, "unregister_gateway_notify", lambda *a, **k: calls.append("unregister"))
+
+
+def test_sync_session_key_after_compress_fails_closed_when_reanchor_fails(monkeypatch):
+    """When the lease cannot move to the continuation id, the surface must NOT
+    rekey onto it — no yolo/notify transfer, session stays anchored on the old
+    key, the failure is surfaced to the client, and the session is fenced."""
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *a, **k: None)
+    approval_calls: list = []
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_queued_prompt_generation"] = 5
+    session["pending_title"] = "keep me"
+    session["created_at"] = time.time() - 120
+    monkeypatch.setattr(server, "_resolve_session_platform", lambda: "desktop")
+
+    emitted: list = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload or {}))
+    )
+
+    _patch_approval_module(monkeypatch, approval_calls)
+    server._sync_session_key_after_compress("sid", session)
+
+    # NOT rekeyed onto the unowned continuation id.
+    assert session["session_key"] == "parent-session"
+    # No yolo/notify state transferred onto the continuation.
+    assert approval_calls == []
+    # Generation still bumps: a raced drain claim must not dispatch on the
+    # unowned continuation (the compute-host drain branch skips the
+    # _run_prompt_submit ownership chokepoint).
+    assert session["_queued_prompt_generation"] == 6
+    # Fence armed with the operator-facing refusal.
+    fenced = session.get("_lease_reanchor_failed")
+    assert fenced is not None
+    assert "child-session" in str(fenced)
+    assert "hermes chat --resume child-session" in str(fenced)
+    assert fenced.holder["surface"] == "desktop"
+    assert fenced.holder["pid"] == os.getpid()
+    assert fenced.holder["age_s"] >= 120
+    assert fenced.holder["session_id"] == "child-session"
+    assert fenced.holder["holder_live"] is True
+    # Exercise the actual refusal forwarding path, not a separately made fixture.
+    server._sessions["fenced-reanchor"] = session
+    try:
+        response = server.handle_request({"id": "fenced", "method": "prompt.submit",
+                                          "params": {"session_id": "fenced-reanchor", "text": "next"}})
+        assert response["error"]["data"]["holder"] == fenced.holder
+    finally:
+        server._sessions.pop("fenced-reanchor", None)
+    # Failure surfaced through the existing error event channel.
+    assert emitted and emitted[0][0] == "error" and emitted[0][1] == "sid"
+    assert "hermes chat --resume child-session" in emitted[0][2]["message"]
+    # Old-key anchored state untouched.
+    assert session["pending_title"] == "keep me"
+
+
+def test_sync_session_key_after_compress_reanchor_success_keeps_behavior(monkeypatch):
+    """Counterpart: a successful re-anchor keeps the existing behavior — rekey
+    plus yolo/notify transfer onto the continuation — and lifts any stale
+    fence (ownership re-proven)."""
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *a, **k: None)
+    approval_calls: list = []
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = "stale fence from an earlier failure"
+
+    _patch_approval_module(monkeypatch, approval_calls)
+    server._sync_session_key_after_compress("sid", session)
+
+    assert session["session_key"] == "child-session"
+    assert "_lease_reanchor_failed" not in session
+    # unregister(old) + is_yolo + enable(new)/disable(old) + register(new)
+    assert approval_calls == ["unregister", "enable", "disable", "register"]
+
+
+def test_prompt_submit_refused_after_failed_compress_reanchor(monkeypatch):
+    """The fence must refuse further prompts on the continuation id with the
+    ownership-refusal family (4090 / SESSION_NOT_OWNED) — no model turn — and
+    the 4090 data carries the machine-readable reason."""
+    from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
+
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = ActiveSessionRefusal(
+        "Session lease could not be moved to the continuation session "
+        "child-session (registry refused). Turns on it are no longer "
+        "ownership-protected, so this surface stops here rather than risking "
+        "a second writer. Re-attach with: hermes chat --resume child-session",
+        SESSION_NOT_OWNED,
+    )
+    server._sessions["fenced-sid"] = session
+    turn_calls: list = []
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: turn_calls.append(a))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "r1",
+                "method": "prompt.submit",
+                "params": {"session_id": "fenced-sid", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("fenced-sid", None)
+
+    err = resp["error"]
+    assert err["code"] == 4090
+    assert err["data"]["reason"] == SESSION_NOT_OWNED
+    assert "hermes chat --resume child-session" in err["message"]
+    assert turn_calls == []
+    assert session.get("running") is False
+
+
+def test_drain_queued_prompt_does_not_dispatch_on_fenced_session(monkeypatch):
+    """The queued-prompt drain must respect the fence: the compute-host branch
+    dispatches without the _run_prompt_submit ownership chokepoint, so a fenced
+    session must not drain at all. The queue is left in place — it dies with
+    this dead-ended runtime session instead of being silently destroyed."""
+    agent = types.SimpleNamespace(session_id="child-session")
+    session = _session(agent=agent, session_key="parent-session")
+    session["_lease_reanchor_failed"] = "fenced: hermes chat --resume child-session"
+    session["queued_prompt"] = {"text": "next", "transport": None}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: True)
+    submitted: list = []
+
+    def _fake_submit(*a, **k):
+        submitted.append(a)
+        return {"result": {"status": "streaming"}}
+
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", _fake_submit)
+
+    assert server._drain_queued_prompt("r", "sid", session) is False
+    assert submitted == []
+    assert session.get("running") is False
+    assert session["queued_prompt"] == {"text": "next", "transport": None}
+
+
+def test_prompt_submit_4090_carries_holder_payload(monkeypatch, tmp_path):
+    """A SESSION_NOT_OWNED refusal surfaces the holder facts as typed data on
+    the 4090 error so the desktop renders 'who owns this' without prose-parsing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    holder, _ = try_acquire_active_session(
+        session_id="held-session", surface="cli", config={},
+        metadata={"live_session_id": "holder-live"},
+    )
+    assert holder is not None
+    session = _session(session_key="held-session")
+    server._sessions["held-sid"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "r2",
+                "method": "prompt.submit",
+                "params": {"session_id": "held-sid", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("held-sid", None)
+        holder.release()
+
+    err = resp["error"]
+    assert err["code"] == 4090
+    holder_data = err["data"]["holder"]
+    assert holder_data["session_id"] == "held-session"
+    assert holder_data["surface"] == "cli"
+    assert holder_data["pid"] == os.getpid()
+    assert "holder_live" in holder_data

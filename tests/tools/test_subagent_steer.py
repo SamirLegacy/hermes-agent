@@ -159,13 +159,14 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
 class TestMissedSteerRetention:
     """The final-answer race: a steer with no boundary left is NAMED, not lost."""
 
-    def test_pending_steer_lands_in_completion_entry(self):
+    def test_pending_steer_lands_in_completion_entry(self, tmp_path):
         import json
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
 
         parent = MagicMock()
+        parent._session_db.db_path = tmp_path / "state.db"
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -190,19 +191,22 @@ class TestMissedSteerRetention:
             result = json.loads(delegate_task(goal="race test", parent_agent=parent))
             entry = result["results"][0]
 
+        assert MockAgent.call_args.kwargs["session_db"].db_path == (tmp_path / "state.db").resolve()
+        assert (tmp_path / "state.db").is_file()
         assert entry["missed_steer"] == "focus on pricing instead"
         assert "steer did not land" in entry["summary"]
         assert "focus on pricing instead" in entry["summary"]
         # The race must not corrupt the outcome of the work itself.
         assert entry["status"] == "completed"
 
-    def test_no_pending_steer_leaves_entry_untouched(self):
+    def test_no_pending_steer_leaves_entry_untouched(self, tmp_path):
         import json
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
 
         parent = MagicMock()
+        parent._session_db.db_path = tmp_path / "state.db"
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -224,6 +228,8 @@ class TestMissedSteerRetention:
             result = json.loads(delegate_task(goal="clean run", parent_agent=parent))
             entry = result["results"][0]
 
+        assert MockAgent.call_args.kwargs["session_db"].db_path == (tmp_path / "state.db").resolve()
+        assert (tmp_path / "state.db").is_file()
         assert "missed_steer" not in entry
         assert "steer did not land" not in entry["summary"]
 

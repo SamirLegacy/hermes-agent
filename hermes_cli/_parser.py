@@ -147,6 +147,8 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
         "recorded-cwd restore)."))
     add("--continue", "-c", dest="continue_last", nargs="?", const=True, default=None,
         metavar="SESSION_NAME", help="Resume a session by name, or the most recent if no name given")
+    add("--takeover", action="store_true", default=False,
+        help="Reclaim --resume's session from a dead/stale holder (a live owner is always refused)")
     add("--worktree", "-w", action="store_true", default=False,
         help="Run in an isolated git worktree (for parallel agents)")
     inherited(parser, "--accept-hooks", action="store_true", default=False, help=(
@@ -232,6 +234,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "'--resume latest' / -c lookups to DIR's workspace)."))
     add("--continue", "-c", dest="continue_last", nargs="?", const=True, default=SUPPRESS,
         metavar="SESSION_NAME", help="Resume a session by name, or the most recent if no name given")
+    add("--takeover", action="store_true", default=SUPPRESS,
+        help="Reclaim --resume's session from a dead/stale holder (a live owner is always refused)")
     add("--create-if-missing", action="store_true", default=SUPPRESS, help=(
         "With -c/--continue <name>: if no session matches the name, "
         "create a new session with that title and proceed (instead of "

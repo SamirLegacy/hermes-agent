@@ -1885,6 +1885,11 @@ class TestSystemdCgroupIsolation:
     ENTIRE gateway cgroup, taking down the messaging control plane.
     """
 
+    @pytest.fixture(autouse=True)
+    def _linux_scope_platform(self, monkeypatch):
+        """Exercise mocked scope dispatch on any POSIX host, not its kernel."""
+        monkeypatch.setattr("tools.process_registry._IS_LINUX", True)
+
     @pytest.fixture()
     def _gateway_identity(self, monkeypatch):
         """Opt-in: mark this test as running AS the live gateway process."""

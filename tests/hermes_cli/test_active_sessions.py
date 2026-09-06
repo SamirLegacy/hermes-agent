@@ -646,3 +646,215 @@ def test_liveness_guard_keeps_a_just_acquired_own_lease_it_cannot_vouch_for(
     ) as active:
         assert active is False
     assert active_sessions.active_session_registry_snapshot(home) == []
+
+
+def test_refusal_message_names_holder_age_clock_and_next_steps(tmp_path, monkeypatch):
+    """The refusal is the ONLY operator-facing surface when a session is locked —
+    it must say who holds it (surface, pid), for how long (age), since when
+    (wall clock), and what to do next."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="20260902_183916_bdcd79",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "holder-live"},
+    )
+    assert holder is not None
+
+    lease, refusal = active_sessions.try_acquire_active_session(
+        session_id="20260902_183916_bdcd79",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "blocked-surface"},
+    )
+
+    assert lease is None
+    assert refusal is not None
+    assert refusal.reason == active_sessions.SESSION_NOT_OWNED
+    message = str(refusal)
+    # Who holds it: session id, holder surface, holder pid.
+    assert "20260902_183916_bdcd79" in message
+    assert "cli" in message
+    assert f"pid {os.getpid()}" in message
+    # For how long, and since when on the wall clock.
+    assert "running" in message
+    assert ", since " in message
+    # Live holder: quit-first guidance, never a --takeover advertisement.
+    assert "Quit that surface first" in message
+    assert "--takeover" not in message
+    assert "hermes status" in message
+
+
+def test_refusal_carries_machine_readable_holder_payload(tmp_path, monkeypatch):
+    """The desktop renders "who owns this" from typed data, never from prose."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="held-session",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "holder-live"},
+    )
+    assert holder is not None
+
+    lease, refusal = active_sessions.try_acquire_active_session(
+        session_id="held-session",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "blocked"},
+    )
+
+    assert lease is None
+    assert refusal.reason == active_sessions.SESSION_NOT_OWNED
+    payload = refusal.holder
+    assert payload["session_id"] == "held-session"
+    assert payload["surface"] == "desktop"
+    assert payload["pid"] == os.getpid()
+    assert payload["started_at"] is not None
+    assert payload["age_s"] is not None
+    assert payload["age_s"] >= 0
+    assert payload["holder_live"] is True
+
+
+def _write_dead_holder(tmp_path, monkeypatch, session_id="dead-holder-session"):
+    """Registry entry whose pid is dead AND whose process start-time mismatches —
+    the only holder class --takeover may reclaim."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id=session_id,
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "dead-owner"},
+    )
+    assert holder is not None
+    state_path = active_sessions._state_path()
+    entries = active_sessions._read_entries(state_path)
+    entries[0]["pid"] = 0x7FFFFFFE
+    entries[0]["process_start_time"] = 1.0
+    active_sessions._write_entries(state_path, entries)
+    return holder
+
+
+def test_takeover_with_dead_holder_is_a_plain_acquire(tmp_path, monkeypatch, caplog):
+    """A dead holder is already pruned by the normal claim path — the takeover
+    must not log a steal against a corpse."""
+    _write_dead_holder(tmp_path, monkeypatch, session_id="owned-session")
+
+    with caplog.at_level(logging.INFO, logger="hermes_cli.active_sessions"):
+        lease, message = active_sessions.takeover_active_session(
+            session_id="owned-session",
+            surface="cli",
+            config={},
+            metadata={"live_session_id": "cli-taker"},
+        )
+
+    assert lease is not None and message is None
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [(entry["lease_id"], entry["session_id"]) for entry in entries] == [
+        (lease.lease_id, "owned-session")
+    ]
+    assert not any("took over session" in record.getMessage() for record in caplog.records)
+
+
+def test_takeover_refuses_live_holder(tmp_path, monkeypatch):
+    """--takeover must NEVER steal from a live holder: the live surface keeps its
+    in-memory lease, so stealing the registry entry would leave two writers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="live-owned",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "desktop-owner"},
+    )
+    assert holder is not None
+
+    lease, refusal = active_sessions.takeover_active_session(
+        session_id="live-owned",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "cli-taker"},
+    )
+
+    assert lease is None
+    assert refusal is not None
+    assert refusal.reason == active_sessions.SESSION_NOT_OWNED
+    assert "is alive" in str(refusal)
+    assert refusal.holder is not None
+    assert refusal.holder["holder_live"] is True
+    # The registry still names the original holder.
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [e["session_id"] for e in entries] == ["live-owned"]
+    assert entries[0]["lease_id"] == holder.lease_id
+
+
+def test_takeover_refuses_unverifiable_holder(tmp_path, monkeypatch):
+    """Liveness None (cannot prove dead) is treated as live: fail closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    holder, _ = active_sessions.try_acquire_active_session(
+        session_id="unknown-owned",
+        surface="desktop",
+        config={},
+        metadata={"live_session_id": "desktop-owner"},
+    )
+    assert holder is not None
+    state_path = active_sessions._state_path()
+    entries = active_sessions._read_entries(state_path)
+    entries[0]["pid"] = None  # unverifiable: no pid to probe
+    entries[0]["process_start_time"] = None
+    active_sessions._write_entries(state_path, entries)
+
+    lease, refusal = active_sessions.takeover_active_session(
+        session_id="unknown-owned",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "cli-taker"},
+    )
+
+    # Fail closed either way: under this module's strict pruning an
+    # unverifiable holder makes the ownership state unprovable, which surfaces
+    # as SESSION_COORDINATION_UNAVAILABLE — refused, never stolen.
+    assert lease is None
+    assert refusal is not None
+    assert refusal.reason == active_sessions.SESSION_COORDINATION_UNAVAILABLE
+
+
+def test_takeover_of_own_live_session_replaces_without_steal_log(tmp_path, monkeypatch, caplog):
+    """A takeover re-claiming this process's own live session is re-entrancy, not a steal."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    own, _ = active_sessions.try_acquire_active_session(
+        session_id="own-session",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "own-live"},
+    )
+    assert own is not None
+
+    with caplog.at_level(logging.INFO, logger="hermes_cli.active_sessions"):
+        lease, message = active_sessions.takeover_active_session(
+            session_id="own-session",
+            surface="cli",
+            config={},
+            metadata={"live_session_id": "own-live"},
+        )
+
+    assert lease is not None and message is None
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [e["session_id"] for e in entries] == ["own-session"]
+    assert not any("took over session" in r.getMessage() for r in caplog.records)
+
+
+def test_takeover_unreadable_registry_fails_closed(tmp_path, monkeypatch):
+    """An unprovable ownership state must not collapse into a go-ahead."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    state_path = active_sessions._state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not json")
+
+    lease, refusal = active_sessions.takeover_active_session(
+        session_id="any-session",
+        surface="cli",
+        config={},
+    )
+
+    assert lease is None
+    assert refusal is not None
+    assert refusal.reason == active_sessions.SESSION_COORDINATION_UNAVAILABLE

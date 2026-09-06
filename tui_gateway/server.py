@@ -1544,6 +1544,14 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if live is None:
         return
     agent, session_key, db = live
+    resolution = getattr(agent, "_runtime_fallback_resolution", None)
+    if (getattr(agent, "_fallback_activated", False) is True
+            or isinstance(resolution, _RuntimeFallbackResolution) and resolution.used_fallback):
+        # Init-time fallback remains transient even after the turn-start restore
+        # clears _fallback_activated on the agent's fallback-built snapshot.
+        # A transient fallback (or one-turn model override) must not replace
+        # the stored primary route used by the next resume.
+        return
     try:
         row = db.get_session(session_key) or {}
         model_config = _runtime_model_config(agent, _parse_model_config(row.get("model_config")))
@@ -2230,7 +2238,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
-        return resolution.selected_model, resolution.runtime
+        return resolution.selected_model, {**resolution.runtime, "_fallback_resolution": resolution}
     resolution.runtime.update({k: v for k, v in overrides.items() if v})
     return model, resolution.runtime
 
@@ -2297,6 +2305,9 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
         **_agent_cbs(sid))
+    agent._runtime_fallback_resolution = runtime.get("_fallback_resolution")
+    if agent._runtime_fallback_resolution is not None:
+        agent._fallback_activated = True
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
             context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(_sessions.get(sid))

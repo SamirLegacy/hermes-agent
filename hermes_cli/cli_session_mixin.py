@@ -1127,6 +1127,18 @@ class CLISessionMixin:
                 agent_sid = getattr(self.agent, "session_id", None)
                 if agent_sid and agent_sid != self.session_id:
                     self.session_id = self.agent.session_id
+                    if not self._reanchor_active_session_lease():
+                        # Fail-closed path already surfaced the stop. The
+                        # compression boundary itself committed on the agent
+                        # side, so the deferred notification is emitted
+                        # (exactly-once) — but this surface does NOT own the
+                        # continuation id: no transcript flush, no further
+                        # handler steps on it.
+                        finalize_context_engine_compression_notification(
+                            self.agent,
+                            committed=True,
+                        )
+                        return
                     self._write_terminal_breadcrumb()
                     self._pending_title = None
                     # Persist the new handoff from offset 0 so resume can recover it after exit.

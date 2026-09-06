@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
+import pytest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +60,7 @@ def _make_sync_fixture(tmp_path: Path):
     subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
     (seed / "README.md").write_text("seed\n")
     (seed / "main_code.py").write_text("X = 1\n")
+    (seed / ".gitignore").write_text("venv/\n")
     (seed / "contributors").mkdir()
     (seed / "contributors" / "emails").mkdir()
     (seed / "contributors" / "emails" / "t@t.t").write_text("t\n")
@@ -75,6 +78,17 @@ def _make_sync_fixture(tmp_path: Path):
     )
     _git(main_checkout, "remote", "add", "upstream", str(upstream))
     _git(main_checkout, "fetch", "-q", "upstream")
+    python = main_checkout / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        '#!/bin/sh\ncase "$2" in "import mcp"*) exit 0;; esac\n'
+        f'exec "{sys.executable}" "$@"\n'
+    )
+    python.chmod(0o755)
+    no_swap = tmp_path / "no-swap.sh"
+    no_swap.write_text("#!/bin/sh\nexit 0\n")
+    no_swap.chmod(0o755)
+    _write_stub_uv(tmp_path)
     return main_checkout, origin, upstream
 
 
@@ -112,6 +126,15 @@ def _run_fork_sync(tmp_path: Path, main_checkout: Path, *args: str, extra_env: d
     env["FORK_SYNC_HERMES_PROFILE"] = "desktop-local"
     env["FORK_SYNC_SKILLS_SNAPSHOT"] = str(tmp_path / "skills-before.txt")
     env["FORK_SYNC_BUNDLE_SWAP_SCRIPT"] = str(tmp_path / "no-swap.sh")
+    home = tmp_path / "home"
+    profile = home / ".hermes" / "profiles" / "desktop-local"
+    profile.mkdir(parents=True, exist_ok=True)
+    config = profile / "config.yaml"
+    if not config.exists():
+        config.write_text("mcp_servers:\n  heygen: {}\nplugins:\n  enabled: []\n")
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(home / ".hermes")
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -192,7 +215,7 @@ def test_single_canonical_sync_line():
         "the canonical dependency-sync line must be defined exactly once "
         "(CANONICAL_SYNC=...); any other occurrence re-opens the MCP-prune hole"
     )
-    assert "CANONICAL_SYNC=(uv sync --extra dev --extra mcp)" in text
+    assert "CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)" in text
     assert 'command -v uv' in text, "script must refuse to run without uv"
 
 
@@ -214,9 +237,9 @@ def _write_stub_hermes(tmp_path: Path, behaviors: dict[str, int]):
         'case "$args" in',
         f'  *"mcp test heygen"*) exit {behaviors.get("mcp", 0)};;',
         f'  *"hooks doctor"*) exit {behaviors.get("hooks", 0)};;',
-        '  *"sessions list"*) echo "ID"; echo "probe-session-123"; exit 0;;',
+        '  *"sessions list"*) echo "ID"; echo "unrelated-latest-session"; exit 0;;',
         f'  *"chat --resume"*) echo "resumed probe-session-123 OK2"; exit {behaviors.get("resume", 0)};;',
-        f'  *"chat -q"*) echo "OK"; exit {behaviors.get("chat", 0)};;',
+        f'  *"chat -q"*) echo "OK"; echo "session_id: probe-session-123"; exit {behaviors.get("chat", 0)};;',
         '  *"skills list"*) cat "$FORK_SYNC_STUB_SKILLS"; exit 0;;',
         "  *) exit 0;;",
         "esac",
@@ -236,6 +259,8 @@ def test_probe_all_pass_output_format(tmp_path):
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "FORK_SYNC_STUB_SKILLS": str(skills),
     }
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
     r = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     for needle in ("PASS mcp heygen", "PASS hooks doctor", "PASS chat smoke",
@@ -255,6 +280,8 @@ def test_probe_fails_when_check_fails(tmp_path):
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "FORK_SYNC_STUB_SKILLS": str(skills),
     }
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
     r = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
     assert r.returncode == 30, r.stdout + r.stderr
     assert "FAIL mcp heygen" in r.stdout
@@ -264,16 +291,56 @@ def test_probe_fails_when_check_fails(tmp_path):
 def test_probe_fails_on_skills_drift(tmp_path):
     main_checkout, _, _ = _make_sync_fixture(tmp_path)
     skills = tmp_path / "skills.txt"
-    skills.write_text("a\nb\n")          # after
+    skills.write_text("a\n")
     (tmp_path / "skills-before.txt").write_text("a\n")   # before
     stub = _write_stub_hermes(tmp_path, {})
     env = {
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "FORK_SYNC_STUB_SKILLS": str(skills),
     }
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    skills.write_text("a\nb\n")          # after
     r = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
     assert r.returncode == 30, r.stdout + r.stderr
     assert "FAIL skills preservation" in r.stdout
+
+
+def test_probe_checks_every_configured_mcp(tmp_path):
+    main_checkout, env = _make_deploy_fixture(tmp_path)
+    profile = tmp_path / "home/.hermes/profiles/desktop-local"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("mcp_servers:\n  heygen: {}\n  second-server: {}\n")
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    stub = tmp_path / "hermes"
+    stub.write_text(stub.read_text().replace(
+        'case "$args" in', 'case "$args" in\n  *"mcp test second-server"*) exit 1;;'))
+    result = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert result.returncode == 30
+    assert "PASS mcp heygen" in result.stdout
+    assert "FAIL mcp second-server" in result.stdout
+
+
+@pytest.mark.parametrize("surface", ["quick-command", "user-plugin"])
+def test_probe_detects_custom_capability_loss(tmp_path, surface):
+    main_checkout, env = _make_deploy_fixture(tmp_path)
+    profile = tmp_path / "home/.hermes/profiles/desktop-local"
+    profile.mkdir(parents=True)
+    config = profile / "config.yaml"
+    config.write_text("mcp_servers:\n  heygen: {}\nquick_commands:\n  custom: {type: alias, target: help}\n")
+    plugin = profile / "plugins/custom/__init__.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("def register(ctx):\n    pass\n")
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    if surface == "quick-command":
+        config.write_text("mcp_servers:\n  heygen: {}\n")
+    else:
+        plugin.unlink()
+    result = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert result.returncode == 30, result.stdout + result.stderr
+    assert "FAIL custom commands/plugins/MCP preservation" in result.stdout
 
 
 # ── bundle swap: pack / swap / relaunch (scripts/fork-sync-bundle-swap.sh)
@@ -561,3 +628,24 @@ def test_deploy_packs_after_the_ff_pull(tmp_path):
     )
     # The upstream file only exists after the ff-pull — proof the pull ran.
     assert (main_checkout / "upstream_deploy.py").read_text() == "Z = 3\n"
+
+
+def test_bundle_pack_reuses_unchanged_sources_and_rebuilds_changes(tmp_path):
+    repo, desk = _make_repo_fixture(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / ".gitignore").write_text("node_modules/\napps/desktop/release/\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "desktop source baseline")
+    _write_stub_npm(tmp_path, "0.17.0")
+    log = tmp_path / "npm.log"
+    env = {"PATH": f"{tmp_path}:{os.environ['PATH']}", "FORK_SYNC_NPM_LOG": str(log)}
+    first = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    second = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert first.returncode == second.returncode == 0, first.stdout + second.stdout
+    assert log.read_text().splitlines().count("run pack") == 1
+    (desk / "source.js").write_text("console.log('changed');\n")
+    _git(repo, "add", "apps/desktop/source.js")
+    _git(repo, "commit", "-qm", "desktop source change")
+    third = _run_bundle_swap(tmp_path, "pack", extra_env=env)
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert log.read_text().splitlines().count("run pack") == 2
