@@ -383,7 +383,7 @@ class TestTranscribeLocalExtended:
         assert mock_whisper_cls.call_count == 1
 
     def test_config_device_and_compute_type_passed_to_whisper(self, tmp_path):
-        """User-configured device and compute_type should be forwarded to WhisperModel.
+        """Forward configured device and compute_type to the model loader.
 
         Regression test for #8319: these values were hardcoded to "auto".
         """
@@ -408,7 +408,7 @@ class TestTranscribeLocalExtended:
         }
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
-             patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_local_whisper_model", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
              patch("tools.transcription_tools._load_stt_config", return_value=fake_config):

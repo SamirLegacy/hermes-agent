@@ -17,6 +17,8 @@ No live gateway, no network. Git and restart are mocked.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +30,21 @@ from hermes_cli import update_cmd
 import hermes_cli.update_cmd_fleet as update_cmd_fleet
 import hermes_cli.update_cmd_deps as update_cmd_deps
 from hermes_constants import get_hermes_home
+
+
+@pytest.fixture(autouse=True)
+def _isolated_update_home(tmp_path, monkeypatch):
+    """No real LaunchAgents or profile state belong in mocked update tests."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".hermes").mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    if os.name == "posix":
+        import pwd
+        account = pwd.getpwuid(os.getuid())
+        monkeypatch.setattr(
+            pwd, "getpwuid",
+            lambda uid: pwd.struct_passwd((*account[:5], str(tmp_path), account.pw_shell)),
+        )
 
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
