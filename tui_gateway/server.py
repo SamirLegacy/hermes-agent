@@ -2234,7 +2234,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
-        return resolution.selected_model, resolution.runtime
+        return resolution.selected_model, {**resolution.runtime, "_fallback_activated": True}
     resolution.runtime.update({k: v for k, v in overrides.items() if v})
     return model, resolution.runtime
 
@@ -2301,6 +2301,8 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
         **_agent_cbs(sid))
+    if runtime.get("_fallback_activated") is True:
+        agent._fallback_activated = True
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
             context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(_sessions.get(sid))

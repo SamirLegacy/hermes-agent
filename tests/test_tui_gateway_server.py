@@ -3878,6 +3878,56 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert server._sessions[runtime_sid]["model_override"] == captured["model_override"]
 
 
+def test_session_resume_auth_fallback_preserves_stored_primary_after_turn(monkeypatch, tmp_path):
+    from hermes_cli.auth import AuthError
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "resume.db")
+    db.create_session("stored-primary", source="desktop", model="primary-model",
+                      model_config={"provider": "openai-codex"})
+    db.append_message("stored-primary", "user", "hello")
+
+    def resolve(**kwargs):
+        if kwargs.get("requested") == "openai-codex":
+            raise AuthError("Stored provider unavailable")
+        assert kwargs["requested"] == "openrouter"
+        return {"provider": "openrouter", "api_mode": "chat_completions"}
+
+    def fake_agent(**kwargs):
+        return types.SimpleNamespace(**kwargs, _session_db=db, _fallback_activated=False)
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a: [])
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [
+        {"provider": "openrouter", "model": "fallback-model"}])
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_kw: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda *_a: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_a: {"model": agent.model})
+    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, **_kw:
+                        server._sessions.update({sid: _session(agent=agent, session_key=key, history=history)}))
+    sid = None
+    try:
+        response = server.handle_request({"id": "resume-fallback", "method": "session.resume",
+                                          "params": {"session_id": "stored-primary", "eager_build": True}})
+        assert "result" in response, response
+        sid = response["result"]["session_id"]
+        session = server._sessions[sid]
+        assert session["agent"].model == "fallback-model"
+        # Exercise the same durable write used after the fallback turn completes.
+        db.append_message("stored-primary", "assistant", "fallback reply")
+        server._persist_live_session_runtime(session)
+        assert db.get_session("stored-primary")["model"] == "primary-model"
+        assert json.loads(db.get_session("stored-primary")["model_config"])["provider"] == "openai-codex"
+    finally:
+        if sid:
+            server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     target = "stored-profile-session"
     launch_cwd = tmp_path / "launch"
