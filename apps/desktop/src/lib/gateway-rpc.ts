@@ -37,3 +37,35 @@ export function isBusySessionModelSwitch(error: unknown): boolean {
 
   return /session busy/i.test(message) && /switching models/i.test(message)
 }
+
+interface SessionOwner {
+  surface?: string
+  pid?: number | string
+  age_s?: number
+  session_id?: string
+  holder_live?: boolean
+}
+
+function sessionOwnerOf(error: unknown): SessionOwner | null {
+  for (const candidate of [error, (error as { error?: unknown } | null)?.error]) {
+    const rpc = candidate as { code?: unknown; data?: { reason?: unknown; holder?: SessionOwner } } | null
+    if ((rpc?.code === 4090 || rpc?.code === '4090') && rpc.data?.reason === 'SESSION_NOT_OWNED') {
+      return rpc.data.holder ?? {}
+    }
+  }
+  return null
+}
+
+export function isSessionNotOwnedError(error: unknown): boolean {
+  return sessionOwnerOf(error) !== null
+}
+
+export function describeSessionOwner(error: unknown): string {
+  const owner = sessionOwnerOf(error)
+  if (!owner) return error instanceof Error ? error.message : String(error)
+  const age = typeof owner.age_s === 'number' ? `, ${Math.max(0, Math.round(owner.age_s / 60))}m` : ''
+  const facts = `${owner.surface || 'another surface'} (pid ${owner.pid ?? '?'}${age})`
+  return owner.holder_live === false && owner.session_id
+    ? `Session held by stale ${facts}. Reclaim with: hermes chat --resume ${owner.session_id} --takeover`
+    : `Session has a live owner: ${facts}. Quit that surface first, then resume again.`
+}

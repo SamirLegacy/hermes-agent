@@ -34,6 +34,23 @@ from agent.model_metadata import (
 )
 
 
+@pytest.mark.parametrize("supplied, expected", [(None, 1_000_000), ([], None)])
+def test_context_lookup_honors_configured_route_without_explicit_catalog(monkeypatch, supplied, expected):
+    from agent.model_metadata import _config_override_context_length
+
+    monkeypatch.setattr("agent.models_dev._override_context_window", lambda *_args: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_compatible_custom_providers",
+        lambda _config=None: [{
+            "name": "fixture-provider", "base_url": "http://127.0.0.1:12345/v1",
+            "models": {"fixture-model": {"context_length": 1_000_000}},
+        }],
+    )
+    assert _config_override_context_length(
+        "fixture-model", "http://127.0.0.1:12345/v1", "custom", supplied
+    ) == expected
+
+
 # =========================================================================
 # Token estimation
 # =========================================================================

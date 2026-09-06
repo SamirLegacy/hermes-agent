@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { isMissingPendingPromptRequest, isMissingRpcMethod } from './gateway-rpc'
+import {
+  describeSessionOwner,
+  isMissingPendingPromptRequest,
+  isMissingRpcMethod,
+  isSessionNotOwnedError
+} from './gateway-rpc'
 
 describe('isMissingRpcMethod', () => {
   it('detects JSON-RPC method-not-found errors', () => {
@@ -24,5 +29,26 @@ describe('isMissingPendingPromptRequest', () => {
   it('ignores unrelated gateway failures', () => {
     expect(isMissingPendingPromptRequest(new Error('gateway not connected'), 'password')).toBe(false)
     expect(isMissingPendingPromptRequest(new Error('no pending value request'), 'password')).toBe(false)
+  })
+})
+
+describe('session ownership refusal', () => {
+  it.each([4090, '4090'])('recognizes typed and wrapped code %s without matching prose', code => {
+    const error = { code, data: { reason: 'SESSION_NOT_OWNED', holder: { surface: 'cli', pid: 42, age_s: 120 } } }
+    expect(isSessionNotOwnedError(error)).toBe(true)
+    expect(isSessionNotOwnedError({ error })).toBe(true)
+    expect(describeSessionOwner({ error })).toContain('cli (pid 42, 2m)')
+    expect(describeSessionOwner(error)).not.toContain('--takeover')
+    expect(isSessionNotOwnedError({ code, data: { reason: 'SESSION_LIMIT' } })).toBe(false)
+    expect(isSessionNotOwnedError(new Error('SESSION_NOT_OWNED'))).toBe(false)
+  })
+
+  it('offers takeover only for an explicitly stale holder', () => {
+    const error = {
+      code: 4090,
+      data: { reason: 'SESSION_NOT_OWNED', holder: { holder_live: false, session_id: 'test-session' } }
+    }
+    expect(describeSessionOwner(error)).toContain('hermes chat --resume test-session --takeover')
+    expect(isSessionNotOwnedError(null)).toBe(false)
   })
 })

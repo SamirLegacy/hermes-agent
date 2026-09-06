@@ -4099,7 +4099,8 @@ def test_openrouter_session_resume_restores_provider():
     assert ov["provider_override"] == "openrouter"
 
 
-def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
+@pytest.mark.parametrize("fallback_active", [False, True])
+def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch, fallback_active):
     updates = {}
 
     class FakeDB:
@@ -4118,10 +4119,14 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
         reasoning_config={"enabled": True, "effort": "high"},
         service_tier="priority",
         _session_db=FakeDB(),
+        _fallback_activated=fallback_active,
     )
 
     server._persist_live_session_runtime({"agent": agent, "session_key": "stored-session"})
 
+    if fallback_active:
+        assert updates == {}
+        return
     assert "model" not in updates
     assert updates["meta"] == (
         "stored-session",

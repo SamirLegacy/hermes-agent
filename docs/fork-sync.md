@@ -20,29 +20,32 @@ cron job only calls the script and resolves real merge conflicts by hand.
   `.py` file under `hermes_cli/`, `agent/`, `tools/`, `gateway/`,
   `tui_gateway/` is mapped to `tests/` by name (the mapping is printed) and
   run with `HERMES_TEST_WORKERS=6 nice -n 15` via `scripts/run_tests.sh`.
-- `deploy` — ff-pull (the single allowed write in the main checkout), the
-  canonical sync against the runtime venv, then `fork-sync-bundle-swap.sh
+- `deploy` — ff-pull, the canonical sync against the runtime venv only when
+  dependency inputs changed or the venv is missing, then `fork-sync-bundle-swap.sh
   pack` (see "Desktop bundle" below), then — only when
-  `FORK_SYNC_ALLOW_APP_SWAP=1` — `swap` + `relaunch`, then the detached
+  `FORK_SYNC_ALLOW_APP_SWAP=1` — `swap`, then one detached
   restart (`scripts/fork-sync-restart.sh`, verbatim from the old cron job's
   STEP 8). Owner-gated.
 - `probe` — mandatory post-deploy checks, each printed `PASS`/`FAIL` with the
-  command: `mcp test heygen`, `hooks doctor`, a one-shot chat smoke
+  command: `mcp test <name>` for every configured MCP server, `hooks doctor`, a one-shot chat smoke
   (`chat -q "reply OK" --oneshot`; no `--no-tools` flag exists — `--oneshot`
   is the closest), a resume smoke (create a session, `chat --resume <id>`,
-  assert the same id appears in the resume output), and a skills-preservation
+  extract its own ID from CLI output, never from the newest session list;
+  assert that ID appears in the resume output), and a skills-preservation
   diff (deploy snapshots `hermes skills list` before any mutation; probe
-  compares). Any FAIL → rc 30 and the cron job stops and reports.
+  compares). Custom command definitions, discovered command names, loaded user
+  plugins and their source hashes are also compared. Any FAIL → rc 30.
 - `all` — check → merge → verify, then prints the push + PR commands and
   stops. Merging the PR and deploy stay separate invocations because the PR
   needs CI.
 
 Every subcommand is idempotent and prints a one-line receipt
-`FORK-SYNC <sub> rc=<n> <summary>`.
+`FORK-SYNC <sub> rc=<n> <summary> elapsed_s=<seconds>`. Deploy also reports
+individual fetch, pull, dependency-sync, desktop-pack and swap timings.
 
 ## The canonical sync line (structural MCP guard)
 
-Exactly one place defines it: `CANONICAL_SYNC=(uv sync --extra dev --extra mcp)`
+Exactly one place defines it: `CANONICAL_SYNC=(uv sync --inexact --extra dev --extra mcp)`
 at the top of the script. `verify` and `deploy` both expand it; no other
 `uv sync` exists in the script (enforced by
 `tests/scripts/test_fork_sync_sh.py::test_single_canonical_sync_line`), and the
@@ -53,7 +56,9 @@ pins `mcp==2.0.0`, `httpx2==2.7.0`, `starlette==1.3.1`; `--extra dev` is needed
 in the worktree for pytest and already carries the same pins, so the guard
 holds in both venvs. `deploy` additionally falls back to the additive
 `uv pip install 'mcp==2.0.0' 'httpx2==2.7.0'` restore if the import guard
-still fails in the runtime venv.
+still fails in the runtime venv. The runtime check and additive restoration also
+cover `aiohttp`, required by the API server. `--inexact` preserves other installed
+runtime packages; dependency failure never leads to a restart.
 
 ## Desktop bundle
 
@@ -62,14 +67,16 @@ still fails in the runtime venv.
 (standalone-usable for a manual UI-only swap). The gateway runs from the venv
 checkout, so the bundle only matters for the Electron UI.
 
-- **What** — `pack`: `npm ci` in `apps/desktop` only when
+- **What** — `pack`: `npm ci` at the workspace root only when
   `package-lock.json` changed (hash state kept in
   `node_modules/.fork-sync-lock-hash`), then `nice -n 15 npm run pack`
   (`electron-builder --dir`), then asserts that
   `release/mac-arm64/Hermes.app/Contents/Info.plist`
   `CFBundleShortVersionString` equals the `version` in
   `apps/desktop/package.json` (0.17.0 — cosmetic, intentionally not bumped
-  per fork convention). `swap`: transactional replace of
+  per fork convention). A previously verified bundle is reused when the relevant
+  committed desktop/shared/TUI sources and dependency inputs are unchanged; a
+  dirty source tree forces rebuilding. `swap`: transactional replace of
   `/Applications/Hermes.app` mirroring upstream
   `scripts/desktop-update/posix.sh` `mac_swap` (stage a `.new` copy, back the
   old bundle up, move it aside, move the copy in, roll back on failure) with
@@ -86,7 +93,7 @@ checkout, so the bundle only matters for the Electron UI.
 - **Gate** — `pack` needs no gate (writes only inside the repo checkout).
   `swap` and `relaunch` touch the Owner's running app and refuse to run
   (rc 23) unless `FORK_SYNC_ALLOW_APP_SWAP=1`; the orchestrator sets that
-  only after the Owner's GO. `deploy` therefore always packs, and swaps
+  only after the Owner's GO. `deploy` therefore checks or builds the bundle, and swaps
   only under the gate.
 - **Retention** — `FORK_SYNC_BACKUP_KEEP` (default 2) newest backups remain
   after each swap; paths are overridable via `FORK_SYNC_APP_TARGET` /
@@ -115,6 +122,11 @@ Recurring fork surfaces:
    schedulable on this personal account and queue forever (PR #32). Adopt
    upstream workflow-structure changes around them, never the labels.
 
+An existing merge or dirty sync worktree is preserved and reported, never
+automatically aborted or reset. Git uses the configured identity unchanged.
+Contributor mappings skip GitHub numeric noreply IDs and existing case-insensitive
+matches, preventing macOS case-collision churn.
+
 After resolving: zero `<<<<<<<` markers must remain. A same-logic
 incompatible rewrite is the only stop case — report files + hunks, Samir
 decides.
@@ -128,7 +140,8 @@ twice" is gone; CI is the full-suite gate.
 
 ## Does the slow path preserve skills / slash commands?
 
-Yes — verified, they are unreachable by a dependency sync or bundle swap:
+The long agent loop is not required to preserve profile files. File retention
+alone does not prove that a command still loads or appears in the desktop:
 
 - Profile skills live under `~/.hermes/profiles/<profile>/skills/` (observed:
   `~/.hermes/profiles/desktop-local/skills/` holds the local skills shown as
@@ -141,5 +154,15 @@ Yes — verified, they are unreachable by a dependency sync or bundle swap:
 - Evidence: `hermes -p desktop-local skills list` captured 153 skill rows
   before and after this lane's real `verify` run (canonical sync + import
   guard + test mapping in the lane worktree) — identical output, diff empty.
-  `probe` enforces this going forward: `deploy` snapshots the skills list
-  before mutating anything and `probe` hard-fails on any diff.
+  this is historical evidence, not a current live verdict. `deploy` now snapshots
+  custom capabilities before mutation and `probe` checks both their preservation
+  and every configured MCP connection after the update.
+
+## Cloud preparation and local application are different phases
+
+The cloud job prepares a PR and waits for CI; it must not run the full test/build
+suite in the small managed container. The Mac applies the verified merged result.
+Do not confuse CI preparation time with app installation time: PR #40's Python
+checks took about 33 minutes. The 4–6 second local updater receipts seen during
+triage ended in failure and are NOT evidence of a successful fast update.
+Record an actual deploy/probe timing before claiming the repaired live duration.

@@ -22,7 +22,7 @@ import {
   stripPendingClarifyProjectionForCache,
   toChatMessages
 } from '@/lib/chat-messages'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { describeSessionOwner, isMissingRpcMethod, isSessionNotOwnedError } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
@@ -1896,6 +1896,12 @@ export function useSessionActions({
         }
 
         if (!isCurrentResume()) {
+          return
+        }
+
+        // Ownership refusal needs a deliberate handoff, not a reconnect loop.
+        if (isSessionNotOwnedError(err)) {
+          notify({ kind: 'info', title: 'Session has an owner', message: describeSessionOwner(err) })
           return
         }
 

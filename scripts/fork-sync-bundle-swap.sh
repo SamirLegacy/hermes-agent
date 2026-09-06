@@ -100,6 +100,18 @@ cmd_pack() {
     printf '%s\n' 'npm ci skipped (root package-lock unchanged since last pack)'
   fi
 
+  local source_revision="" pack_state="$REPO_ROOT/node_modules/.fork-sync-pack-revision"
+  if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+      && [ -z "$(git -C "$REPO_ROOT" status --porcelain -- apps/desktop apps/shared ui-tui package.json package-lock.json)" ]; then
+    source_revision=$(git -C "$REPO_ROOT" log -1 --format=%H -- apps/desktop apps/shared ui-tui package.json package-lock.json)
+  fi
+  if [ -n "$source_revision" ] && [ -f "$pack_state" ] \
+      && [ "$(cat "$pack_state")" = "$source_revision" ] && [ -d "$RELEASE_APP" ] \
+      && [ "$(read_plist_version "$RELEASE_APP")" = "$(read_pkg_version "$desk/package.json")" ]; then
+    SUMMARY="desktop pack skipped (verified bundle sources unchanged)"
+    return 0
+  fi
+
   printf '%s\n' 'npm run pack (build + electron-builder --dir)'
   ( cd "$desk" && nice -n 15 npm run pack ) || { SUMMARY="npm run pack failed"; return 24; }
 
@@ -111,6 +123,7 @@ cmd_pack() {
   [ -n "$pkg_ver" ] || { SUMMARY="could not read version from apps/desktop/package.json"; return 24; }
   [ "$app_ver" = "$pkg_ver" ] \
     || { SUMMARY="version mismatch: packed app $app_ver != package.json $pkg_ver"; return 24; }
+  [ -z "$source_revision" ] || printf '%s\n' "$source_revision" > "$pack_state"
 
   SUMMARY="packed Hermes.app $app_ver (npm ci $( [ "$ci_needed" -eq 1 ] && echo ran || echo skipped ))"
 }
@@ -130,6 +143,9 @@ enforce_backup_retention() {
 
 cmd_swap() {
   gate_check || return 23
+  case "$BACKUP_KEEP" in
+    ''|*[!0-9]*|0*) SUMMARY="backup retention must keep at least one recovery copy"; return 25 ;;
+  esac
   [ -d "$RELEASE_APP" ] || { SUMMARY="no packed app at $RELEASE_APP (run pack first)"; return 25; }
   [ -d "$APP_TARGET" ] || { SUMMARY="app target missing: $APP_TARGET"; return 25; }
 
@@ -144,7 +160,10 @@ cmd_swap() {
   # stage a full copy, back the old bundle up, move it aside, move the copy
   # in. Every step checked; a failed final move ROLLS BACK so a launchable
   # app always remains.
-  rm -rf "${APP_TARGET}.new" "${APP_TARGET}.old" 2>/dev/null || true
+  if [ -e "${APP_TARGET}.new" ] || [ -e "${APP_TARGET}.old" ]; then
+    SUMMARY="existing app staging/recovery path preserved; resolve it before swapping"
+    return 25
+  fi
   if ! copy_tree "$RELEASE_APP" "${APP_TARGET}.new"; then
     rm -rf "${APP_TARGET}.new" 2>/dev/null || true
     SUMMARY="staging copy failed; nothing touched"

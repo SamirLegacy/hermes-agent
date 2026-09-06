@@ -1544,6 +1544,10 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if live is None:
         return
     agent, session_key, db = live
+    if getattr(agent, "_fallback_activated", False) is True:
+        # A transient fallback (or one-turn model override) must not replace
+        # the stored primary route used by the next resume.
+        return
     try:
         row = db.get_session(session_key) or {}
         model_config = _runtime_model_config(agent, _parse_model_config(row.get("model_config")))
