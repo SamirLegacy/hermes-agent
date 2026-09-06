@@ -63,9 +63,14 @@ export function isSessionNotOwnedError(error: unknown): boolean {
 export function describeSessionOwner(error: unknown): string {
   const owner = sessionOwnerOf(error)
   if (!owner) return error instanceof Error ? error.message : String(error)
+  if (!owner.surface || owner.pid == null) {
+    const rpc = (error as { error?: { message?: unknown }; message?: unknown } | null)
+    const message = rpc?.error?.message ?? rpc?.message
+    if (typeof message === 'string' && message) return message
+  }
   const age = typeof owner.age_s === 'number' ? `, ${Math.max(0, Math.round(owner.age_s / 60))}m` : ''
   const facts = `${owner.surface || 'another surface'} (pid ${owner.pid ?? '?'}${age})`
   return owner.holder_live === false && owner.session_id
     ? `Session held by stale ${facts}. Reclaim with: hermes chat --resume ${owner.session_id} --takeover`
-    : `Session has a live owner: ${facts}. Quit that surface first, then resume again.`
+    : `Session has a live owner: ${facts}. Quit that surface first, then ${owner.session_id ? `resume with: hermes chat --resume ${owner.session_id}` : 'resume again.'}`
 }

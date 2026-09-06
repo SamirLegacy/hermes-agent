@@ -22357,6 +22357,8 @@ def test_sync_session_key_after_compress_fails_closed_when_reanchor_fails(monkey
     session = _session(agent=agent, session_key="parent-session")
     session["_queued_prompt_generation"] = 5
     session["pending_title"] = "keep me"
+    session["created_at"] = time.time() - 120
+    monkeypatch.setattr(server, "_resolve_session_platform", lambda: "desktop")
 
     emitted: list = []
     monkeypatch.setattr(
@@ -22379,6 +22381,19 @@ def test_sync_session_key_after_compress_fails_closed_when_reanchor_fails(monkey
     assert fenced is not None
     assert "child-session" in str(fenced)
     assert "hermes chat --resume child-session" in str(fenced)
+    assert fenced.holder["surface"] == "desktop"
+    assert fenced.holder["pid"] == os.getpid()
+    assert fenced.holder["age_s"] >= 120
+    assert fenced.holder["session_id"] == "child-session"
+    assert fenced.holder["holder_live"] is True
+    # Exercise the actual refusal forwarding path, not a separately made fixture.
+    server._sessions["fenced-reanchor"] = session
+    try:
+        response = server.handle_request({"id": "fenced", "method": "prompt.submit",
+                                          "params": {"session_id": "fenced-reanchor", "text": "next"}})
+        assert response["error"]["data"]["holder"] == fenced.holder
+    finally:
+        server._sessions.pop("fenced-reanchor", None)
     # Failure surfaced through the existing error event channel.
     assert emitted and emitted[0][0] == "error" and emitted[0][1] == "sid"
     assert "hermes chat --resume child-session" in emitted[0][2]["message"]

@@ -43,6 +43,25 @@ describe('session ownership refusal', () => {
     expect(isSessionNotOwnedError(new Error('SESSION_NOT_OWNED'))).toBe(false)
   })
 
+  it('renders the continuation resume command with live holder facts', () => {
+    const error = {
+      code: 4090,
+      data: { reason: 'SESSION_NOT_OWNED', holder: {
+        surface: 'desktop', pid: 42, age_s: 120, session_id: 'child-session', holder_live: true
+      } }
+    }
+    expect(describeSessionOwner(error)).toContain('desktop (pid 42, 2m)')
+    expect(describeSessionOwner(error)).toContain('hermes chat --resume child-session')
+    expect(describeSessionOwner(error)).not.toContain('--takeover')
+  })
+
+  it('preserves the server recovery message when holder facts are partial', () => {
+    const message = 'Lease re-anchor failed. Re-attach with: hermes chat --resume child-session'
+    const error = { code: 4090, message, data: { reason: 'SESSION_NOT_OWNED' } }
+    expect(describeSessionOwner({ error })).toBe(message)
+    expect(describeSessionOwner(Object.assign(new Error(message), error))).toBe(message)
+  })
+
   it('offers takeover only for an explicitly stale holder', () => {
     const error = {
       code: 4090,

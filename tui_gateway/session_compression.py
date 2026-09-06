@@ -296,6 +296,9 @@ def _sync_session_key_after_compress(
             f"a second writer. Re-attach with: hermes chat --resume {new_session_id}",
             SESSION_NOT_OWNED,
         )
+        refusal.holder = {"surface": _resolve_session_platform(), "pid": os.getpid(),
+                          "age_s": max(0, time.time() - session.get("created_at", time.time())),
+                          "session_id": new_session_id, "holder_live": True}
         logger.error(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s; fencing this surface",
             sid, old_key, new_session_id,
