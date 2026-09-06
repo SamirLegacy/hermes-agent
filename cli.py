@@ -4508,6 +4508,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._seeded_first_message = _SeededQueryMessage(seeded_query, seeded_images)
         return cli.run()
     cli._single_query_mode = True  # agent waits the full MCP cold-start before its only tool snapshot
+    if getattr(cli, "_resumed", False) and not cli.conversation_history:
+        # Restore before credentials, the lease claim and turn-route snapshot:
+        # otherwise -q captures the ambient model before the late restore.
+        if cli._session_db is None or not cli._load_resumed_history_late():
+            sys.exit(1)
     # No user can answer approval prompts: the approval gate takes the deterministic path.
     # One-shot mode: no between-turns MCP late-binding refresh, so the agent must wait the full MCP
     # cold-start bound before its first (and only) tool snapshot. See #51316.

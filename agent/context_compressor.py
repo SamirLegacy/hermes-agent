@@ -554,6 +554,7 @@ class _SummaryFailureKind:
     streaming_closed: bool
     empty_content: bool
     truncated: bool
+    server_error: bool = False
 
     def fallback_reason(self) -> str:
         """Reason string for the one-shot main-model retry log line, most specific first."""
@@ -586,12 +587,21 @@ def _classify_summary_failure(e: Exception) -> _SummaryFailureKind:
         ),
         # Truncated summary: one main-model retry, then ABORT preserving the session.
         truncated=isinstance(e, RuntimeError) and _TRUNCATED_SUMMARY_MARKER in err,
+        server_error=(isinstance(status, int) and 500 <= status < 600) or bool(
+            re.search(r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\berror code:\s*|^\s*)5\d\d\b", err)
+        ),
     )
 
 
 # Summary failures that abort compress() regardless of abort_on_summary_failure, in precedence
 # order: (flag attribute, telemetry failure_class, user-facing warning with %d preserved messages).
 _TERMINAL_SUMMARY_FAILURES = (
+    (
+        "_last_summary_server_failure",
+        "summary_server_failure",
+        "Summary generation failed with a provider server error after retries — aborting compression. "
+        "%d message(s) preserved unchanged; retry /compress when the provider recovers.",
+    ),
     (
         "_last_summary_auth_failure",
         "summary_auth_failure",
@@ -3485,6 +3495,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         err_text = _short_error_text(e)
         self._record_compression_failure_cooldown(_transient_cooldown, err_text)
         self._last_summary_error = err_text
+        if kind.server_error:
+            self._last_summary_server_failure = True
         # Terminal network/empty-content failure after any fallback: flag so compress() ABORTS
         # and preserves the session; independent of abort_on_summary_failure.
         if kind.streaming_closed:
@@ -4386,7 +4398,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         Access/quota, network, truncated and empty-content failures ALWAYS abort (#29559); otherwise
         ``abort_on_summary_failure`` decides between abort and the static fallback."""
         terminal_failure = next(
-            ((failure_class, message) for flag, failure_class, message in _TERMINAL_SUMMARY_FAILURES if getattr(self, flag)),
+            ((failure_class, message) for flag, failure_class, message in _TERMINAL_SUMMARY_FAILURES if getattr(self, flag, False)),
             None,
         )
         if terminal_failure is None and not self.abort_on_summary_failure:
