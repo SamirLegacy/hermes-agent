@@ -10285,6 +10285,54 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         server._sessions.clear()
 
 
+@pytest.mark.parametrize("once", [True, False])
+def test_model_switch_persists_only_durable_identity(monkeypatch, tmp_path, once):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "model-switch.db")
+    db.create_session("session-key", source="desktop", model="primary-model")
+
+    class Agent:
+        model = "primary-model"
+        provider = "openrouter"
+        api_key = ""
+        base_url = ""
+        api_mode = "chat_completions"
+        _fallback_activated = False
+        _session_db = db
+
+        def switch_model(self, **kwargs):
+            for field in ("model", "provider"):
+                setattr(self, field, kwargs["new_" + field])
+            self._fallback_activated = False
+
+    agent = Agent()
+    session = _session(agent=agent)
+    result = types.SimpleNamespace(new_model="other-model", target_provider="openrouter",
+                                   api_key="", base_url="", api_mode="chat_completions")
+    snapshot = server._snapshot_agent_model_runtime(agent) if once else None
+    for name in ("_restart_slash_worker", "_persist_live_session_system_prompt",
+                 "_append_model_switch_marker", "_emit_session_info", "_clear_session_context"):
+        monkeypatch.setattr(server, name, lambda *_a, **_kw: None)
+    persist = Mock(wraps=db.update_session_meta)
+    monkeypatch.setattr(db, "update_session_meta", persist)
+    try:
+        server._commit_agent_switch("sid", session, agent, result, "primary-model", snapshot)
+        assert agent.model == "other-model"
+        assert db.get_session("session-key")["model"] == ("primary-model" if once else "other-model")
+        if once:
+            persist.assert_not_called()
+            # The real finally path restores before its durable write.
+            state = server._TurnRun(agent, session.pop("one_turn_model_restore"), None, receipt_committed=True)
+            server._finish_turn("sid", session, state)
+            assert agent.model == "primary-model"
+            assert agent._fallback_activated is False
+            assert db.get_session("session-key")["model"] == "primary-model"
+        persist.assert_called_once()
+    finally:
+        db.close()
+
+
 def test_config_set_model_once_requires_live_session(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model",
