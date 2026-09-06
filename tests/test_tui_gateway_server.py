@@ -3878,7 +3878,8 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert server._sessions[runtime_sid]["model_override"] == captured["model_override"]
 
 
-def test_session_resume_auth_fallback_preserves_stored_primary_after_turn(monkeypatch, tmp_path):
+@pytest.mark.parametrize("turn_start_restored", [False, True])
+def test_session_resume_auth_fallback_preserves_stored_primary_after_turn(monkeypatch, tmp_path, turn_start_restored):
     from hermes_cli.auth import AuthError
     from hermes_state import SessionDB
 
@@ -3917,11 +3918,26 @@ def test_session_resume_auth_fallback_preserves_stored_primary_after_turn(monkey
         sid = response["result"]["session_id"]
         session = server._sessions[sid]
         assert session["agent"].model == "fallback-model"
+        if turn_start_restored:
+            # turn_context.prepare_turn calls restore_primary_runtime, whose successful
+            # init-time snapshot restore clears this transient flag (both routes are fallback).
+            session["agent"]._fallback_activated = False
         # Exercise the same durable write used after the fallback turn completes.
         db.append_message("stored-primary", "assistant", "fallback reply")
         server._persist_live_session_runtime(session)
         assert db.get_session("stored-primary")["model"] == "primary-model"
         assert json.loads(db.get_session("stored-primary")["model_config"])["provider"] == "openai-codex"
+        # A later deliberate /model switch replaces the stored primary normally.
+        agent = session["agent"]
+        agent.switch_model = lambda **kw: vars(agent).update(
+            model=kw["new_model"], provider=kw["new_provider"], _fallback_activated=False)
+        for name in ("_restart_slash_worker", "_persist_live_session_system_prompt",
+                     "_append_model_switch_marker", "_emit_session_info"):
+            monkeypatch.setattr(server, name, lambda *_a, **_kw: None)
+        result = types.SimpleNamespace(new_model="chosen-model", target_provider="openrouter",
+                                       api_key="", base_url="", api_mode="chat_completions")
+        server._commit_agent_switch(sid, session, agent, result, agent.model, None)
+        assert db.get_session("stored-primary")["model"] == "chosen-model"
     finally:
         if sid:
             server._sessions.pop(sid, None)

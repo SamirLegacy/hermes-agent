@@ -187,6 +187,7 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
     _restart_slash_worker(sid, session)
     if snapshot is None:
+        agent._runtime_fallback_resolution = None
         _persist_live_session_runtime(session)
     _persist_live_session_system_prompt(session)
     _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
