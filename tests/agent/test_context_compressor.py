@@ -31,6 +31,7 @@ class StubProviderError(Exception):
     StubProviderError("upstream unavailable", status_code=503),
     RuntimeError("HTTP/1.1 502 Bad Gateway"),
     RuntimeError("HTTP 504 Gateway Timeout"),
+    RuntimeError("Server error '502 Bad Gateway' for url 'https://example.invalid'"),
 ])
 def test_terminal_server_error_preserves_messages(compressor, error):
     messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"}
@@ -52,6 +53,18 @@ def test_port_number_is_not_a_summary_server_status(message):
     from agent.context_compressor import _classify_summary_failure
 
     assert _classify_summary_failure(RuntimeError(message)).server_error is False
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+@pytest.mark.parametrize("on_response", [False, True])
+def test_summary_server_status_walks_wrapped_numeric_string(link, on_response):
+    from agent.context_compressor import _classify_summary_failure
+
+    inner = StubProviderError("upstream failed", **(
+        {"response": SimpleNamespace(status_code="502")} if on_response else {"status_code": "502"}))
+    outer = RuntimeError("summary wrapper")
+    setattr(outer, link, inner)
+    assert _classify_summary_failure(outer).server_error is True
 
 
 @pytest.fixture()

@@ -167,8 +167,17 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 
 
 def _exc_status_code(exc: Exception) -> Any:
-    """HTTP status carried on the exception itself or on its ``response``."""
-    return getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    """HTTP status carried by this exception, its response, or a wrapped exception."""
+    pending, seen = [exc], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        status = getattr(current, "status_code", None) or getattr(getattr(current, "response", None), "status_code", None)
+        if isinstance(status, int) or (isinstance(status, str) and status.isdecimal()):
+            return int(status)
+        pending.extend((current.__context__, current.__cause__))
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
@@ -588,7 +597,7 @@ def _classify_summary_failure(e: Exception) -> _SummaryFailureKind:
         # Truncated summary: one main-model retry, then ABORT preserving the session.
         truncated=isinstance(e, RuntimeError) and _TRUNCATED_SUMMARY_MARKER in err,
         server_error=(isinstance(status, int) and 500 <= status < 600) or bool(
-            re.search(r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\berror code:\s*|^\s*)5\d\d\b", err)
+            re.search(r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\berror code:\s*|\bserver error\s+'|^\s*)5\d\d\b", err)
         ),
     )
 
