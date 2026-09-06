@@ -761,6 +761,13 @@ def transfer_active_session(
         if loaded is None:
             return False
         entries = loaded[1]
+        if any(
+            str(entry.get("session_id") or "") == new_session_id
+            and str(entry.get("lease_id") or "") != lease.lease_id
+            for entry in entries
+        ):
+            logger.info("Refused lease transfer to owned session %s", new_session_id)
+            return False
         own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
         if own is not None:
             own["session_id"] = new_session_id

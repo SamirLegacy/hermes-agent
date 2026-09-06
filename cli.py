@@ -3012,9 +3012,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             self._active_session_lease = None
 
     def _lease_reanchor_failed_closed(self, attempted: str, target: str, exc: Exception) -> None:
-        """Fail-closed stop for a failed lease re-anchor: we no longer hold a
-        provable claim on EITHER id, so nothing further may be written from
-        this surface. Interactive: red line + exit. Non-interactive (-q / -Q
+        """Stop when ownership of the continued session cannot be proved.
+        Retain the previous lease for cleanup, not further transcript writes.
+        Interactive: red line + exit. Non-interactive (-q / -Q
         one-shot): flag for the entry-point's non-zero exit; the turn itself
         already committed on the agent side and must not be retried from here.
         """
@@ -3035,23 +3035,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             self._lease_reanchor_failed = True
 
     def _reanchor_active_session_lease(self) -> bool:
-        """Re-anchor the session lease onto the CURRENT session id (post-compression).
-
-        Compression rotates the session id; the lease was claimed under the OLD
-        one. Drop the in-memory lease and claim the new id NOW (not at some
-        later turn boundary) so a second surface resuming the old id mid-turn
-        cannot become a concurrent writer. Returns False when the re-claim
-        failed closed: the caller must NOT proceed with transcript writes on
-        this surface (interactive: exit; -q: non-zero exit). True also covers
-        the no-claim-needed cases (no session id / empty claim).
-        """
-        self._active_session_lease = None
+        """Transfer the existing slot after compression; never leak the old claim."""
+        lease = getattr(self, "_active_session_lease", None)
         attempted = None
         try:
-            attempted = str(self.session_id or "")
+            from hermes_cli.active_sessions import transfer_active_session
+
+            attempted = str(lease.session_id if lease is not None else self.session_id or "")
             target = str(getattr(self.agent, "session_id", "") or attempted)
-            if not self._claim_active_session("cli"):
-                raise RuntimeError("active-session claim refused")
+            if lease is None:
+                transferred = self._claim_active_session("cli")
+            else:
+                transferred = transfer_active_session(
+                    lease, session_id=target, metadata={"live_session_id": target},
+                )
+            if not transferred:
+                raise RuntimeError("active-session transfer refused")
             return True
         except Exception as exc:
             self._lease_reanchor_failed_closed(

@@ -60,7 +60,7 @@ class DummyAgent:
         return ([{"role": "user", "content": "[CONTEXT SUMMARY]: compacted"}], "new system prompt")
 
 
-def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
+def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch, request):
     """Manual /compress should rebuild the next prompt without nesting the old one."""
     cli = HermesCLI.__new__(HermesCLI)
     cli.conversation_history = [
@@ -73,6 +73,10 @@ def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
     cli.session_id = "old-session"
     cli._pending_title = "old title"
     cli._busy_command = lambda _message, **_kwargs: nullcontext()
+    cli.config = {}
+    cli._active_session_lease = None
+    assert cli._claim_active_session("cli")
+    request.addfinalizer(cli._release_active_session)
 
     monkeypatch.setattr(
         "agent.manual_compression_feedback.summarize_manual_compression",
@@ -98,7 +102,7 @@ def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
     assert len(cli.agent.boundary_calls) == 1
 
 
-def test_manual_compress_flush_failure_discards_notification(monkeypatch):
+def test_manual_compress_flush_failure_discards_notification(monkeypatch, request):
     cli = HermesCLI.__new__(HermesCLI)
     cli.conversation_history = [
         {"role": "user", "content": "one"},
@@ -111,6 +115,10 @@ def test_manual_compress_flush_failure_discards_notification(monkeypatch):
     cli.session_id = "old-session"
     cli._pending_title = "old title"
     cli._busy_command = lambda _message, **_kwargs: nullcontext()
+    cli.config = {}
+    cli._active_session_lease = None
+    assert cli._claim_active_session("cli")
+    request.addfinalizer(cli._release_active_session)
 
     cli._manual_compress("/compress")
 
