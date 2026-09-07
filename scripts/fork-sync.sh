@@ -252,7 +252,7 @@ cmd_deploy() {
   fi
 
   # Before-snapshot for probe's skills-preservation diff (written before any mutation).
-  hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_SNAPSHOT" \
+  env COLUMNS=240 hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_SNAPSHOT" \
     || { SUMMARY="pre-deploy skills snapshot failed"; return 30; }
   profile_inventory capabilities > "$CAPABILITIES_SNAPSHOT" \
     || { SUMMARY="pre-deploy custom command/plugin snapshot failed"; return 30; }
@@ -351,12 +351,48 @@ cmd_probe() {
     failp "resume smoke (session create / id capture failed)"
   fi
 
-  printf 'CHECK skills preservation :: hermes skills list diff vs pre-deploy snapshot\n'
+  printf 'CHECK skills preservation :: pre-deploy skill set is a subset of post-deploy set\n'
   if [ ! -f "$SKILLS_SNAPSHOT" ]; then
     failp "skills preservation (no before-snapshot at $SKILLS_SNAPSHOT — deploy writes it)"
-  elif hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_AFTER" 2>/dev/null \
-       && diff -u "$SKILLS_SNAPSHOT" "$SKILLS_AFTER" >/dev/null; then
-    pass "skills preservation (list identical pre/post deploy)"
+  elif env COLUMNS=240 hermes -p "$HERMES_PROFILE_NAME" skills list > "$SKILLS_AFTER" 2>/dev/null \
+       && "$MAIN_CHECKOUT/venv/bin/python" - "$SKILLS_SNAPSHOT" "$SKILLS_AFTER" <<'PY'
+import re
+import sys
+
+
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SUMMARY = re.compile(
+    r"(\d+) hub-installed, (\d+) builtin, (\d+) local — "
+    r"(\d+) enabled, (\d+) disabled")
+
+
+def skill_names(path):
+    text = ANSI.sub("", open(path, encoding="utf-8").read())
+    lines = text.splitlines()
+    table_names = set()
+    for line in lines:
+        if "│" not in line:
+            continue
+        cells = [cell.strip() for cell in line.split("│")[1:-1]]
+        if len(cells) >= 5 and cells[-1] in {"enabled", "disabled"}:
+            table_names.add(cells[0])
+    if not table_names:
+        raise ValueError(f"empty or malformed skills table in {path}")
+    summary = SUMMARY.search(text)
+    expected = sum(map(int, summary.groups()[:3])) if summary else -1
+    states = sum(map(int, summary.groups()[3:])) if summary else -2
+    if expected <= 0 or expected != states or len(table_names) != expected:
+        raise ValueError(f"invalid skills table in {path}: parsed={len(table_names)} expected={expected}")
+    return table_names
+
+before, after = (skill_names(path) for path in sys.argv[1:])
+removed = sorted(before - after)
+if removed:
+    print("removed skills: " + ", ".join(removed))
+    raise SystemExit(1)
+PY
+  then
+    pass "skills preservation (no pre-deploy skill removed)"
   else
     failp "skills preservation (post-deploy list differs or capture failed)"
   fi
