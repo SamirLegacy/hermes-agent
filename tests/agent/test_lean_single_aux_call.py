@@ -143,6 +143,38 @@ class TestLeanSingleAuxiliaryCall:
         assert "chars elided" in prompt
 
 
+class TestSummaryInputCapFromConfig:
+    """``compression.summary_input_max_chars`` reaches the summarizer bounders per instance while the
+    class-level call form (and other instances) keep the runtime default."""
+
+    def _instance(self, cap):
+        return ContextCompressor(model="m", threshold_percent=0.5, summary_input_max_chars=cap, quiet_mode=True)
+
+    def test_config_cap_is_honoured_by_instance_sampler(self):
+        default_cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        big = self._instance(default_cap * 3)
+        content = "y" * (default_cap * 2)
+        out = big._sample_summary_input(content)
+        # Content fits the enlarged instance cap: passes through untouched (no sampling marker).
+        assert out == content
+        # The class default and a default-constructed instance are unaffected.
+        assert ContextCompressor._SUMMARY_INPUT_MAX_CHARS == default_cap
+        assert len(ContextCompressor._sample_summary_input(content)) <= default_cap
+        assert self._instance(None)._SUMMARY_INPUT_MAX_CHARS == default_cap
+
+    def test_invalid_cap_values_keep_default(self):
+        default_cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        for bad in (0, -5, True, None):
+            assert self._instance(bad)._SUMMARY_INPUT_MAX_CHARS == default_cap
+
+    def test_bound_summary_input_honours_instance_cap(self):
+        default_cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        small = self._instance(10_000)
+        out = small._bound_summary_input("z" * 50_000)
+        assert len(out) <= 10_000 + 200  # head+tail + elision marker
+        assert len(ContextCompressor._bound_summary_input("z" * 50_000)) == 50_000 <= default_cap
+
+
 class TestSampledSummaryInput:
     def test_small_input_passes_through(self):
         content = "abc" * 100

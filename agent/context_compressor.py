@@ -1656,6 +1656,19 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
+class _class_or_instance_method:
+    """Descriptor: bind to the instance when called on one, else to the class. Lets the summary-input
+    bounders honour a per-instance ``_SUMMARY_INPUT_MAX_CHARS`` (config override) while keeping the
+    class-level call form used by tests and tooling."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, obj, objtype=None):
+        import functools
+        return functools.partial(self.func, obj if obj is not None else objtype)
+
+
 class ContextCompressor(MicroCompactionMixin, ContextEngine):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
@@ -2282,10 +2295,16 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
+        summary_input_max_chars: int | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
+        # Prompt-side cap on serialized turns handed to the summarizer (chars, ~4 chars/token).
+        # Config ``compression.summary_input_max_chars``; None/<=0 keeps the class default.
+        if isinstance(summary_input_max_chars, int) and not isinstance(summary_input_max_chars, bool) \
+                and summary_input_max_chars > 0:
+            self._SUMMARY_INPUT_MAX_CHARS = summary_input_max_chars
         # Per-model overrides (longest substring match wins); floor applied on top.
         self.model_thresholds = model_thresholds or {}
         # Raw config value, before override/floor; fallback when switching to a model with no override.
@@ -3127,7 +3146,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 summary += build()
         return summary
 
-    @classmethod
+    @_class_or_instance_method
     def _bound_summary_input(cls, content: str) -> str:
         """Cap total summarizer input, keeping head and tail and marking the omitted middle."""
         if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
@@ -3151,7 +3170,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
     # Lean-mode sampling slice count: 8 keeps slices ~20K chars at the 160K cap.
     _SAMPLED_INPUT_SLICES = 8
 
-    @classmethod
+    @_class_or_instance_method
     def _sample_summary_input(cls, content: str) -> str:
         """Cap summarizer input by EVEN SAMPLING across the whole region (lean mode).
         The single request also produces the session log, so coverage must be uniform: head+tail

@@ -560,6 +560,11 @@ DEFAULT_CONFIG = {
         # A prune only commits when it reclaims at least this many tokens, then waits for a
         # trigger-sized runway to regrow before rearming. 0 = no minimum-savings gate.
         "proactive_prune_min_reclaim_tokens": 4096,
+        # summary_input_max_chars: prompt-side cap on the serialized turns handed to the
+        # summarizer (chars, ~4 chars/token; 0 = runtime default 160000 ≈ 40K tokens). Raise it
+        # (e.g. 512000 ≈ 128K tokens) when every summarizer route has a large window; the
+        # summary then samples/keeps more of the compacted region.
+        "summary_input_max_chars": 0,
         # micro_compact: opt-in — after each turn fold the oldest un-absorbed exchange into a
         # rolling summary, amortizing compression cost. Off by default because every pass rewrites
         # sent history and breaks the prompt-cache prefix EVERY turn; enable only if the amortized
