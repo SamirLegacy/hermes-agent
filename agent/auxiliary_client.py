@@ -3587,23 +3587,24 @@ def _fallback_request_kwargs(
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap).
 
     A fallback_chain entry may carry its own ``reasoning_effort`` (providers differ in their top
-    tier: Grok caps at ``xhigh``, GLM-5.3 at ``max``). When present and valid it replaces the
-    ``reasoning`` folded in from the primary task config so the entry's dial reaches the wire
-    instead of the primary's."""
+    tier: Grok caps at ``xhigh``, GLM-5.3 at ``max``). When it names an ENABLED level it replaces
+    the ``reasoning`` folded in from the primary task config so the entry's dial reaches the wire
+    instead of the primary's. A disabling level (``none``) is left to the fast-lane certification
+    below, which owns the exact non-reasoning wire shape."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
     entry_effort = fallback_entry.get("reasoning_effort") if isinstance(fallback_entry, dict) else None
     if entry_effort not in (None, ""):
         from hermes_constants import parse_reasoning_effort
         parsed = parse_reasoning_effort(entry_effort)
-        if parsed is not None:
-            fallback_extra_body = dict(effective_extra_body or {})
-            fallback_extra_body["reasoning"] = parsed
-        else:
+        if parsed is None:
             logger.warning(
                 "Auxiliary %s: fallback_chain entry %s/%s has invalid reasoning_effort %r — keeping the "
                 "primary's reasoning setting", task or "call", fallback_entry.get("provider"),
                 fallback_entry.get("model"), entry_effort,
             )
+        elif parsed.get("enabled") is not False:
+            fallback_extra_body = dict(effective_extra_body or {})
+            fallback_extra_body["reasoning"] = parsed
     if apply_fast_lane:
         fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
             task, actual_provider=destination.provider, actual_model=destination.model,

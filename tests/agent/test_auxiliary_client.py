@@ -2424,6 +2424,14 @@ class TestFallbackEntryReasoningEffort:
         kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash"})
         assert kw["extra_body"]["reasoning"]["effort"] == "xhigh"
 
+    def test_disabling_entry_effort_defers_to_fast_lane_shape(self):
+        """``reasoning_effort: none`` on an entry must not pre-empt the fast-lane certification, which
+        owns the exact non-reasoning wire shape ({enabled: False, effort: none}) — CI regression
+        test_fallback_cap_requires_independent_route_certification."""
+        kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash", "reasoning_effort": "none"})
+        # Not certified as a fast lane (entry provider/model differ from the primary) -> primary's dial stays.
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "xhigh"}
+
     def test_invalid_entry_effort_keeps_primary(self):
         kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash", "reasoning_effort": "turbo-ultra"})
         assert kw["extra_body"]["reasoning"]["effort"] == "xhigh"
