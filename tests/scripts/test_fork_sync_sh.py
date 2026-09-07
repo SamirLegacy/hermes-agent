@@ -240,7 +240,21 @@ def _write_stub_hermes(tmp_path: Path, behaviors: dict[str, int]):
         '  *"sessions list"*) echo "ID"; echo "unrelated-latest-session"; exit 0;;',
         f'  *"chat --resume"*) echo "resumed probe-session-123 OK2"; exit {behaviors.get("resume", 0)};;',
         f'  *"chat -q"*) echo "OK"; echo "session_id: probe-session-123"; exit {behaviors.get("chat", 0)};;',
-        '  *"skills list"*) cat "$FORK_SYNC_STUB_SKILLS"; exit 0;;',
+        '  *"skills list"*)',
+        '    first=""; IFS= read -r first < "$FORK_SYNC_STUB_SKILLS" || true',
+        '    case "$first" in',
+        '      *"│"*) cat "$FORK_SYNC_STUB_SKILLS";;',
+        '      *)',
+        '        count=0',
+        '        printf "%s\\n" "│ Name │ Category │ Source │ Trust │ Status │"',
+        '        while IFS= read -r skill; do',
+        '          [ -n "$skill" ] || continue',
+        '          printf "│ %s │ test │ builtin │ builtin │ enabled │\\n" "$skill"',
+        '          count=$((count + 1))',
+        '        done < "$FORK_SYNC_STUB_SKILLS"',
+        '        printf "0 hub-installed, %s builtin, 0 local — %s enabled, 0 disabled\\n" "$count" "$count";;',
+        '    esac',
+        '    exit 0;;',
         "  *) exit 0;;",
         "esac",
     ]
@@ -288,11 +302,11 @@ def test_probe_fails_when_check_fails(tmp_path):
     assert "FORK-SYNC probe rc=30" in r.stdout
 
 
-def test_probe_fails_on_skills_drift(tmp_path):
+def test_probe_allows_new_skills_but_rejects_removals(tmp_path):
     main_checkout, _, _ = _make_sync_fixture(tmp_path)
     skills = tmp_path / "skills.txt"
     skills.write_text("a\n")
-    (tmp_path / "skills-before.txt").write_text("a\n")   # before
+    (tmp_path / "skills-before.txt").write_text("a\n")
     stub = _write_stub_hermes(tmp_path, {})
     env = {
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
@@ -300,10 +314,65 @@ def test_probe_fails_on_skills_drift(tmp_path):
     }
     setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
     assert setup.returncode == 0, setup.stdout + setup.stderr
-    skills.write_text("a\nb\n")          # after
-    r = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
-    assert r.returncode == 30, r.stdout + r.stderr
-    assert "FAIL skills preservation" in r.stdout
+
+    skills.write_text("a\nb\n")
+    added = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert added.returncode == 0, added.stdout + added.stderr
+    assert "PASS skills preservation (no pre-deploy skill removed)" in added.stdout
+
+    skills.write_text("b\n")
+    removed = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert removed.returncode == 30, removed.stdout + removed.stderr
+    assert "removed skills: a" in removed.stdout
+    assert "FAIL skills preservation" in removed.stdout
+
+
+def test_probe_parses_rich_skill_table_as_set(tmp_path):
+    main_checkout, _, _ = _make_sync_fixture(tmp_path)
+    skills = tmp_path / "skills.txt"
+
+    def table(*names):
+        rows = ["│ Name │ Category │ Source │ Trust │ Status │"]
+        rows.extend(f"│ {name} │ test │ builtin │ builtin │ enabled │" for name in names)
+        rows.append(f"0 hub-installed, {len(names)} builtin, 0 local — {len(names)} enabled, 0 disabled")
+        return "\n".join(rows) + "\n"
+
+    skills.write_text(table("skill-a"))
+    stub = _write_stub_hermes(tmp_path, {})
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_STUB_SKILLS": str(skills),
+    }
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+
+    skills.write_text(table("skill-a", "skill-b"))
+    added = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert added.returncode == 0, added.stdout + added.stderr
+
+    skills.write_text(table("skill-b"))
+    removed = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+    assert removed.returncode == 30, removed.stdout + removed.stderr
+    assert "removed skills: skill-a" in removed.stdout
+
+
+def test_probe_rejects_empty_or_malformed_skill_snapshot(tmp_path):
+    main_checkout, _, _ = _make_sync_fixture(tmp_path)
+    skills = tmp_path / "skills.txt"
+    skills.write_text("skill-a\n")
+    stub = _write_stub_hermes(tmp_path, {})
+    env = {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FORK_SYNC_STUB_SKILLS": str(skills),
+    }
+    setup = _run_fork_sync(tmp_path, main_checkout, "deploy", extra_env=env)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+
+    for invalid in ("", "│ skill-a │ test │ builtin │ builtin │ enabled │\n"):
+        (tmp_path / "skills-before.txt").write_text(invalid)
+        result = _run_fork_sync(tmp_path, main_checkout, "probe", extra_env=env)
+        assert result.returncode == 30, result.stdout + result.stderr
+        assert "FAIL skills preservation" in result.stdout
 
 
 def test_probe_checks_every_configured_mcp(tmp_path):
