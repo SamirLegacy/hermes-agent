@@ -4348,18 +4348,27 @@ def _wrap_transport(req: _ResolveRequest, client_obj: Any, final_model_str: str,
     """Wrap a plain OpenAI client in the right transport adapter; specialized wrappers pass through.
     Codex (Responses API): explicit ``api_mode=codex_responses`` (or provider ``actual``), else — with no
     explicit api_mode — api.openai.com + codex model. Anthropic (Messages): ``api_mode=anthropic_messages``,
-    any ``/anthropic`` suffix, ``api.kimi.com/coding``, or ``api.anthropic.com``."""
+    any ``/anthropic`` suffix, ``api.kimi.com/coding``, or ``api.anthropic.com``. OpenCode
+    uses the main runtime's per-model mapping unless the caller explicitly selects a wire."""
+    api_mode = req.api_mode
+    if not api_mode:
+        from hermes_cli.models import opencode_model_api_mode, opencode_provider_family
+
+        # OpenCode chooses the wire per MODEL, not host. Match main turns rather
+        # than sending GPT summaries to its unsupported Chat Completions shim.
+        if opencode_provider_family(req.provider) is not None:
+            api_mode = opencode_model_api_mode(req.provider, final_model_str)
     needs_codex = not (isinstance(client_obj, CodexAuxiliaryClient) or req.raw_codex) and (
-        req.provider == "actual" or req.api_mode == "codex_responses"
-        or (not req.api_mode and base_url_hostname(base_url_str) == "api.openai.com"
+        req.provider == "actual" or api_mode == "codex_responses"
+        or (not api_mode and base_url_hostname(base_url_str) == "api.openai.com"
             and "codex" in (final_model_str or "").lower())
     )
     if needs_codex:
         logger.debug("resolve_provider_client: wrapping client in CodexAuxiliaryClient "
                      "(api_mode=%s, model=%s, base_url=%s)",
-                     req.api_mode or "auto-detected", final_model_str, base_url_str[:60] if base_url_str else "")
+                     api_mode or "auto-detected", final_model_str, base_url_str[:60] if base_url_str else "")
         return CodexAuxiliaryClient(client_obj, final_model_str)
-    return _maybe_wrap_anthropic(client_obj, final_model_str, api_key_str, base_url_str, req.api_mode)
+    return _maybe_wrap_anthropic(client_obj, final_model_str, api_key_str, base_url_str, api_mode)
 
 
 def _route_client(req: _ResolveRequest, client_obj: Any, final_model_str: Optional[str]) -> _ResolveResult:

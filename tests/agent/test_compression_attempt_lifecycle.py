@@ -254,6 +254,109 @@ class TestSupersessionDiscardsLateResults:
 
 
 class TestTransientBlockIsNotExhaustion:
+    @pytest.mark.parametrize("overflow_kind", ["context", "payload"])
+    @pytest.mark.parametrize("in_place", [False, True])
+    def test_failed_summary_defers_overflow_and_same_session_can_retry(
+        self, tmp_path: Path, overflow_kind: str, in_place: bool
+    ):
+        """A fresh summary 500 is not proof of permanent incompressibility.
+
+        Exercise the real compressor, host commit boundary, overflow consumer and
+        temporary SessionDB. Only the unavailable/recovered provider is replaced.
+        """
+        from types import SimpleNamespace
+
+        from agent.error_classifier import FailoverReason
+        from agent.model_metadata import estimate_messages_tokens_rough
+        from agent.turn_overflow import recover_from_overflow
+        from agent.turn_retry_state import TurnRetryState
+
+        session_id = "SUMMARY_SERVER_RETRY"
+        db, agent = _build_agent(tmp_path, session_id)
+        agent.compression_in_place = in_place
+        compressor = agent.context_compressor
+        compressor.update_model("test/model", 128_000)
+        live = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"row {i} " * 3000}
+            for i in range(40)
+        ]
+        for message in live:
+            db.append_message(session_id, message["role"], message["content"])
+            message["_db_persisted"] = True
+        original = copy.deepcopy(live)
+        stored_before = db.get_messages_as_conversation(session_id)
+        tokens = estimate_messages_tokens_rough(live)
+        assert tokens > compressor.context_length
+        error = RuntimeError("context_length_exceeded" if overflow_kind == "context" else "payload too large")
+        reason = (
+            FailoverReason.context_overflow if overflow_kind == "context"
+            else FailoverReason.payload_too_large
+        )
+        kwargs = dict(
+            status_code=400 if overflow_kind == "context" else 413,
+            error_msg=str(error), wrapped_output_cap_budget=None,
+            messages=live, api_messages=live, system_message="sys",
+            active_system_prompt="sys", conversation_history=list(live),
+            approx_tokens=tokens, compression_attempts=0, max_compression_attempts=5,
+            api_call_count=1, effective_task_id=session_id,
+        )
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("Error code: 500 - Internal Server Error"),
+        ) as summary_call:
+            verdict = recover_from_overflow(
+                agent, error, SimpleNamespace(reason=reason), TurnRetryState(), **kwargs
+            )
+        assert summary_call.call_count == 1
+        assert compressor._last_compress_aborted is True
+        assert verdict.action == "return"
+        assert verdict.result.get("compression_deferred") is True
+        assert not verdict.result.get("compression_exhausted")
+        assert verdict.compression_attempts == 0
+        assert verdict.result["failed"] is False
+        assert live == original
+        assert agent.session_id == session_id
+        assert db.get_messages_as_conversation(session_id) == stored_before
+        assert db.get_session(session_id)["ended_at"] is None
+
+        # Provider recovery must work on this same session, even inside cooldown:
+        # overflow deliberately bypasses that guard; no /new or route change.
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_summary_response("## Goal\nContinue the recorded investigation."),
+        ) as recovered_call, patch("agent.turn_overflow.time.sleep"):
+            retry = TurnRetryState()
+            recovered = recover_from_overflow(
+                agent, error, SimpleNamespace(reason=reason), retry, **kwargs
+            )
+        assert recovered_call.call_count == 1
+        assert recovered.action == "break"
+        assert retry.restart_with_compressed_messages is True
+        assert compression_blocked_transiently(agent) is False
+        assert estimate_messages_tokens_rough(recovered.messages) < tokens * 0.5
+        assert db.get_compression_failure_cooldown(agent.session_id) is None
+        compacted_history = db.get_messages_as_conversation(agent.session_id)
+        assert compacted_history and len(compacted_history) < len(stored_before)
+        reply = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Investigation continued.", tool_calls=None,
+                                        reasoning_content=None, reasoning=None),
+                finish_reason="stop",
+            )], usage=None, model=agent.model,
+        )
+        with patch.object(agent, "_interruptible_streaming_api_call", return_value=reply) as main_call, patch.object(
+            agent, "_interruptible_api_call", side_effect=AssertionError("unexpected non-streaming request")
+        ), patch(
+            "agent.context_compressor.call_llm", side_effect=AssertionError("no endless compression retry")
+        ):
+            continued = agent.run_conversation("Continue the investigation.", conversation_history=compacted_history)
+        assert main_call.call_count == 1
+        assert continued["completed"] is True
+        assert continued["final_response"] == "Investigation continued."
+        assert not continued.get("compression_exhausted")
+        assert db.get_messages_as_conversation(session_id)
+        db.close()
+
     def test_cooldown_blocked_noop_sets_transient_signal(self, tmp_path: Path):
         db, agent = _build_agent(tmp_path, "TRANSIENT_SIGNAL")
         agent.context_compressor.record_timeout_failure(
