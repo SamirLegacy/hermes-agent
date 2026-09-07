@@ -608,7 +608,7 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
     return result
 
 
-def _pre_tool_block(agent, ref: _ToolCallRef):
+def _pre_tool_block(agent, ref: _ToolCallRef, retry_execution=None):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
     hook-modified args applied. Hook failures never block."""
     try:
@@ -619,6 +619,7 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
             ref.args,
             **tool_hook_ids(agent, ref.task_id, ref.call_id),
             middleware_trace=list(ref.trace),
+            **({"retry_execution": retry_execution} if retry_execution is not None else {}),
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
     except Exception:
@@ -635,7 +636,28 @@ def _dispatch_authorized_once(
     display_index: int | None,
     begin_execution,
     authorization_gate: _ConcurrentToolAuthorizationGate | None,
+    retry_execution,
 ) -> Any:
+    """Keep exact retry validation alive through this one authorized dispatch."""
+    from tools.approval_retry import execution_scope, RetryExecutionInvalid
+    try:
+        with execution_scope(ref.name, getattr(agent, "session_id", ""), ref.call_id,
+                             owner=retry_execution):
+            return _dispatch_authorized_in_scope(
+                agent, state, ref, execute=execute, scope_block=scope_block,
+                display_index=display_index, begin_execution=begin_execution,
+                authorization_gate=authorization_gate, retry_execution=retry_execution,
+            )
+    except RetryExecutionInvalid as exc:
+        state.blocked = True
+        if retry_execution.suppress_late_result():
+            return json.dumps({"error": str(exc)})
+        return _blocked_tool_result(agent, ref, block_message=str(exc), block_error_type="retry_binding",
+                                    guardrail_decision=None)
+
+
+def _dispatch_authorized_in_scope(agent, state, ref, *, execute, scope_block, display_index,
+                                  begin_execution, authorization_gate, retry_execution):
     """Hermes policy (scope → plugin pre-hooks → guardrails) then the one real dispatch.
 
     Plugin ``modify`` hooks may rewrite ``ref.args`` (mirrored into ``state.args``).
@@ -651,7 +673,7 @@ def _dispatch_authorized_once(
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
+        resolve = lambda: _pre_tool_block(agent, ref, retry_execution=retry_execution)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
 
@@ -675,7 +697,10 @@ def _dispatch_authorized_once(
         agent._iters_since_skill = 0
 
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    retry_execution.check(ref.args)
+    from tools.approval_retry import forward_execution
+    return _run_with_activity_heartbeat(
+        agent, ref.name, lambda: forward_execution(retry_execution, execute, ref.args))
 
 
 def _run_agent_tool_execution_middleware(
@@ -691,8 +716,12 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    retry_execution=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from tools.approval_retry import RetryExecution
+    if retry_execution is None:
+        retry_execution = RetryExecution(function_name, getattr(agent, "session_id", "") or "", tool_call_id or "")
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -719,6 +748,7 @@ def _run_agent_tool_execution_middleware(
             display_index=display_index,
             begin_execution=begin_execution,
             authorization_gate=authorization_gate,
+            retry_execution=retry_execution,
         )
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
@@ -833,12 +863,15 @@ def _run_sequential_tool_execution_middleware(
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
     authorization_gate = _ConcurrentToolAuthorizationGate()
+    from tools.approval_retry import RetryExecution
+    retry_execution = RetryExecution(function_name, getattr(agent, "session_id", "") or "", tool_call_id or "")
     worker_tid: list[int] = []
 
     def _run() -> _ManagedToolResult:
         with _registered_tool_worker(agent) as tid:
             worker_tid.append(tid)
-            return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+            return _run_agent_tool_execution_middleware(
+                agent, authorization_gate=authorization_gate, retry_execution=retry_execution, **kwargs)
 
     if ref.trace is None:
         ref.trace = []
@@ -876,6 +909,7 @@ def _run_sequential_tool_execution_middleware(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
             )
         abandoned = True
+        retry_execution.abandon()
         future.cancel()
         if state == "timeout":
             _interrupt_worker_tids(agent, worker_tid)
@@ -1153,6 +1187,11 @@ class _ConcurrentBatch:
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
+        from tools.approval_retry import RetryExecution
+        self.retry_executions = [
+            RetryExecution(pc.name, getattr(agent, "session_id", "") or "", pc.tool_call.id or "")
+            for pc in parsed_calls
+        ]
 
     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
@@ -1179,6 +1218,7 @@ class _ConcurrentBatch:
                 display_index=index + 1,
                 begin_execution=start_gate.advance,
                 authorization_gate=self.authorization_gate,
+                retry_execution=self.retry_executions[index],
             )
             result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
             blocked, dispatched = managed.blocked, managed.dispatched
@@ -1186,6 +1226,8 @@ class _ConcurrentBatch:
             logger.info("tool %s abandoned at start-order gate; skipping dispatch", ref.name)
             return None
         except KeyboardInterrupt:
+            if self.retry_executions[index].suppress_late_result():
+                return None
             with contextlib.suppress(Exception):
                 agent.interrupt("keyboard interrupt")
             result = ref.emit_cancelled(agent, start)
@@ -1195,6 +1237,8 @@ class _ConcurrentBatch:
         except Exception as tool_error:
             result = f"Error executing tool '{ref.name}': {tool_error}"
             logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
+        if self.retry_executions[index].suppress_late_result():
+            return None
         duration = time.time() - start
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
@@ -1216,8 +1260,10 @@ class _ConcurrentBatch:
             start_gate = _WorkerStartOnce(self.gate, start_order, pc.name)
             try:
                 outcome = self._dispatch_worker(index, pc.ref(self.effective_task_id), pc.scope_block, start_gate)
-                if outcome is not None:
-                    self.results[index] = outcome
+                retry_execution = self.retry_executions[index]
+                with retry_execution.lock:
+                    if outcome is not None and not retry_execution.suppress_late_result():
+                        self.results[index] = outcome
             finally:
                 with contextlib.suppress(_BatchAbandoned):
                     start_gate.advance()  # keep later-ordered workers moving
@@ -1296,6 +1342,9 @@ class _ConcurrentBatch:
                     )
                 continue
             for f in not_done:
+                index = future_to_index.get(f)
+                if index is not None:
+                    self.retry_executions[index].abandon()
                 f.cancel()
             # Release gate-parked workers BEFORE interrupt fan-out so none later
             # dispatches a tool the turn already reported as timed out / interrupted.

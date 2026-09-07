@@ -808,17 +808,26 @@ class ToolRegistry:
             error_type="tool_result_contract", tool=name, result_type=result_type)
 
     def dispatch(
-        self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+        self, name: str, args: dict, *, scope: Optional[str] = None,
+        _before_handler: Optional[Callable[[], None]] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
-        results normalized, every exception returned as ``{"error": ...}``."""
+        results normalized, every exception returned as ``{"error": ...}``.
+
+        An explicit caller may recheck its pending execution after lookup waits.
+        The optional callback is framework-only and is not passed to the handler.
+        """
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
             if entry.is_async:
                 from model_tools import _run_async
+                if _before_handler is not None:
+                    _before_handler()
                 result = _run_async(entry.handler(args, **kwargs))
             else:
+                if _before_handler is not None:
+                    _before_handler()
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:

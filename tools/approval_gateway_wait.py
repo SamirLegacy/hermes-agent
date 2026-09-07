@@ -128,9 +128,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     keys = list(approval_data.get("pattern_keys") or [])
     with _approval._lock:
         leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                       if e.data.get("command") == approval_data.get("command")
+                       if not e.data.get("fresh_once")
+                       and e.data.get("command") == approval_data.get("command")
                        and list(e.data.get("pattern_keys") or []) == keys), None)
-    if leader is not None:
+    if leader is not None and not approval_data.get("fresh_once"):
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted
