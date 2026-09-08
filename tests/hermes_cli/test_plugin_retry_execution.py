@@ -171,6 +171,7 @@ def test_same_action_approvals_and_native_gate_share_one_choice(policy, monkeypa
     assert executed == [args] and len(posted) == 1 and posted[0]['args'] == args
     assert evaluations == [False, True] and len(prompts) == 1
     assert prompts[0]['fresh_once'] and not prompts[0]['allow_session'] and not prompts[0]['allow_permanent']
+    assert json.dumps(args, separators=(',', ':')) in prompts[0]['description']
     assert approval._session_approved == {} and approval._permanent_approved == set()
 
 
