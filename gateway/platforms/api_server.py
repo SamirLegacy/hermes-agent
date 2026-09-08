@@ -3683,13 +3683,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
                 except _ProviderAuthResolutionError as exc:
-                    # Typed provider-auth failure only, handled once for every caller in
-                    # run.py's response shape (text, no HTTP error).
+                    # Preserve the text response for existing callers, but carry the same
+                    # failure flags as run_conversation so API clients need not parse prose.
                     logger.warning("Provider authentication failed for session=%s: %s",
                                    session_id or "", exc)
                     return (
                         {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [],
-                         "api_calls": 0, "tools": []},
+                         "api_calls": 0, "tools": [],
+                         "completed": False, "failed": True, "error": str(exc)},
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
                 finally:
                     # Turn over (any outcome): clear ownership so a late disconnect can't reap

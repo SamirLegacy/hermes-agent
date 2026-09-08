@@ -6,12 +6,110 @@ gate in :mod:`tools.approval`.
 """
 
 import contextvars
+from dataclasses import dataclass, field
+import json
+import threading
+from typing import Any
 import logging
 import os
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger("tools.approval")
+
+
+@dataclass(frozen=True)
+class _PreToolInvocation:
+    """Framework-only identity of a pending execution, never deserialized from tool input."""
+
+    nonce: object
+    home: str
+    session_id: str
+    session_key: str
+    tool_call_id: str
+    tool_name: str
+    arguments: str
+    cwd: str
+
+
+@dataclass(frozen=True)
+class PreToolRetry:
+    """A policy's observed failure, attached to the current framework invocation.
+
+    Return this as ``retry`` on a BLOCK directive. It is a request, not a grant.
+    The policy must reconstruct it from live failure state on the recheck.
+    """
+
+    invocation: _PreToolInvocation
+    profile: str
+    failure_id: str
+    generation: str
+    action_fingerprint: str
+
+
+@dataclass
+class _PreToolRetryGrant:
+    request: PreToolRetry
+    active: bool = True
+    consumed: bool = False
+    matched: bool = False
+    lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    def close(self):
+        # Shared with context-copied bounded workers: an abandoned callback cannot
+        # consume after the enclosing dispatch returned or timed out.
+        with self.lock:
+            self.active = False
+
+
+_pre_tool_invocation: contextvars.ContextVar[_PreToolInvocation | None] = contextvars.ContextVar(
+    "pre_tool_invocation", default=None)
+_pre_tool_retry_grant: contextvars.ContextVar[_PreToolRetryGrant | None] = contextvars.ContextVar(
+    "pre_tool_retry_grant", default=None)
+
+
+def _tool_arguments(args: dict) -> str:
+    return json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def make_pre_tool_retry(*, profile: str, failure_id: str, generation: str,
+                        action_fingerprint: str, tool_name: str, args: dict,
+                        session_id: str, tool_call_id: str, cwd: str) -> PreToolRetry | None:
+    """Bind a trusted policy observation; absent/mismatched runtime identity fails closed.
+
+    Only Python policy code calls this. Tool fields, prose and approval lifecycle
+    observers cannot establish the invocation or activate a continuation.
+    """
+    invocation = _pre_tool_invocation.get()
+    if invocation is None or not all((profile, failure_id, generation, action_fingerprint,
+                                     session_id, tool_call_id)):
+        return None
+    from hermes_constants import get_hermes_home
+    if (invocation.home != str(get_hermes_home()) or
+            invocation.session_key != get_current_session_key() or
+            (invocation.tool_name, invocation.arguments, invocation.session_id,
+             invocation.tool_call_id, invocation.cwd) !=
+            (tool_name, _tool_arguments(args), session_id, tool_call_id, cwd)):
+        return None
+    return PreToolRetry(invocation, profile, failure_id, generation, action_fingerprint)
+
+
+def consume_pre_tool_retry(request: PreToolRetry | None) -> bool:
+    """Consume BEFORE supplying an Owner signal; even a mismatch burns the grant."""
+    grant = _pre_tool_retry_grant.get()
+    if grant is None:
+        return False
+    with grant.lock:
+        if not grant.active or grant.consumed:
+            return False
+        grant.consumed = True
+        grant.matched = request is not None and grant.request == request
+        return grant.matched
+
+
+def is_pre_tool_recheck() -> bool:
+    """Policy re-evaluation marker, not approval (use consume_pre_tool_retry)."""
+    return _pre_tool_retry_grant.get() is not None
 
 
 def _ctx(name: str, default: "str | None" = "") -> contextvars.ContextVar:

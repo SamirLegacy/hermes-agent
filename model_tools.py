@@ -623,6 +623,11 @@ def _emit_post_tool_call_hook(
     fields are derived from the result only past that gate when status is None."""
     if _post_tool_call_hook_suppressed.get():
         return
+    from tools.approval_retry import current_execution
+    retry_execution = current_execution()
+    if retry_execution is not None and retry_execution.suppress_late_result():
+        # The runner already owns this revoked retry's timeout/cancelled result.
+        return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -695,7 +700,7 @@ def _apply_request_middleware(
 
 
 def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
-                         ids: _CallIds, middleware_trace: List[Dict[str, Any]],
+                         ids: _CallIds, middleware_trace: List[Dict[str, Any]], retry_execution=None,
                          ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
     """Plugin pre_tool_call hook, then ACP edit approval.
 
@@ -709,7 +714,8 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
+                function_name, function_args, middleware_trace=list(middleware_trace),
+                **({"retry_execution": retry_execution} if retry_execution is not None else {}), **ids.hook_kwargs(),
             )
             if modified_args is not None:
                 function_args = modified_args
@@ -763,8 +769,15 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
     else:
         dispatch_kwargs["user_task"] = user_task
 
+    from tools.approval_retry import current_execution, run_handler
+    retry_execution = current_execution()  # captured so abandoned next_call stays closed
+    if retry_execution is not None and retry_execution.invocation is not None:
+        # Lookup may wait after run_handler's check; recheck the same frame at entry.
+        dispatch_kwargs["_before_handler"] = retry_execution.require_open
+
     def _dispatch(next_args: Dict[str, Any]) -> Any:
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        return run_handler(retry_execution, next_args,
+                           lambda payload: registry.dispatch(function_name, payload, **dispatch_kwargs))
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:
@@ -806,6 +819,30 @@ def handle_function_call(
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
 ) -> str:
+    """Route one invocation with an explicitly scoped retry continuation."""
+    from tools.approval_retry import execution_scope, RetryExecutionInvalid
+    try:
+        with execution_scope(_LEGACY_TOOL_ALIASES.get(function_name, function_name), session_id, tool_call_id,
+                             prechecked=skip_pre_tool_call_hook):
+            return _handle_function_call_scoped(
+                function_name, function_args, task_id, tool_call_id, session_id, turn_id, api_request_id,
+                user_task, enabled_tools, skip_pre_tool_call_hook, skip_tool_request_middleware,
+                skip_tool_execution_middleware, tool_request_middleware_trace, enabled_toolsets, disabled_toolsets,
+            )
+    except RetryExecutionInvalid as exc:
+        result = tool_error(str(exc))
+        _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
+                                 task_id=task_id, session_id=session_id, tool_call_id=tool_call_id,
+                                 turn_id=turn_id, api_request_id=api_request_id,
+                                 status="blocked", error_type="retry_binding", error_message=str(exc))
+        return result
+
+
+def _handle_function_call_scoped(
+    function_name: str, function_args: Dict[str, Any], task_id, tool_call_id, session_id, turn_id, api_request_id,
+    user_task, enabled_tools, skip_pre_tool_call_hook, skip_tool_request_middleware,
+    skip_tool_execution_middleware, tool_request_middleware_trace, enabled_toolsets, disabled_toolsets,
+):
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
     task_id isolates terminal/browser sessions; user_task feeds browser_snapshot.
@@ -851,7 +888,11 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
+        from tools.approval_retry import current_execution
+        function_args, blocked = _pre_dispatch_guards(
+            function_name, function_args, skip_pre_tool_call_hook, ids, trace,
+            retry_execution=current_execution(),
+        )
         if blocked is not None:
             result, error_type, error_message = blocked
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
@@ -873,6 +914,9 @@ def handle_function_call(
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
     except Exception as e:
+        from tools.approval_retry import RetryExecutionInvalid
+        if isinstance(e, RetryExecutionInvalid):
+            return _emit(tool_error(str(e)), status="blocked", error_type="retry_binding", error_message=str(e))
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),

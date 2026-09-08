@@ -2164,7 +2164,8 @@ def switch_model(
     _persist_switch_billing_route(agent)
 
 
-def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
+def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace,
+                            retry_execution=None):
     """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
@@ -2174,6 +2175,7 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             middleware_trace=list(middleware_trace),
+            **({"retry_execution": retry_execution} if retry_execution is not None else {}),
         )
         return block_message, (modified_args if modified_args is not None else function_args)
     except Exception:
@@ -2186,9 +2188,32 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
                  skip_tool_execution_middleware: bool = False) -> str:
-    """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
-    no display logic. Used by the concurrent path; the sequential path keeps its own inline
-    invocation for display."""
+    """Invoke one tool; keep retry validation alive only for this execution."""
+    from tools.approval_retry import execution_scope, RetryExecutionInvalid
+    try:
+        with execution_scope(function_name, getattr(agent, "session_id", ""), tool_call_id,
+                             prechecked=pre_tool_block_checked) as retry_execution:
+            return _invoke_tool_in_scope(
+                agent, function_name, function_args, effective_task_id, tool_call_id, messages,
+                pre_tool_block_checked, skip_tool_request_middleware, tool_request_middleware_trace,
+                skip_tool_execution_middleware, retry_execution,
+            )
+    except RetryExecutionInvalid as exc:
+        from agent.inline_tool_executors import emit_terminal_post_tool_call
+        result = json.dumps({"error": str(exc)})
+        emit_terminal_post_tool_call(
+            agent, function_name=function_name, function_args=function_args, result=result,
+            effective_task_id=effective_task_id, tool_call_id=tool_call_id,
+            status="blocked", error_type="retry_binding", error_message=str(exc),
+            middleware_trace=tool_request_middleware_trace,
+        )
+        return result
+
+
+def _invoke_tool_in_scope(agent, function_name, function_args, effective_task_id, tool_call_id, messages,
+                          pre_tool_block_checked, skip_tool_request_middleware, tool_request_middleware_trace,
+                          skip_tool_execution_middleware, retry_execution):
+    """Existing middleware order, with validation at the final execution boundary."""
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )
@@ -2207,7 +2232,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         block_message, function_args = _pre_tool_block_message(
-            agent, function_name, function_args, effective_task_id, tool_call_id, _tool_middleware_trace
+            agent, function_name, function_args, effective_task_id, tool_call_id, _tool_middleware_trace,
+            retry_execution=retry_execution,
         )
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -2226,7 +2252,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
 
         def _execute(next_args: dict) -> Any:
-            result = inline_executor(agent, next_args, inline_ctx)
+            from tools.approval_retry import run_handler
+            result = run_handler(retry_execution, next_args, lambda payload: inline_executor(agent, payload, inline_ctx))
             emit_terminal_post_tool_call(
                 agent, function_name=function_name,
                 function_args=next_args if isinstance(next_args, dict) else function_args,
@@ -2237,7 +2264,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return result
     else:
         def _execute(next_args: dict) -> Any:
-            dispatch_kwargs = dict(
+            retry_execution.check(next_args)
+            dispatch_kwargs: Dict[str, Any] = dict(
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
@@ -2250,7 +2278,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
-            return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+            from tools.approval_retry import forward_execution
+            return forward_execution(retry_execution, model_tools.handle_function_call,
+                                     function_name, next_args, effective_task_id, **dispatch_kwargs)
     if skip_tool_execution_middleware:
         return _execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware

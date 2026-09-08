@@ -196,6 +196,12 @@ class PluginDispatchMixin:
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                if hook_name == "pre_tool_call":
+                    from tools.approval_context import is_pre_tool_recheck
+                    if is_pre_tool_recheck():
+                        # Consuming a retry grant is not proof that the remainder
+                        # of this policy (or a later policy) completed successfully.
+                        results.append({"action": "block", "message": "BLOCKED: pre-tool policy recheck failed"})
         return results
 
     def _run_hook_callback_bounded(

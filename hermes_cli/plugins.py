@@ -1768,6 +1768,7 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[Dict[str, Any]] = None
+    retry: Any = None
 
 
 def set_thread_tool_whitelist(
@@ -1787,21 +1788,26 @@ def _get_pre_tool_call_directive_details(
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
-    the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
-    human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). First valid directive
-    wins; irrelevant returns are ignored."""
+    """Ordinary calls retain first-valid-directive and modify-prefix semantics.
+    Only a typed retry request or its recheck aggregates all vetoes. Callbacks
+    run once per pass; retry scope is discovered from their collected results.
+    A retry stays a BLOCK to legacy consumers that cannot obtain fresh consent."""
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
         return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
-    hook_results = invoke_lifecycle_hook(
+    from tools.approval_context import is_pre_tool_recheck
+    # Re-evaluate policies, not the first-party tool-request observation. This
+    # is still the same pending invocation, not a second tool request.
+    dispatch_hook = invoke_hook if is_pre_tool_recheck() else invoke_lifecycle_hook
+    hook_results = dispatch_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
         task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
     )
     modified_args: Optional[Dict[str, Any]] = None
+    directives = []
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -1824,8 +1830,28 @@ def _get_pre_tool_call_directive_details(
             continue
         rule_key = result.get("rule_key") if action == "approve" else None
         rule_key = (rule_key.strip() or None) if isinstance(rule_key, str) else None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key, modified_args=modified_args)
-    return _PreToolCallDirective(modified_args=modified_args)
+        from tools.approval_context import PreToolRetry
+        retry = result.get("retry")
+        retry = retry if action == "block" and isinstance(retry, PreToolRetry) else None
+        directives.append(_PreToolCallDirective(action=action, message=message, rule_key=rule_key,
+                                                modified_args=modified_args, retry=retry))
+    retries = [d for d in directives if d.retry is not None]
+    if not retries and not is_pre_tool_recheck():
+        # Each directive captured only the modifies preceding it, as at baseline.
+        return directives[0] if directives else _PreToolCallDirective(modified_args=modified_args)
+    for directive in directives:
+        if directive.action == "block" and directive.retry is None:
+            return directive
+    if retries:
+        if len(retries) != 1:
+            return _PreToolCallDirective(action="block", message="BLOCKED: multiple failed-action rechecks required")
+        directive = retries[0]
+        return _PreToolCallDirective(action="block", message=directive.message,
+                                    modified_args=modified_args, retry=directive.retry)
+    # Rechecks validate ALL modifications, including those after an approve.
+    first = directives[0] if directives else _PreToolCallDirective()
+    return _PreToolCallDirective(action=first.action, message=first.message,
+                                rule_key=first.rule_key, modified_args=modified_args)
 
 
 def get_pre_tool_call_directive(
@@ -1886,14 +1912,113 @@ def _resolve_block_from_details(
 
 
 def _dispatch_pre_tool_call_hooks(
-    tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
+    tool_name: str, args: Optional[Dict[str, Any]], *, retry_execution=None, **hook_kwargs: Any
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Invoke ``pre_tool_call`` hooks once; return ``(block_message, modified_args)`` — the resolved
-    block/approve message (``None`` to proceed) and merged ``modify`` args (``None`` if none)."""
-    details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
-    block_msg = _resolve_block_from_details(
-        details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
-    return (block_msg, details.modified_args)
+    """One policy pass, or one fresh-human, exact-argument failure recheck.
+
+    The modal wait lives on the caller, outside bounded hook workers. A grant is
+    neither a tool field nor persistent approval: its lifetime is this stack frame.
+    All policy hooks re-evaluate on recheck; tool-request middleware, execution,
+    post-tool hooks and approval observers are not recursively dispatched.
+    """
+    from copy import deepcopy
+    from hermes_constants import get_hermes_home
+    from tools import approval_context as ctx
+    from tools.approval import request_tool_approval
+
+    source_args = args if isinstance(args, dict) else {}
+    grant = None
+    invocation_token = grant_token = approval_tokens = None
+    failure_message = f"BLOCKED: failed-action recheck invalidated for {tool_name}"
+    observed_retry = False
+    try:
+        # Ordinary callers historically passed Python values straight to hooks.
+        # A binding failure disables retry, not that unrelated ordinary call.
+        invocation = None
+        with suppress(Exception):
+            invocation = ctx._PreToolInvocation(
+                object(), str(get_hermes_home()), hook_kwargs.get("session_id", ""),
+                ctx.get_current_session_key(), hook_kwargs.get("tool_call_id", ""),
+                tool_name, ctx._tool_arguments(source_args),
+                str(hook_kwargs.get("cwd") or os.environ.get("TERMINAL_CWD") or os.getcwd()),
+            )
+        invocation_token = ctx._pre_tool_invocation.set(invocation)
+        # A nested dispatch never inherits its parent's retry grant.
+        grant_token = ctx._pre_tool_retry_grant.set(None)
+        details = _get_pre_tool_call_directive_details(tool_name, source_args, **hook_kwargs)
+        if details.retry is None:
+            block_msg = _resolve_block_from_details(
+                details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
+            return block_msg, details.modified_args
+
+        observed_retry = True
+        if retry_execution is not None:
+            retry_execution.observe_retry()
+        if invocation is None:
+            return failure_message, details.modified_args
+        final_args = source_args if details.modified_args is None else details.modified_args
+        request = details.retry
+        # A modify hook cannot transfer a failure request to a different action.
+        # Let the next ordinary call use the existing changed-argument policy.
+        def unchanged():
+            return (str(get_hermes_home()) == invocation.home and
+                    ctx.get_current_session_key() == invocation.session_key and
+                    str(hook_kwargs.get("cwd") or os.environ.get("TERMINAL_CWD") or os.getcwd()) == invocation.cwd and
+                    ctx._tool_arguments(source_args) == invocation.arguments and
+                    ctx._tool_arguments(final_args) == invocation.arguments)
+
+        if (not invocation.session_id or not invocation.tool_call_id or
+                request.invocation != invocation or not unchanged()):
+            return failure_message, details.modified_args
+        approval_tokens = ctx.set_current_observability_context(
+            **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
+        # Only display copies cross the UI boundary. They do not mint the grant.
+        reason = (f"Recheck this failed action ONCE, then apply all tool policies again. "
+                  f"{details.message or ''}\nProfile: {request.profile}; session: {invocation.session_id}; "
+                  f"call: {invocation.tool_call_id}; cwd: {invocation.cwd}\n"
+                  f"Tool: {tool_name}\nArguments: {invocation.arguments}")
+        result = request_tool_approval(tool_name, reason, rule_key="failed-action-recheck", fresh_once=True)
+        if not (result.get("approved") is True and result.get("fresh_once") is True):
+            return str(result.get("message") or details.message or failure_message), details.modified_args
+        if not unchanged():
+            return failure_message, details.modified_args
+        if retry_execution is not None:
+            retry_execution.require_open()
+        grant = ctx._PreToolRetryGrant(request)
+        ctx._pre_tool_retry_grant.set(grant)
+        recheck_args = deepcopy(final_args)
+        checked = _get_pre_tool_call_directive_details(tool_name, recheck_args, **hook_kwargs)
+        if (not unchanged() or ctx._tool_arguments(recheck_args) != invocation.arguments or
+                (checked.modified_args is not None and
+                 ctx._tool_arguments(checked.modified_args) != invocation.arguments) or
+                not grant.consumed or not grant.matched):
+            return failure_message, details.modified_args
+        # No recursion and no second prompt for the same failed-action request.
+        if checked.retry is not None:
+            return checked.message or failure_message, details.modified_args
+        # All independent predicates just ran with veto precedence. Their
+        # approvable results concern this exact action, already selected ONCE.
+        # A genuine BLOCK still wins; do not open an ordinary session/always UI.
+        if checked.action == "block":
+            return checked.message or failure_message, details.modified_args
+        if retry_execution is not None:
+            retry_execution.bind(invocation, final_args)
+        return None, details.modified_args
+    except Exception:
+        if not observed_retry:
+            # Preserve each ordinary caller's historical dispatcher-error behavior.
+            raise
+        logger.warning("Pre-tool retry dispatch failed for %s", tool_name, exc_info=True)
+        return failure_message, None
+    finally:
+        if grant is not None:
+            grant.close()
+        if approval_tokens is not None:
+            ctx.reset_current_observability_context(approval_tokens)
+        if grant_token is not None:
+            ctx._pre_tool_retry_grant.reset(grant_token)
+        if invocation_token is not None:
+            ctx._pre_tool_invocation.reset(invocation_token)
 
 
 def get_pre_verify_continue_message(

@@ -152,12 +152,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
                 return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
         else:
-            targets = [queue.pop(0)]
+            # Retry requests require the matching native modal selection, never
+            # a blanket /approve all or uncorrelated FIFO answer.
+            eligible = [entry for entry in queue if not entry.data.get("fresh_once")]
+            targets = eligible if resolve_all else eligible[:1]
+            if not targets:
+                return 0
+        queue[:] = [entry for entry in queue if entry not in targets]
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -644,7 +646,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None, fresh_once: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -656,13 +658,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     from agent.redact import redact_sensitive_text
 
     smart_denied = False
-    if smart:
+    if smart and not fresh_once:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    allow_permanent = permanent_capable and not smart_denied and not fresh_once
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -675,6 +677,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, **extra)
 
     def grant(choice: str) -> dict:
+        if fresh_once:
+            if choice != "once":
+                return _denied("BLOCKED: a fresh explicit once decision is required for this recheck.",
+                               pattern_key=pattern_key, description=description, outcome="denied")
+            return {"approved": True, "message": None, "fresh_once": True}
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
             _persist_choice(session_key, choice, warnings)
@@ -712,9 +719,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": not smart_denied and not fresh_once,
             }
+            if fresh_once:
+                data["fresh_once"] = True
             if smart_denied:
                 data["smart_denied"] = True
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
@@ -742,6 +751,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if not _should_fall_through_to_cli_approval(
             is_cli=is_cli, approval_callback=approval_callback, notify_cb=notify_cb,
         ):
+            if fresh_once:
+                return _blocked("BLOCKED: no human approval transport for this recheck.",
+                                pattern_key=pattern_key, description=description)
             if not spec.pending_keys:
                 display_command, display_description = command, description
             return _pending_result(
@@ -751,14 +763,16 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
     prompt_command, prompt_description = command, description
-    if spec.redact_cli:
+    if spec.redact_cli or fresh_once:
         prompt_command = redact_sensitive_text(command)
         prompt_description = redact_sensitive_text(description)
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
+    prompt_options = {"allow_session": False} if fresh_once else {}
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+                                       smart_denied=smart_denied, approval_callback=approval_callback,
+                                       **prompt_options)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -787,6 +801,7 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    fresh_once: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -799,14 +814,17 @@ def _run_approval_gate(
     an explicit ``*_deny_message`` (the file-tool write gates word their own).
     """
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
-    if _yolo_active():
+    if not fresh_once and _yolo_active():
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not fresh_once and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     if not is_cli and not is_gateway:
+        if fresh_once:
+            return _blocked(no_human_block_message or "BLOCKED: a fresh human once decision is required.",
+                            pattern_key=pattern_key, description=description)
         log_args = (autoapprove_log_prefix, pattern_key, description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
         deny_messages = {
@@ -847,6 +865,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        fresh_once=fresh_once,
     )
 
 
@@ -904,6 +923,9 @@ def check_dangerous_command(command: str, env_type: str,
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
         return _approved()
+    from tools.approval_retry import native_retry_covers_command
+    if native_retry_covers_command(command):
+        return _approved()
     return _run_approval_gate(
         pattern_key=pattern_key, description=description, display_target=command, approval_callback=approval_callback,
         subject=f"Command flagged as dangerous ({description})", noun="dangerous commands",
@@ -912,7 +934,8 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None,
+                          fresh_once: bool = False) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -922,6 +945,11 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     non-gateway context fails CLOSED. ``rule_key`` controls the ``[a]lways`` allowlist grain;
     when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons on the same tool
     persist independently. Returns the ``check_dangerous_command`` result shape.
+
+    ``fresh_once`` is for a failed-action recheck, not an ordinary approval:
+    bypass no policy via cache/yolo/smart/unattended modes, offer only once/deny,
+    persist nothing, and attest ``fresh_once=True`` only after an explicit once
+    response from the existing native human transport.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
@@ -934,7 +962,7 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         display_target=f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
-        fail_closed_when_no_human=True,
+        fail_closed_when_no_human=True, fresh_once=fresh_once,
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
     )
@@ -1048,6 +1076,11 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous and not is_approved(session_key, pattern_key):
         warnings.append((pattern_key, description, False))
     if not warnings:
+        return _approved()
+    # Floors and scanner already evaluated; only their recoverable permission
+    # question is covered by the exact running retry's fresh once decision.
+    from tools.approval_retry import native_retry_covers_command
+    if native_retry_covers_command(command):
         return _approved()
 
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
