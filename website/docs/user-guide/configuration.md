@@ -924,6 +924,7 @@ compression:
   proactive_prune_tokens: 0                         # Opt-in tokens trigger for the no-LLM tool-result prune (0 = off; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
+  summary_input_max_chars: 0                        # Char cap on the turns handed to the summarizer (0 = runtime default 160000 ≈ 40K tokens; e.g. 512000 ≈ 128K tokens when all summarizer routes have large windows)
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:

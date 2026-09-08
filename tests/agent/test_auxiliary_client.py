@@ -2302,6 +2302,141 @@ class TestTransientTransportRetry:
 
 
 
+class TestServerErrorFallsBackAfterRetries:
+    """A dead primary answering HTTP 5xx must reach the configured fallback_chain once the
+    same-provider transient retries are exhausted.
+
+    Regression for the 2026-09-07 desktop-local incident: the compression primary returned
+    HTTP 500 on every call (148x in one afternoon); ``_is_transient_transport_error`` retried the
+    same provider and then re-raised because a 5xx matched none of ``_FALLBACK_REASONS`` — the
+    fallback_chain (grok-4.6 / glm-5.3-flash) was never contacted and zero compactions ran.
+    """
+
+    def _patches(self, client):
+        return (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("opencode-go", "gpt-5.6-luna", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "gpt-5.6-luna"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda resp, _task, **_kw: resp,
+            ),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
+        )
+
+    def test_is_server_error_detector(self):
+        from agent.auxiliary_client import _is_server_error
+
+        class _Err500(Exception):
+            status_code = 500
+
+        class _Err503(Exception):
+            status_code = 503
+
+        class _Err429(Exception):
+            status_code = 429
+
+        class _Err400(Exception):
+            status_code = 400
+
+        assert _is_server_error(_Err500("internal"))
+        assert _is_server_error(_Err503("unavailable"))
+        assert not _is_server_error(_Err429("slow down"))
+        assert not _is_server_error(_Err400("bad request"))
+        assert not _is_server_error(RuntimeError("no status"))
+
+    def test_compression_500_after_retries_uses_configured_fallback_chain(self):
+        class _Err500(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/go/v1"
+        primary.chat.completions.create.side_effect = _Err500("Internal server error")
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://api.x.ai/v1"
+        fb_client.chat.completions.create.return_value = {"fallback": "grok-4.6"}
+
+        p1, p2, p3, p4 = self._patches(primary)
+        with (
+            p1, p2, p3, p4,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fb_client, "grok-4.6", "fallback_chain[0](xai-oauth)"),
+            ) as chain,
+        ):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result == {"fallback": "grok-4.6"}
+        # Same-provider transient retries ran first (1 + 2 retries), THEN the chain was consulted.
+        assert primary.chat.completions.create.call_count == 3
+        assert chain.call_count == 1
+        assert fb_client.chat.completions.create.call_count == 1
+
+    def test_non_server_4xx_still_does_not_fall_back_on_explicit_provider(self):
+        """Guard the boundary: a plain 400 on an explicitly configured provider is a request
+        problem, not capacity — it must still re-raise without touching the chain."""
+        class _Err400(Exception):
+            status_code = 400
+
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/go/v1"
+        primary.chat.completions.create.side_effect = _Err400("bad request")
+
+        p1, p2, p3, p4 = self._patches(primary)
+        with (
+            p1, p2, p3, p4,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ) as chain,
+            pytest.raises(_Err400),
+        ):
+            call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert primary.chat.completions.create.call_count == 1
+        assert chain.call_count == 0
+
+
+class TestFallbackEntryReasoningEffort:
+    """A fallback_chain entry's own ``reasoning_effort`` must reach the wire instead of the primary's
+    (Grok tops out at xhigh, GLM-5.3 at max — one dial for the whole chain under-drives one of them)."""
+
+    def _kwargs_for(self, entry):
+        from agent.auxiliary_client import _FallbackDestination, _fallback_request_kwargs
+        dest = _FallbackDestination(provider=entry["provider"], model=entry["model"], base_url="https://api.z.ai/api/coding/paas/v4", api_mode=None)
+        return _fallback_request_kwargs(
+            dest, task="compression", messages=[{"role": "user", "content": "hi"}], tools=None, temperature=None,
+            max_tokens=None, effective_timeout=30.0,
+            effective_extra_body={"reasoning": {"enabled": True, "effort": "xhigh"}},
+            reasoning_config=None, fallback_entry=entry, task_config={"provider": "xai-oauth", "model": "grok-4.6"},
+            apply_fast_lane=True,
+        )
+
+    def test_entry_effort_overrides_primary_effort(self):
+        kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash", "reasoning_effort": "max"})
+        assert kw["extra_body"]["reasoning"]["effort"] == "max"
+
+    def test_entry_without_effort_inherits_primary(self):
+        kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash"})
+        assert kw["extra_body"]["reasoning"]["effort"] == "xhigh"
+
+    def test_disabling_entry_effort_defers_to_fast_lane_shape(self):
+        """``reasoning_effort: none`` on an entry must not pre-empt the fast-lane certification, which
+        owns the exact non-reasoning wire shape ({enabled: False, effort: none}) — CI regression
+        test_fallback_cap_requires_independent_route_certification."""
+        kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash", "reasoning_effort": "none"})
+        # Not certified as a fast lane (entry provider/model differ from the primary) -> primary's dial stays.
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_invalid_entry_effort_keeps_primary(self):
+        kw = self._kwargs_for({"provider": "zai", "model": "glm-5.3-flash", "reasoning_effort": "turbo-ultra"})
+        assert kw["extra_body"]["reasoning"]["effort"] == "xhigh"
+
+
 class TestAuxClientNoSdkRetries:
     """Auxiliary OpenAI clients are constructed with SDK-internal retries
     disabled so Hermes owns the retry/timeout budget (issue #54465). The SDK

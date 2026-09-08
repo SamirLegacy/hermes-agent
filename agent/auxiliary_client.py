@@ -3039,6 +3039,14 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
+def _is_server_error(exc: Exception) -> bool:
+    """Pure HTTP 5xx from the provider (``InternalServerError`` and friends), as opposed to a
+    connection failure. Retried on the same provider first; once those retries are exhausted the
+    provider-fallback rung treats it as a capacity error so the configured fallback_chain runs."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(status, int) and 500 <= status < 600
+
+
 _DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
 
@@ -3576,14 +3584,33 @@ def _fallback_request_kwargs(
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
     fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
 ) -> Dict[str, Any]:
-    """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
+    """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap).
+
+    A fallback_chain entry may carry its own ``reasoning_effort`` (providers differ in their top
+    tier: Grok caps at ``xhigh``, GLM-5.3 at ``max``). When it names an ENABLED level it replaces
+    the ``reasoning`` folded in from the primary task config so the entry's dial reaches the wire
+    instead of the primary's. A disabling level (``none``) is left to the fast-lane certification
+    below, which owns the exact non-reasoning wire shape."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
+    entry_effort = fallback_entry.get("reasoning_effort") if isinstance(fallback_entry, dict) else None
+    if entry_effort not in (None, ""):
+        from hermes_constants import parse_reasoning_effort
+        parsed = parse_reasoning_effort(entry_effort)
+        if parsed is None:
+            logger.warning(
+                "Auxiliary %s: fallback_chain entry %s/%s has invalid reasoning_effort %r — keeping the "
+                "primary's reasoning setting", task or "call", fallback_entry.get("provider"),
+                fallback_entry.get("model"), entry_effort,
+            )
+        elif parsed.get("enabled") is not False:
+            fallback_extra_body = dict(effective_extra_body or {})
+            fallback_extra_body["reasoning"] = parsed
     if apply_fast_lane:
         fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
             task, actual_provider=destination.provider, actual_model=destination.model,
             requested_provider=fallback_entry.get("provider"),
             requested_model=fallback_entry.get("model"), route_config=fallback_entry,
-            leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
+            leak_guard_config=task_config, max_tokens=max_tokens, extra_body=fallback_extra_body,
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
     fb_kwargs = _build_call_kwargs(
@@ -6582,10 +6609,15 @@ _RERAISE_ORIGINAL = object()
 
 # Ordered (predicate, reason) pairs for the provider-fallback rung: first match
 # wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
+# ``_is_server_error`` is LAST: a 5xx only reaches this rung after the same-provider
+# transient retries are exhausted (see ``_is_transient_transport_error``), at which point
+# the endpoint is down for this request and the configured fallback_chain must run —
+# otherwise a dead primary (148x HTTP 500 on one afternoon) yields zero compactions.
 _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
     (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
     (_is_invalid_aux_response_error, "invalid provider response"), (_is_connection_error, "connection error"),
+    (_is_server_error, "server error after retries"),
 )
 
 
