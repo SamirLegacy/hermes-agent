@@ -38,10 +38,11 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import compression_made_progress
+from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
-# Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_expiry_watcher.
+# Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
@@ -721,6 +722,40 @@ def _approval_send_outcome(future, timeout: float) -> str:
         return "failed"
     if getattr(result, "success", False):
         return "sent"
+    # P5(b): a connector DECLINE is not a lane failure. The connector
+    # authorized the destination and refused it; re-sending the same content as
+    # plain text into that same chat is the exfiltration the egress guard
+    # exists to stop. `failed` is the cue to fall back, so a decline needs its
+    # own verdict — callers must surface it and send nothing further.
+    #
+    # CLASSIFY THE STRUCTURED RESPONSE, NOT THE ERROR STRING. The adapter
+    # preserves the connector's own dict in `raw_response`; rebuilding a dict
+    # from `error` alone loses two things review demonstrated:
+    #   * a decline carrying `code: egress_declined` and NO text renders as
+    #     "relay egress declined" — no marker colon — so the string check
+    #     missed it and the fallback fired into the refused chat;
+    #   * `ambiguous: True` (lost ack, mid-write drop) was flattened into a
+    #     DEFINITE failure, which re-sends a card that may well have posted.
+    # I fixed the text-marker path and tested only the text-marker path.
+    from gateway.relay.egress import declined_send
+
+    _raw = getattr(result, "raw_response", None)
+    if isinstance(_raw, dict) and _raw.get("ambiguous"):
+        # The frame may have been applied. Same physics as a scheduling
+        # timeout: possibly-delivered, so never re-send. Checked BEFORE the
+        # decline classification because an ambiguous result is a transport
+        # outcome, not an authorization one, and this lane has three verdicts
+        # rather than the boolean the shared helper answers.
+        logger.warning("Prompt send AMBIGUOUS (lost ack): %s", _raw.get("error"))
+        return "ambiguous"
+    if declined_send(result):
+        # Both shapes, one classifier: a structured body, or the uniform
+        # decline sentence from an older connector.
+        logger.warning(
+            "Prompt send DECLINED by connector egress guard: %s",
+            getattr(result, "error", None),
+        )
+        return "declined"
     logger.warning("Prompt send failed: %s", getattr(result, "error", None) or "unknown error")
     return "failed"
 
@@ -731,6 +766,18 @@ def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | N
     Only a DEFINITIVE failure tears down the registration; ``ambiguous`` (card may have posted) stays armed
     and proceeds to the bounded wait, whose response timeout covers a lost card."""
     outcome = _approval_send_outcome(fut, timeout=15)
+    if outcome == "declined":
+        # P5(b): a connector DECLINE is MORE definitive than a failure — the
+        # destination was authorized and refused, so the card cannot arrive and
+        # no late reply can resolve it. Without this branch `declined` fell
+        # through to the bounded wait and the agent blocked until
+        # clarify_timeout (indefinitely when that is configured non-positive).
+        logger.warning(
+            "Clarify prompt DECLINED by the connector's egress guard; "
+            "clearing registration"
+        )
+        clarify_mod.clear_session(session_key)
+        return "[clarify prompt could not be delivered: destination refused]"
     if outcome == "failed":
         # Undeliverable: clear the registration and return the sentinel so the agent falls back, not hangs.
         logger.warning("Clarify send failed definitively; clearing registration")
@@ -898,7 +945,7 @@ def _warm_turn_machinery_sync() -> int:
     """Synchronously initialize first-turn prerequisites (executor thread); returns the schema count.
 
     Covers the lazy init seen in skeleton turns: ``run_agent`` import graph, tool schemas (+ ``check_fn``
-    TTL cache), context files."""
+    TTL cache), context files, the local Python toolchain probe (#106064)."""
     import run_agent  # noqa: F401  # heavy import graph, cached in sys.modules
     import model_tools
 
@@ -909,6 +956,15 @@ def _warm_turn_machinery_sync() -> int:
         build_context_files_prompt()
     except Exception:
         logger.debug("context-file warm-up failed (non-fatal)", exc_info=True)
+    from hermes_cli.config import load_config_readonly
+
+    agent_cfg = load_config_readonly().get("agent")
+    if not isinstance(agent_cfg, dict) or agent_cfg.get("environment_probe", True):
+        # The resolver owns remote-backend omission, the single worker, its cache and the bounded
+        # wait; calling it here is what the first prompt build would otherwise do on the hot path.
+        from tools.env_probe import get_environment_probe_line
+
+        get_environment_probe_line()
     return len(tool_defs)
 
 
@@ -933,7 +989,7 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _stamp_hygiene_compression_provenance(
-    agent: Any, desc: str, provenance: "ActivityProvenance", debug_label: str) -> None:
+    agent: Any, desc: str, provenance: ActivityProvenance, debug_label: str) -> None:
     """Best-effort activity provenance stamp for hygiene compression transitions."""
     try:
         agent._touch_activity(desc, provenance=provenance)
@@ -2042,7 +2098,7 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
-from gateway.run_turn import GatewayTurnMixin
+from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
 from gateway.run_shutdown import GatewayShutdownMixin, _exit_with_failure_verdict, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
@@ -2051,13 +2107,13 @@ from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
+from gateway.run_wisdom import GatewayWisdomMixin, WisdomCardRefresh, enqueue_weekly_review
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
     _reply_anchor_for_event,
 )
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
@@ -2172,27 +2228,13 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        with suppress(ValueError, TypeError):
-            max_tokens = int(_env_mt)
-    elif isinstance(model_cfg, dict):
-        mt = model_cfg.get("max_tokens")
-        max_tokens = mt if isinstance(mt, int) else None
-    # Per-provider max_output_tokens applies only when global model.max_tokens is unset (global wins).
-    if max_tokens is None:
-        _runtime_mot = runtime.get("max_output_tokens")
-        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
-            max_tokens = _runtime_mot
 
     capabilities = runtime.get("capabilities")
     capabilities = (
         {k: v for k, v in capabilities.items() if isinstance(k, str) and isinstance(v, bool)}
         if isinstance(capabilities, dict) else {})
 
-    return {**_runtime_agent_kwargs(runtime), "max_tokens": max_tokens, "capabilities": capabilities}
+    return {**_runtime_agent_kwargs(runtime), "capabilities": capabilities}
 
 
 def _runtime_agent_kwargs(runtime: dict) -> dict:
@@ -2295,8 +2337,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     return {
         **_runtime_agent_kwargs(runtime),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
-        "capabilities": dict(runtime.get("capabilities") or {}),
-        "max_tokens": runtime.get("max_output_tokens")}
+        "capabilities": dict(runtime.get("capabilities") or {})}
 
 
 def _deep_merge_request_overrides(base: Optional[dict], override: Optional[dict]) -> dict:
@@ -2978,8 +3019,13 @@ def _normalize_empty_agent_response(
     non-failed turn -- this is the silent-drop pattern observed after ``/stop`` where the next user message
     hits a stale generation token and returns an empty result, leaving the platform with nothing to send.
     (#31884)
+
+    A failed context-overflow turn whose ``final_response`` is only the raw provider envelope
+    (``HTTP 400: {...}``) is rewritten too: returned unchanged, chat sanitizers turn it into a
+    generic provider-failed reply and the user never sees /compact. Curated agent text survives.
     """
-    if response:
+    is_overflow = is_context_overflow_failure_result(agent_result, history_len)
+    if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
         return response
     if agent_result.get("failed"):
         # ``error`` can be an EXPLICIT None (bypasses dict.get default) -> would render "failed: None".
@@ -2997,9 +3043,7 @@ def _normalize_empty_agent_response(
                 "⚠️ Session storage was temporarily unavailable, so this "
                 "turn was stopped to protect your conversation history. "
                 "Your message should already be saved — please send it again in a moment.")
-        if any(p in error_str for p in (
-                "context", "token", "too large", "too long", "exceed", "payload")) or (
-                "400" in error_str and history_len > 50):
+        if is_overflow:
             return (
                 "⚠️ Session too large for the model's context window.\n"
                 "Use /compact to compress the conversation, or /reset to start fresh.")
@@ -3146,27 +3190,10 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
 _SESSION_DB_UNPINNED = object()
 
 
-# Agent-facing sidecar note per auto-reset reason (default: idle).
+# Only explicit suspension can replace a routed conversation.
 _AUTO_RESET_CONTEXT_NOTES = {
     "suspended": "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]",
-    "daily": "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]",
-    "resume_pending_expired": "[System note: The previous gateway session could not be recovered after a restart (API recovery timed out). This is a fresh conversation — use /resume to restore history if needed.]",
-    "idle": "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]",
 }
-
-
-def _auto_reset_reason_text(reset_reason: str, policy) -> str:
-    """Human-readable cause for the user-facing auto-reset notice."""
-    if reset_reason == "suspended":
-        return "previous session was stopped or interrupted"
-    if reset_reason == "resume_pending_expired":
-        return "gateway restart recovery timed out"
-    if reset_reason == "daily":
-        return f"daily schedule at {policy.at_hour}:00"
-    hours = policy.idle_minutes // 60
-    mins = policy.idle_minutes % 60
-    duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-    return f"inactive for {duration}"
 
 
 def _write_runtime_status_quiet(**fields: Any) -> None:
@@ -3246,7 +3273,7 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin):
+    GatewayAgentCacheMixin, GatewayWisdomMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -3387,16 +3414,11 @@ class GatewayRunner(
 
     def _init_session_store(self) -> None:
         """Build the SessionStore (with process-registry reset guard), its async facade and the router."""
-        # Reset guard: a background process older than session_reset.bg_process_max_age_hours (24h
-        # default) is stale and no longer blocks idle/daily reset (NOT killed, only ignored).
         from tools.process_registry import process_registry
-        _bg_max_age_hours = getattr(self.config.default_reset_policy, "bg_process_max_age_hours", 24)
-        _bg_max_age_seconds = (
-            _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None)
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
-                key, max_active_age=_bg_max_age_seconds))
+                key))
         # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
@@ -3935,11 +3957,20 @@ class GatewayRunner(
                 return self._is_user_authorized(source)
             return self._is_user_authorized(source, allow_adapter_delegation=False)
 
+        return self._under_authorization_profile(source, _check)
+
+    def _admit_bot_message_for_source(self, source: SessionSource) -> bool:
+        """Count a bot message under the profile that authorized it, so the guard's peek, count and
+        config all read the transport profile's ``gateway.bot_loop_guard``."""
+        return self._under_authorization_profile(source, lambda: self._admit_bot_message(source))
+
+    @staticmethod
+    def _under_authorization_profile(source: SessionSource, check):
         authorization_home = getattr(source, "_authorization_profile_home", None)
-        if authorization_home is not None:
-            with _profile_runtime_scope(Path(authorization_home)):
-                return _check()
-        return _check()
+        if authorization_home is None:
+            return check()
+        with _profile_runtime_scope(Path(authorization_home)):
+            return check()
 
     def _cache_session_source(self, session_key: str, source) -> None:
         if not session_key or source is None:
@@ -4029,13 +4060,18 @@ class GatewayRunner(
             # fallback. See #210.
             team_id = getattr(source, "scope_id", None)
             user_id = getattr(source, "user_id", None)
-            if team_id or user_id:
+            profile = getattr(source, "profile", None)
+            if team_id or user_id or profile:
                 metadata = dict(metadata or {})
                 if team_id:
                     metadata["slack_team_id"] = str(team_id)
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+                if profile:
+                    metadata.setdefault("profile", str(profile))
+        from gateway.session_context import source_route_metadata
+        metadata = source_route_metadata(source, metadata)
         # Routed profile for shared state.db namespaces: under profile_routes the transport adapter's
         # stamp is not the profile that wrote the binding (Telegram prune path needs it).
         # See #76423.
@@ -4117,6 +4153,7 @@ class GatewayRunner(
             user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
+            parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
@@ -4183,7 +4220,7 @@ class GatewayRunner(
     # cached agent or a mid-gateway edit is silently ignored. Add new baked-in settings here.
     # _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
-        ("model", "context_length"), ("model", "max_tokens"), ("compression", "enabled"),
+        ("model", "context_length"), ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
         ("compression", "model_thresholds"), ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"), ("compression", "codex_app_server_auto"),
@@ -4200,11 +4237,6 @@ class GatewayRunner(
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
-    _HONCHO_CACHE_BUSTING_KEYS = (
-        "honcho.peer_name", "honcho.ai_peer", "honcho.pin_peer_name", "honcho.runtime_peer_prefix",
-        "honcho.user_peer_aliases")
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
-
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
@@ -4218,7 +4250,6 @@ class GatewayRunner(
         See #15654, #9051.
         """
         if interrupt_depth == 0:
-            from agent.session_activity import ActivityProvenance
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             agent._last_activity_provenance = ActivityProvenance.UNKNOWN
@@ -4531,6 +4562,9 @@ def _start_gateway_housekeeping(
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     chores: list[tuple[int, str, Any]] = []
+    wisdom_cards = WisdomCardRefresh(adapters, loop)
+    chores.append((1, "Wisdom publication-card refresh", wisdom_cards.tick))
+    chores.append((60, "Wisdom agent-led review tick", enqueue_weekly_review))
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.

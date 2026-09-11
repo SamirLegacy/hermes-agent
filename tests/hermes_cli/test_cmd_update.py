@@ -79,6 +79,11 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
+def _patch_gateway_discovery(isolated_update_runtime):
+    pass
+
+
+@pytest.fixture(autouse=True)
 def _patch_gateway_restart():
     """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
 
@@ -1223,6 +1228,7 @@ class TestNodeRuntimeNpmResolution:
         from hermes_cli import update_cmd
 
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 

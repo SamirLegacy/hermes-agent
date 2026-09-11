@@ -79,6 +79,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | Skill | Description | Path |
 |-------|-------------|------|
 | [`airtable`](/docs/user-guide/skills/bundled/productivity/productivity-airtable) | Airtable REST API via curl. Records CRUD, filters, upserts. | `productivity\airtable` |
+| [`collective-wisdom-install`](/docs/user-guide/skills/bundled/productivity/productivity-collective-wisdom-install) | Install a shared team skill with explicit consent. | `productivity\collective-wisdom-install` |
 | [`box`](/docs/user-guide/skills/bundled/productivity/productivity-box) | Box manages cloud files, sharing, search, and metadata. | `productivity\box` |
 | [`document-to-action-items`](/docs/user-guide/skills/bundled/productivity/productivity-document-to-action-items) | Extract cited obligations, deadlines, tasks from documents. | `productivity\document-to-action-items` |
 | [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Create, read, edit, template, and review Word .docx files. | `productivity\docx` |
@@ -101,13 +102,11 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`competitor-news-monitor`](/docs/user-guide/skills/bundled/research/research-competitor-news-monitor) | Watch named companies for material news; cited digests. | `research\competitor-news-monitor` |
 | [`grounded-citations`](/docs/user-guide/skills/bundled/research/research-grounded-citations) | Ground answers and documents in cited, verifiable sources. | `research\grounded-citations` |
 | [`llm-wiki`](/docs/user-guide/skills/bundled/research/research-llm-wiki) | Karpathy's LLM Wiki: build/query interlinked markdown KB. | `research\llm-wiki` |
-| [`rss-feeds`](/docs/user-guide/skills/bundled/research/research-rss-feeds) | Read RSS, Atom, JSON feeds; discover feeds behind a page. | `research/rss-feeds` |
 
 ## social-media
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`reddit-reading`](/docs/user-guide/skills/bundled/social-media/social-media-reddit-reading) | Read Reddit: subreddits, search, threads, users. No browser. | `social-media/reddit-reading` |
 | [`xurl`](/docs/user-guide/skills/bundled/social-media/social-media-xurl) | X/Twitter via xurl CLI: raw post search, posting, DM, media. | `social-media\xurl` |
 
 ## software-development

@@ -18,7 +18,8 @@ import re
 import time
 from contextlib import suppress
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import EphemeralReply
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_common import _UNSET
 from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
@@ -189,12 +190,16 @@ class GatewayInboundMixin:
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
+            # DMs get a pairing code, groups are ignored. A bot cannot pair, and answering one mid-cooldown is outbound traffic.
             if (
                 source.chat_type == "dm"
+                and not getattr(source, "is_bot", False)
                 and self._get_unauthorized_dm_behavior(source.platform, profile=source.profile) == "pair"
             ):
                 await self._hm_offer_pairing_code(source)
+            return None
+        # The busy path charged this event on arrival; a drained follow-up must not pay twice.
+        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
         return event, source, False
 
@@ -557,7 +562,7 @@ class GatewayInboundMixin:
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
-                steered = bool(running_agent.steer(steer_text))
+                steered = bool(running_agent.steer(self._steer_text_with_origin(steer_text, event)))
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
@@ -576,7 +581,9 @@ class GatewayInboundMixin:
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
         if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
             try:
-                if running_agent.redirect((event.text or "").strip()):
+                if running_agent.redirect(
+                    self._steer_text_with_origin((event.text or "").strip(), event)
+                ):
                     logger.debug("PRIORITY redirect for session %s", _quick_key)
                     return
             except Exception as exc:
@@ -774,6 +781,8 @@ class GatewayInboundMixin:
         )
 
     async def _hm_cmd_start(self, event, source, _quick_key):
+        if event.get_command_args().strip().startswith("wisdom_"):
+            return True, await self._continue_wisdom_start(event, source)
         logger.info("Ignoring /start platform ping for session %s", _quick_key)
         return True, ""
 
@@ -1181,6 +1190,14 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
+        # not on the adapter's raw inbound: profile routing, the ignored-channel
+        # guard, plugin hooks and user authorization all reject events above,
+        # and a rejected event must not be able to clear a refusal belonging to
+        # an active turn. This is also the single entry point every lane shares
+        # — Discord interaction passthrough builds its own MessageEvent and
+        # calls handle_message directly, so a teardown on the relay's inbound
+        # handler left those turns muted.
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:

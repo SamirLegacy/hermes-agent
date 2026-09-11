@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional, Tuple
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 
-from hermes_cli.commands import COMMANDS, SUBCOMMANDS
+from hermes_cli.commands import COMMANDS, SUBCOMMANDS, SUBCOMMAND_DESCRIPTIONS
 
 # (config-file signature, personalities) memo for /personality completion.
 _personalities_memo: Optional[
@@ -41,12 +41,6 @@ def _personalities_from_cli_config() -> Dict[str, Any]:
     if _personalities_memo is None or _personalities_memo[0] != sig:
         _personalities_memo = (sig, available_personalities(load_cli_config()))
     return _personalities_memo[1]
-
-
-def _short_desc(info: Mapping[str, Any], default: str) -> str:
-    """50-char description preview used in completion menus."""
-    description = str(info.get("description", default))
-    return description[:50] + ("..." if len(description) > 50 else "")
 
 
 def _file_size_label(path: str) -> str:
@@ -287,6 +281,11 @@ class SlashCommandCompleter(Completer):
         self._file_cache_cwd: str = ""
 
     def _command_allowed(self, slash_command: str) -> bool:
+        from hermes_cli.commands import command_available, resolve_command
+
+        command = resolve_command(slash_command)
+        if command is not None and not command_available(command):
+            return False
         try:
             return self._command_filter is None or bool(self._command_filter(slash_command))
         except Exception:
@@ -335,7 +334,7 @@ class SlashCommandCompleter(Completer):
             # Exact match: trailing space keeps the dropdown open for the next stacked token.
             yield _completion(
                 f"{cmd} " if cmd == word_key else cmd, current_word, cmd,
-                f"⚡ {_short_desc(info, 'Skill command')}")
+                f"⚡ {info.get('description', 'Skill command')}")
 
     @staticmethod
     def _completion_text(cmd_name: str, word: str) -> str:
@@ -441,7 +440,8 @@ class SlashCommandCompleter(Completer):
                 yield from handler(sub_text, sub_text.lower())
             elif first_arg and base_cmd in SUBCOMMANDS and self._command_allowed(base_cmd):
                 yield from _prefix_completions(
-                    ((s, None) for s in SUBCOMMANDS[base_cmd]), sub_text)
+                    ((s, SUBCOMMAND_DESCRIPTIONS.get(base_cmd, {}).get(s))
+                     for s in SUBCOMMANDS[base_cmd]), sub_text)
             return
         word = text[1:]
 
@@ -455,16 +455,16 @@ class SlashCommandCompleter(Completer):
             if cmd[1:].startswith(word):
                 skill_count = len(info.get("skills", []))
                 yield _cmd_completion(
-                    cmd[1:], f"▣ {_short_desc(info, 'Skill bundle')} ({skill_count} skills)")
+                    cmd[1:], f"▣ {info.get('description', 'Skill bundle')} ({skill_count} skills)")
         for cmd, info in self._iter_skill_commands().items():
             if cmd[1:].startswith(word):
-                yield _cmd_completion(cmd[1:], f"⚡ {_short_desc(info, 'Skill command')}")
+                yield _cmd_completion(cmd[1:], f"⚡ {info.get('description', 'Skill command')}")
         try:
             from hermes_cli.plugins import get_plugin_commands
             for cmd_name, cmd_info in get_plugin_commands().items():
                 if cmd_name.startswith(word):
                     yield _cmd_completion(
-                        cmd_name, f"🔌 {_short_desc(cmd_info, 'Plugin command')}")
+                        cmd_name, f"🔌 {cmd_info.get('description', 'Plugin command')}")
         except Exception:
             pass
 

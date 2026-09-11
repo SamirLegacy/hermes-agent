@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sys
 import time
 from pathlib import Path
 
@@ -89,7 +88,11 @@ class TestFormatters:
 # ---------------------------------------------------------------------------
 
 class TestSpawnAsyncDiagnostic:
-    # The real script reads /proc and uses GNU timeout/ps plus systemd journal tools.
+    # The diagnostic wraps its script in GNU coreutils ``timeout`` and the script
+    # body is Linux-only (``ps auxf --sort``, ``/proc/loadavg``, ``dmesg``,
+    # ``pstree``). On hosts without ``timeout`` (macOS) Popen raises and the
+    # producer returns None by design (fail-soft), so the spawn can only be
+    # observed on Linux.
     @pytest.mark.linux_only
     def test_spawns_subprocess_and_writes_output(self, tmp_path):
         log_path = tmp_path / "diag.log"

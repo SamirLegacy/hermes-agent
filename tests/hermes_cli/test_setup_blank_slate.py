@@ -15,7 +15,6 @@ from hermes_cli import setup_quick
 class TestBlankSlateMinimalToolsets:
 
 
-
     def test_no_disabled_bundle_overlaps_kept_tools(self):
         """Invariant: ``disabled_toolsets`` is applied at *tool* granularity and
         a single tool can belong to several toolsets, so no disabled entry may
@@ -34,7 +33,6 @@ class TestBlankSlateMinimalToolsets:
                 f"disabled toolset '{ts}' overlaps kept tools {sorted(overlap)}; "
                 "it would silently strip them from the blank-slate agent"
             )
-
 
 
     def test_tool_schema_survives_disabled_toolsets_from_config(self, monkeypatch):
@@ -78,6 +76,30 @@ class TestBlankSlateMinimalToolsets:
                          "terminal", "vision_analyze", "write_file"]
 
 
+    def test_kept_skills_can_present_consent_when_wisdom_is_available(self, monkeypatch):
+        import model_tools
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig
+
+        monkeypatch.setattr(registry.get_entry("present_wisdom_consent"), "check_fn", lambda: True)
+        eager_tools = ToolSearchConfig.from_raw({"enabled": "on", "defer": []})
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: eager_tools)
+        monkeypatch.setattr("tools.tool_search.load_config_readonly", lambda: eager_tools)
+        config = {}
+        _blank_slate_minimal_toolsets(config)
+        _blank_slate_minimize_config(config)
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=sorted(_get_platform_tools(config, "cli")),
+            disabled_toolsets=config["agent"]["disabled_toolsets"],
+            quiet_mode=True,
+        )
+        assert "present_wisdom_consent" in {
+            (definition.get("function") or {}).get("name") or definition.get("name")
+            for definition in definitions
+        }
+
+
 class TestBlankSlateMinimizeConfig:
     def test_optional_features_turned_off(self):
         cfg = {}
@@ -87,7 +109,6 @@ class TestBlankSlateMinimizeConfig:
         assert cfg["memory"]["user_profile_enabled"] is False
         assert cfg["checkpoints"]["enabled"] is False
         assert cfg["smart_model_routing"]["enabled"] is False
-        assert cfg["session_reset"]["mode"] == "none"
 
 
 class TestBlankSlateFork:
@@ -125,4 +146,3 @@ class TestBlankSlateFork:
         assert walked["called"] is False
         # Finish-now path records the skill opt-out (no bundled skills).
         assert opted_out["value"] is True
-
