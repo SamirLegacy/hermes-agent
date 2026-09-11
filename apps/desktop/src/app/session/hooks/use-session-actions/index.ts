@@ -1924,6 +1924,7 @@ export function useSessionActions({
         // Ownership refusal needs a deliberate handoff, not a reconnect loop.
         if (isSessionNotOwnedError(err)) {
           notify({ kind: 'info', title: 'Session has an owner', message: describeSessionOwner(err) })
+
           return
         }
 

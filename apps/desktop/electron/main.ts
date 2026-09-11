@@ -397,10 +397,7 @@ import {
 import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubRepoSlug, parseCompare } from './update-api-check'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import {
-  resolveHealProbeRemote,
-  resolvePassiveUpdateSource
-} from './update-remote'
+import { resolveHealProbeRemote, resolvePassiveUpdateSource } from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,

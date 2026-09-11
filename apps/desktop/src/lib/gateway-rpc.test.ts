@@ -46,10 +46,18 @@ describe('session ownership refusal', () => {
   it('renders the continuation resume command with live holder facts', () => {
     const error = {
       code: 4090,
-      data: { reason: 'SESSION_NOT_OWNED', holder: {
-        surface: 'desktop', pid: 42, age_s: 120, session_id: 'child-session', holder_live: true
-      } }
+      data: {
+        reason: 'SESSION_NOT_OWNED',
+        holder: {
+          surface: 'desktop',
+          pid: 42,
+          age_s: 120,
+          session_id: 'child-session',
+          holder_live: true
+        }
+      }
     }
+
     expect(describeSessionOwner(error)).toContain('desktop (pid 42, 2m)')
     expect(describeSessionOwner(error)).toContain('hermes chat --resume child-session')
     expect(describeSessionOwner(error)).not.toContain('--takeover')
@@ -67,6 +75,7 @@ describe('session ownership refusal', () => {
       code: 4090,
       data: { reason: 'SESSION_NOT_OWNED', holder: { holder_live: false, session_id: 'test-session' } }
     }
+
     expect(describeSessionOwner(error)).toContain('hermes chat --resume test-session --takeover')
     expect(isSessionNotOwnedError(null)).toBe(false)
   })
