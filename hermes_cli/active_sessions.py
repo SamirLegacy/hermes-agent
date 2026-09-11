@@ -135,6 +135,12 @@ class ActiveSessionRefusal(str):
         return obj
 
 
+def format_refusal_stderr(message: str) -> str:
+    """Keep the refusal contract across the one-shot CLI subprocess boundary."""
+    reason = getattr(message, "reason", "")
+    return f"hermes-refusal-reason: {reason}\n{message}" if reason else str(message)
+
+
 def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:
     """True when an existing lease belongs to the very caller re-acquiring it.
     Identity is (pid, live_session_id): pid alone lets two live sessions in one process
@@ -180,7 +186,7 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
     surface = str(entry.get("surface") or "another surface")
     pid = entry.get("pid")
     started = _optional_float(entry.get("started_at"))
-    age = f", running {format_age(time.time() - started)}" if started else ""
+    age = f", lease age {format_age(time.time() - started)}" if started else ""
     since = f", since {_wall_clock(started)}" if started else ""
     # --takeover only reclaims stale/dead leases: a live holder keeps writing
     # from its in-memory lease no matter what the registry says, so stealing
@@ -201,8 +207,10 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
         )
     return (
         f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}{since}). "
+        "Its turn activity is unknown; an open lease does not mean a turn is running. "
         "Only one surface at a time may run a session, because a second one would "
-        "reason from a transcript that does not include the first one's work.\n"
+        "reason from a transcript that does not include the first one's work; "
+        "close the session in its owning surface before resuming here.\n"
         f"{next_steps}"
     )
 
@@ -228,27 +236,30 @@ def _lease_paths(
     return home / "runtime" / "active_sessions.json", home / "runtime" / "active_sessions.lock"
 
 
-def _flock(fh, *, lock: bool) -> None:
+def _flock(fh, *, lock: bool, blocking: bool = True) -> None:
     """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows)."""
     if os.name == "nt":
         import msvcrt
         fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+        mode = (msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK) if lock else msvcrt.LK_UNLCK
+        msvcrt.locking(fh.fileno(), mode, 1)
     else:
         import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
+        mode = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB) if lock else fcntl.LOCK_UN
+        fcntl.flock(fh.fileno(), mode)
 
 
 class _FileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, blocking: bool = True):
         self.path = path
+        self.blocking = blocking
         self._fh = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a+b")
         try:
-            _flock(self._fh, lock=True)
+            _flock(self._fh, lock=True, blocking=self.blocking)
         except Exception as exc:
             self._fh.close()
             self._fh = None
@@ -858,13 +869,13 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
 
 
 def active_session_registry_snapshot(
-    registry_home: str | Path | None = None,
+    registry_home: str | Path | None = None, *, strict: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return the pruned active-session registry for diagnostics/tests."""
+    """Return live leases; attachment callers require provable liveness."""
     state_path, lock_path = _lease_paths(registry_home=registry_home)
     with _FileLock(lock_path):
         raw_entries = _read_entries(state_path, strict=True)
-        entries = _prune_dead(raw_entries)
+        entries = _prune_dead(raw_entries, strict=strict)
         if entries != raw_entries:
             _write_entries(state_path, entries)
         return entries

@@ -157,18 +157,16 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     db.create_session(session_id, source="cli")
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
-    # SamirLegacy fork patch: upstream's (0.05, 0.1) assumes the summary
-    # dispatch lands within 100 ms of fence-arm. On the fork's 4-vCPU
-    # ubuntu-latest runners under 4-way pytest parallelism the dispatch
-    # thread is routinely starved past the ceiling, so the fence cancels
-    # BEFORE dispatch ("Compression cancelled before summary dispatch") and
-    # provider_started never fires (failed 3 of 4 CI attempts 2026-09-02).
-    # (0.5, 1.0) preserves the contract under test — the fence still fires
-    # while the provider is blocked (10s ceiling) and the owner must still
-    # unwind without holding the pool slot.
+    # Fence-timeout values: upstream's (2.0, 4.0) supersedes the fork's earlier
+    # (0.5, 1.0) runner-starvation patch (sync 2026-09-11) — the larger window
+    # covers the same starved-dispatch failure mode with more headroom; the
+    # contract under test is unchanged (the fence still fires while the
+    # provider is blocked and the owner must still unwind without holding the
+    # pool slot).
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda cfg=None: (0.5, 1.0),
+        # Allow provider-thread startup under the parallel runner before timing out.
+        lambda cfg=None: (2.0, 4.0),
     )
 
     provider_started = threading.Event()
@@ -176,7 +174,7 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
 
     def _blocked_provider(_kwargs):
         provider_started.set()
-        assert release_provider.wait(timeout=10)
+        assert release_provider.wait(timeout=30)
         return "late-provider-result"
 
     def _compress_with_protected_provider(msgs, **_kwargs):
@@ -191,10 +189,10 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             live, "sys", approx_tokens=120_000
         )
         assert returned is live
-        assert provider_started.wait(timeout=1)
+        assert provider_started.wait(timeout=5)
         assert not release_provider.is_set()
 
-        deadline = time.time() + 1
+        deadline = time.time() + 5
         while time.time() < deadline:
             with cc._compress_admission_lock:
                 if cc._compress_admitted_count == 0:

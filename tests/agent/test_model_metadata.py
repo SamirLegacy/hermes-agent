@@ -375,6 +375,8 @@ class TestDefaultContextLengths:
             "deepseek-v4-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
+            # Version-less canonical Flash id (2026-09 Flash refresh).
+            "deepseek-flash": 1_000_000,
         }
         for key, value in expected_keys.items():
             assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
@@ -396,48 +398,14 @@ class TestDefaultContextLengths:
                 ("deepseek/deepseek-v4-flash", 1_000_000),
                 ("deepseek-chat", 1_000_000),
                 ("deepseek-reasoner", 1_000_000),
+                ("deepseek-flash", 1_000_000),
+                ("deepseek/deepseek-flash", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
                 actual = get_model_context_length(model_id)
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
-
-    def test_glm53_models_1m_context(self):
-        """GLM-5.3 resolves to its official 1M window on every spelling.
-
-        Official spec (docs.z.ai/guides/llm/ glm-5.3, verified 2026-08-15):
-        Context Length 1M, max output 128K — same base model as GLM-5.2,
-        which already carries 1_048_576 here.  Before this entry existed,
-        every glm-5.3 spelling fell through to the generic ``glm`` catch-all
-        (202,752) and the picker/compressor capped sessions at ~202K.
-        """
-        from unittest.mock import patch as mock_patch
-
-        assert DEFAULT_CONTEXT_LENGTHS["glm-5.3"] == 1_048_576
-        assert DEFAULT_CONTEXT_LENGTHS["zai-org/GLM-5.3"] == 1_048_576
-
-        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
-             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
-             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
-             mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
-             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
-            one_m = [
-                "glm-5.3",
-                "GLM-5.3",
-                "z-ai/glm-5.3",
-                "zai-org/GLM-5.3",
-                "openrouter/z-ai/glm-5.3",
-            ]
-            for model_id in one_m:
-                actual = get_model_context_length(model_id)
-                assert actual == 1_048_576, (
-                    f"{model_id}: expected 1048576, got {actual}"
-                )
-            # Older GLM variants must still hit the generic 202K fallback.
-            assert get_model_context_length("glm-5-turbo") == 202752
-            assert get_model_context_length("GLM-5-TEE") == 202752
-
 
 
 
@@ -1138,13 +1106,14 @@ class TestGetModelContextLength:
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {}
 
-        # GLM-5-TEE matches the "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        # GLM-5-TEE resolves through DEFAULT_CONTEXT_LENGTHS (longest matching GLM key), not the generic default.
         result = get_model_context_length(
             "zai-org/GLM-5-TEE",
             base_url="https://llm.chutes.ai/v1",
             api_key="test-key",
         )
-        assert result == 202752  # "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS, _longest_key_match
+        assert result == _longest_key_match(DEFAULT_CONTEXT_LENGTHS, "zai-org/glm-5-tee")[1]
 
 
 

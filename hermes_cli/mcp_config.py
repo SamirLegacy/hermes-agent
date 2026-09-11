@@ -630,11 +630,11 @@ def cmd_mcp_test(args):
     print()
 
 
-def _reauth_oauth_server(name: str, server_config: dict) -> bool:
+def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = None) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
-    Wipes cached OAuth state (disk + in-process MCPOAuthManager cache), re-probes to trigger the
-    browser flow, and verifies a token actually landed. Shared by ``login`` and ``reauth``.
+    Browser login clears cached state and re-probes. Device login replaces state only after
+    approval. Both verify a token landed. Shared by ``login`` and ``reauth``.
     """
     url = server_config.get("url")
     if not url:
@@ -645,9 +645,15 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
         return False
 
+    oauth_cfg = server_config.get("oauth") or {}
+    selected_flow = flow or oauth_cfg.get("flow", "browser")
+    if selected_flow not in {"browser", "device"}:
+        _error("oauth.flow must be browser or device")
+        return False
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+        if selected_flow == "browser":
+            get_manager().remove(name)
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
@@ -668,8 +674,11 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _login_connect_timeout = 0.0
         if not math.isfinite(_login_connect_timeout):
             _login_connect_timeout = 0.0
+        if selected_flow == "device":
+            from tools.mcp_oauth_device import login_device
+            asyncio.run(login_device(name, url, oauth_cfg))
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
-        probe_config = dict(server_config)
+        probe_config = {**server_config, "oauth": {**oauth_cfg, "flow": selected_flow}}
         probe_config["connect_timeout"] = _login_connect_timeout
         with force_interactive_oauth():
             tools = _probe_single_server(
@@ -712,10 +721,10 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
 
 
 def cmd_mcp_login(args):
-    """Force re-authentication for an OAuth-based MCP server (wipes cached tokens, re-runs the flow)."""
+    """Run an explicit browser or device authorization for an OAuth-based MCP server."""
     cfg = _lookup_server(args.name, _get_mcp_servers())
     if cfg is not None:
-        _reauth_oauth_server(args.name, cfg)
+        _reauth_oauth_server(args.name, cfg, flow=getattr(args, "flow", None))
 
 
 def cmd_mcp_reauth(args):
