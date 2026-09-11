@@ -186,7 +186,7 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
     surface = str(entry.get("surface") or "another surface")
     pid = entry.get("pid")
     started = _optional_float(entry.get("started_at"))
-    age = f", running {format_age(time.time() - started)}" if started else ""
+    age = f", lease age {format_age(time.time() - started)}" if started else ""
     since = f", since {_wall_clock(started)}" if started else ""
     # --takeover only reclaims stale/dead leases: a live holder keeps writing
     # from its in-memory lease no matter what the registry says, so stealing
@@ -207,8 +207,10 @@ def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str
         )
     return (
         f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}{since}). "
+        "Its turn activity is unknown; an open lease does not mean a turn is running. "
         "Only one surface at a time may run a session, because a second one would "
-        "reason from a transcript that does not include the first one's work.\n"
+        "reason from a transcript that does not include the first one's work; "
+        "close the session in its owning surface before resuming here.\n"
         f"{next_steps}"
     )
 
